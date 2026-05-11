@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: flow-ledger-experiment
+  namespace: flow-ledger-system
+data:
+  experiment_id: "unknown"
+  scenario_label: "unlabeled"
+  scenario_phase: "baseline"
+  attack_enabled: "false"
+  load_level: "unknown"
