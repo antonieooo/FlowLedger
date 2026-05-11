@@ -1,0 +1,72 @@
+# Experimental: real eBPF TCP lifecycle collector.
+# Requires Linux nodes plus privileged/capability access to load and attach BPF.
+# Do not apply this manifest as part of the default v0 mock validation path.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: flow-ledger-node-agent-ebpf
+  namespace: flow-ledger-system
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: flow-ledger
+      app.kubernetes.io/component: node-agent-ebpf
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: flow-ledger
+        app.kubernetes.io/component: node-agent-ebpf
+    spec:
+      serviceAccountName: flow-ledger-node-agent
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: node-agent
+          image: flow-ledger:v0
+          imagePullPolicy: IfNotPresent
+          args:
+            - --mode=ebpf
+            - --node-name=$(NODE_NAME)
+            - --ledger-path=/var/lib/flow-ledger/flows.jsonl
+            - --ledger-max-bytes=104857600
+            - --ledger-max-age=0s
+            - --namespace=flow-ledger-system
+            - --experiment-configmap=flow-ledger-experiment
+            - --metadata-sync-timeout=30s
+            - --allow-unsynced-metadata=false
+            - --metrics-addr=:9090
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          securityContext:
+            privileged: true
+            capabilities:
+              add: ["BPF", "PERFMON", "NET_ADMIN"]
+          ports:
+            - name: metrics
+              containerPort: 9090
+              hostPort: 9090
+          volumeMounts:
+            - name: flow-ledger-data
+              mountPath: /var/lib/flow-ledger
+            - name: bpffs
+              mountPath: /sys/fs/bpf
+            - name: tracing
+              mountPath: /sys/kernel/tracing
+      volumes:
+        - name: flow-ledger-data
+          hostPath:
+            path: /var/lib/flow-ledger
+            type: DirectoryOrCreate
+        - name: bpffs
+          hostPath:
+            path: /sys/fs/bpf
+            type: DirectoryOrCreate
+        - name: tracing
+          hostPath:
+            path: /sys/kernel/tracing
+            type: DirectoryOrCreate

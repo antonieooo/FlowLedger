@@ -14,10 +14,11 @@ It is a flow/session metadata ledger. It is not an IDS, alerting system, machine
 - JSONL ledger writing with basic size/age rotation.
 - Prometheus metrics on `/metrics`.
 - A Kubernetes DaemonSet manifest for lifecycle, metadata, ledger, and metrics validation using mock events.
+- An experimental Linux eBPF collector for IPv4 TCP lifecycle events from `sock/inet_sock_set_state`.
 
 ## What v0 Does Not Implement
 
-- No real eBPF traffic collection yet. The `ebpf` collector is still a compile-safe stub.
+- No full traffic accounting yet; eBPF bytes and packet counters are currently zero.
 - No fast-path detection yet.
 - No slow-path review yet.
 - No alerting yet.
@@ -29,7 +30,7 @@ It is a flow/session metadata ledger. It is not an IDS, alerting system, machine
 
 ## Components
 
-- `collector`: reads raw flow events from mock JSONL; the eBPF collector is intentionally a v0 stub.
+- `collector`: reads raw flow events from mock JSONL or, on Linux, from an experimental eBPF tracepoint collector.
 - `sessionizer`: aggregates flow events into session/window summaries.
 - `k8smeta`: watches Kubernetes metadata and maintains local lookup caches.
 - `identity`: maps session endpoints to Kubernetes or external identities.
@@ -66,6 +67,22 @@ Useful ledger flags:
 ```
 
 `--ledger-max-bytes=0` disables size-based rotation. `--ledger-max-age=0s` disables age-based rotation.
+
+## Build eBPF Bindings
+
+The generated eBPF bindings are checked in. Regenerate them after changing `bpf/flow_events.bpf.c`:
+
+```bash
+go generate ./...
+```
+
+Generation requires:
+
+- Go with tool support for `go tool bpf2go`
+- `clang`
+- `llvm-strip`
+
+The project pins `github.com/cilium/ebpf/cmd/bpf2go` in `go.mod` with a `tool` directive.
 
 ## Deploy To Kubernetes For Lifecycle Validation
 
@@ -110,6 +127,39 @@ kubectl -n flow-ledger-system port-forward ds/flow-ledger-node-agent 9090:9090
 curl http://localhost:9090/metrics
 ```
 
+## Experimental eBPF Collector
+
+The eBPF collector is Linux-only and experimental. It attaches to the `sock/inet_sock_set_state` tracepoint and emits TCP IPv4 lifecycle events into the existing FlowLedger pipeline.
+
+Current capture behavior:
+
+- `newstate == TCP_ESTABLISHED` becomes `CONNECT`.
+- `newstate == TCP_CLOSE` becomes `CLOSE`.
+- IPv6 is not emitted yet.
+- Bytes and packet counters are emitted as `0`.
+- No payload is captured.
+- TLS is not decrypted.
+
+Local Linux test, usually requiring root or equivalent BPF permissions:
+
+```bash
+sudo go run ./cmd/node-agent \
+  --mode ebpf \
+  --ledger-path ./flows.jsonl \
+  --node-name local-ebpf-test
+```
+
+In another shell, create TCP activity with `curl`, `nc`, or `wget`, then inspect `flows.jsonl` and `/metrics`.
+
+Kubernetes experimental deployment:
+
+```bash
+kubectl apply -f deploy/
+kubectl apply -f deploy/experimental/daemonset-ebpf.yaml
+```
+
+The experimental DaemonSet uses privileged/capability access and host mounts for BPF/tracing. Do not apply it as part of the default mock validation path.
+
 ## Metadata Sync
 
 When running in Kubernetes, the agent waits for informer cache sync before starting the collector. The default timeout is 30 seconds:
@@ -150,21 +200,26 @@ Mapping confidence values are `high`, `medium`, `low`, and `unknown`. Mapping me
 - `flowledger_k8s_cache_services`
 - `flowledger_k8s_watch_errors_total`
 - `flowledger_experiment_label_read_errors_total`
+- `flowledger_ebpf_events_total`
+- `flowledger_ebpf_read_errors_total`
+- `flowledger_ebpf_attach_errors_total`
+- `flowledger_ebpf_events_by_type_total`
 
 ## Known Limitations
 
-- The eBPF collector is a v0 stub; use mock mode for validation.
-- Kubernetes deployment validates lifecycle and metadata plumbing only, not real traffic collection.
+- The default Kubernetes deployment validates lifecycle and metadata plumbing only, not real traffic collection.
+- The experimental eBPF collector captures TCP IPv4 connect/close lifecycle only.
+- eBPF byte and packet counters are currently zero until send/receive accounting is added.
 - Session byte and packet counters treat event counters as cumulative and keep the maximum seen value.
 - Owner resolution depends on informer cache freshness and may temporarily emit `BarePod`, `ReplicaSet`, or `unknown` during startup or cache churn.
 - Node-origin detection is minimal in v0; hostNetwork Pods are preserved when they can be mapped by Pod IP.
 - Ledger rotation is local-only and does not compress, upload, or enforce global retention.
 
-## Next Steps Toward Real eBPF Collection
+## Next Steps Toward Richer eBPF Collection
 
-- Define the kernel/user-space event ABI for TCP connect, accept, stats, and close events.
-- Generate Go bindings for the BPF object and load it with `github.com/cilium/ebpf`.
-- Attach probes or tracepoints appropriate for the target kernels and document required privileges.
-- Convert raw kernel events into the existing `collector.FlowEvent` shape.
+- Add `tcp_sendmsg` / `tcp_recvmsg` or equivalent accounting for bytes.
+- Add packet counters only if they can be collected without payload capture.
+- Add IPv6 event conversion.
+- Add netns inode enrichment from `skaddr` or task context.
 - Add integration tests or a privileged smoke-test path that is separate from regular unit tests.
-- Add deployment manifests for experimental real eBPF mode only after the collector emits real flow events.
+- Keep experimental eBPF deployment separate until kernel compatibility is well understood.

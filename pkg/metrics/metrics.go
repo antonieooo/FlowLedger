@@ -20,6 +20,10 @@ type Metrics struct {
 	K8sCacheServices          prometheus.Gauge
 	K8sWatchErrors            prometheus.Counter
 	ExperimentLabelReadErrors prometheus.Counter
+	EBPFEventsTotal           prometheus.Counter
+	EBPFReadErrors            prometheus.Counter
+	EBPFAttachErrors          prometheus.Counter
+	EBPFEventsByType          *prometheus.CounterVec
 }
 
 func New() *Metrics {
@@ -64,6 +68,22 @@ func New() *Metrics {
 			Name: "flowledger_experiment_label_read_errors_total",
 			Help: "Total experiment label ConfigMap read errors.",
 		}),
+		EBPFEventsTotal: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "flowledger_ebpf_events_total",
+			Help: "Total eBPF flow events read from the kernel.",
+		}),
+		EBPFReadErrors: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "flowledger_ebpf_read_errors_total",
+			Help: "Total eBPF ring buffer read or decode errors.",
+		}),
+		EBPFAttachErrors: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "flowledger_ebpf_attach_errors_total",
+			Help: "Total eBPF program load or attach errors.",
+		}),
+		EBPFEventsByType: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "flowledger_ebpf_events_by_type_total",
+			Help: "Total eBPF flow events read from the kernel by event type.",
+		}, []string{"event_type"}),
 	}
 	prometheus.MustRegister(
 		m.EventsTotal,
@@ -76,6 +96,10 @@ func New() *Metrics {
 		m.K8sCacheServices,
 		m.K8sWatchErrors,
 		m.ExperimentLabelReadErrors,
+		m.EBPFEventsTotal,
+		m.EBPFReadErrors,
+		m.EBPFAttachErrors,
+		m.EBPFEventsByType,
 	)
 	return m
 }

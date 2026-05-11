@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -132,10 +133,21 @@ func main() {
 				continue
 			}
 			m.EventsTotal.Inc()
+			if cfg.mode == "ebpf" {
+				m.EBPFEventsTotal.Inc()
+				m.EBPFEventsByType.WithLabelValues(ev.EventType).Inc()
+			}
 			emitSessions(writer, resolver, labels, sessions.Process(ev), m)
 			m.SessionsActive.Set(float64(sessions.ActiveCount()))
 		case err, ok := <-errs:
 			if ok && err != nil && err != context.Canceled {
+				if cfg.mode == "ebpf" {
+					if strings.Contains(err.Error(), "attach") || strings.Contains(err.Error(), "load ebpf") {
+						m.EBPFAttachErrors.Inc()
+					} else {
+						m.EBPFReadErrors.Inc()
+					}
+				}
 				log.Printf("collector error: %v", err)
 			}
 		case <-ticker.C:

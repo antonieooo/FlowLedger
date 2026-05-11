@@ -1,13 +1,11 @@
+//go:build !linux
+
 package collector
 
 import (
 	"context"
 	"errors"
-
-	"github.com/cilium/ebpf"
 )
-
-var _ = ebpf.CollectionOptions{}
 
 type EBPFCollector struct{}
 
