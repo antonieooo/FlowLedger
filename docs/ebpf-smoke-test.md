@@ -1,0 +1,222 @@
+# eBPF Smoke Test
+
+## Purpose
+
+This smoke test verifies the local Linux eBPF collector path for real TCP lifecycle events:
+
+- The eBPF collector can start.
+- The eBPF program can attach to `sock/inet_sock_set_state`.
+- The ring buffer can deliver kernel events to Go userspace.
+- `CONNECT` and `CLOSE` events can be converted into `collector.FlowEvent`.
+- The sessionizer can emit `session_summary` records.
+- `flows.jsonl` can be written.
+- Metrics can reflect eBPF events.
+
+This smoke test does not verify:
+
+- Kubernetes DaemonSet deployment.
+- Pod identity enrichment.
+- Service or EndpointSlice mapping.
+- Bytes or packets accounting.
+- TLS metadata.
+- Malicious traffic detection.
+- ML or alerting.
+
+## Prerequisites
+
+Use a Linux or WSL2 Ubuntu environment with:
+
+- Root or `sudo` privileges.
+- A working Go environment.
+- `clang` and `llvm`.
+- Optional `bpftool`.
+- Kernel support for eBPF, tracepoints, and ring buffers.
+- A passing `go test ./...` run.
+- Awareness that the current eBPF collector only supports IPv4 TCP lifecycle events.
+
+Install common dependencies:
+
+```sh
+sudo apt update
+sudo apt install -y clang llvm make gcc curl netcat-openbsd jq
+```
+
+Optionally install `bpftool`:
+
+```sh
+sudo apt install -y bpftool
+```
+
+## Build / Test Check
+
+Run the regular test and Linux build checks first:
+
+```sh
+go test ./...
+CGO_ENABLED=0 GOOS=linux go build ./cmd/node-agent
+```
+
+The generated eBPF bindings are checked in. Re-run generation only if generated files are missing or `bpf/flow_events.bpf.c` has changed:
+
+```sh
+go generate ./...
+```
+
+## Run node-agent In eBPF Mode
+
+Start the agent as root so it can load and attach the eBPF program:
+
+```sh
+sudo rm -f ./flows.jsonl
+sudo go run ./cmd/node-agent \
+  --mode ebpf \
+  --ledger-path ./flows.jsonl \
+  --node-name local-ebpf-test \
+  --metrics-addr :9090
+```
+
+Expected logs should include:
+
+- `flow-ledger node-agent started`
+- `mode=ebpf`
+- `kubernetes in-cluster config not available; running with empty metadata cache`, which is normal outside Kubernetes.
+- `ebpf collector attached tracepoint sock/inet_sock_set_state`
+- `ebpf collector started ringbuf reader`
+
+## Generate Real TCP Traffic
+
+In a second terminal, generate real IPv4 TCP connections:
+
+```sh
+curl -4 https://example.com
+curl -4 http://example.com
+```
+
+You can also try a local `nc` connection.
+
+Terminal A:
+
+```sh
+nc -l 127.0.0.1 18080
+```
+
+Terminal B:
+
+```sh
+echo "hello" | nc 127.0.0.1 18080
+```
+
+Notes:
+
+- The current eBPF collector only observes TCP lifecycle state changes, so HTTPS/TLS content is not decrypted.
+- `bytes` and `packets` may be `0`; this is a known limitation.
+- Local loopback visibility can vary by kernel path. If loopback does not produce useful events, prefer external IPv4 traffic with `curl -4`.
+
+## Verify flows.jsonl
+
+Inspect the ledger:
+
+```sh
+sudo cat ./flows.jsonl
+sudo cat ./flows.jsonl | jq .
+sudo tail -n 20 ./flows.jsonl | jq .
+```
+
+Expected records should include at least one:
+
+- `record_type` set to `session_summary`.
+- `node_name` set to `local-ebpf-test`.
+- `protocol` set to `tcp`.
+- Event-derived `start_time`, `end_time`, and `duration_ms`.
+- Non-empty `src_ip`, `dst_ip`, `src_port`, and `dst_port`.
+- `src_mapping_confidence` and `dst_mapping_confidence` may be `unknown`, which is normal in a local non-Kubernetes environment.
+- `bytes_out`, `bytes_in`, `packets_out`, and `packets_in` may currently be `0`.
+
+## Verify Metrics
+
+Inspect FlowLedger metrics:
+
+```sh
+curl localhost:9090/metrics | grep flowledger
+```
+
+Focus on:
+
+- `flowledger_ebpf_events_total`
+- `flowledger_ebpf_events_by_type_total`
+- `flowledger_ebpf_read_errors_total`
+- `flowledger_ebpf_attach_errors_total`
+- `flowledger_sessions_emitted_total`
+
+Expected behavior:
+
+- `flowledger_ebpf_events_total` is greater than `0`.
+- `CONNECT` event count is greater than `0`.
+- `CLOSE` event count is preferably greater than `0`.
+- Read errors should not continuously increase.
+- Attach errors should be `0`.
+- Sessions emitted should increase as connections close.
+
+## Troubleshooting
+
+### A. permission denied / operation not permitted
+
+The process needs root privileges, or the kernel may restrict unprivileged BPF. Run the node-agent with `sudo`.
+
+### B. tracepoint attach failed
+
+Check that the tracepoint exists:
+
+```sh
+sudo ls /sys/kernel/tracing/events/sock/inet_sock_set_state
+sudo cat /sys/kernel/tracing/events/sock/inet_sock_set_state/format
+```
+
+If the path does not exist, the current kernel may not support this tracepoint.
+
+### C. no flows.jsonl generated
+
+Check:
+
+- Whether `node-agent` is still running.
+- Whether traffic used IPv4, for example `curl -4`.
+- Whether real TCP connections were created.
+- Whether `flowledger_ebpf_events_total` increased.
+- If events increased but sessions were not emitted, whether `CONNECT` and `CLOSE` events share the same flow key.
+
+### D. events exist but identity unknown
+
+This is normal in local WSL/Linux tests. The process is not running as a Kubernetes Pod with a populated Kubernetes metadata cache.
+
+### E. bytes/packets are zero
+
+The first eBPF collector version only observes TCP lifecycle events. It does not attach to `tcp_sendmsg` or `tcp_recvmsg`, so byte and packet counters being `0` is expected.
+
+### F. IPv6 traffic not captured
+
+The current collector only handles `AF_INET`, which means IPv4. Use `curl -4`.
+
+## Pass Criteria
+
+The smoke test passes when:
+
+- `go test ./...` passes.
+- `node-agent --mode ebpf` starts with `sudo`.
+- eBPF attach has no error.
+- After real `curl` or `nc` TCP connections, eBPF event metrics increase.
+- `flows.jsonl` contains at least one `session_summary` from a real connection.
+- The JSONL output can be parsed by `jq`.
+- Ring buffer or read errors do not continuously increase.
+
+## Known Limitations
+
+- Does not verify Kubernetes deployment.
+- Does not verify Pod identity.
+- Does not verify Service mapping.
+- Does not verify attack detection.
+- Does not verify TLS tunnel identification.
+- Does not capture payload.
+- Does not decrypt TLS.
+- `bytes` and `packets` are currently `0`.
+- IPv4 TCP only.
+- PID and CgroupID at this tracepoint are best-effort and should not be treated as strong attribution evidence.

@@ -8,6 +8,8 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"log"
+	"time"
 
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/ringbuf"
@@ -48,6 +50,7 @@ func (c *EBPFCollector) Run(ctx context.Context) (<-chan FlowEvent, <-chan error
 			return
 		}
 		defer tp.Close()
+		log.Print("ebpf collector attached tracepoint sock/inet_sock_set_state")
 
 		reader, err := ringbuf.NewReader(objs.Events)
 		if err != nil {
@@ -55,6 +58,7 @@ func (c *EBPFCollector) Run(ctx context.Context) (<-chan FlowEvent, <-chan error
 			return
 		}
 		defer reader.Close()
+		log.Print("ebpf collector started ringbuf reader")
 
 		go func() {
 			<-ctx.Done()
@@ -79,6 +83,8 @@ func (c *EBPFCollector) Run(ctx context.Context) (<-chan FlowEvent, <-chan error
 				errs <- fmt.Errorf("decode ebpf event: %w", err)
 				continue
 			}
+			// bpf_ktime_get_ns is monotonic boot time; ledger records need wall-clock time.
+			raw.TimestampNS = uint64(time.Now().UTC().UnixNano())
 
 			ev, err := convertRawEBPFEventToFlowEvent(raw)
 			if err != nil {
