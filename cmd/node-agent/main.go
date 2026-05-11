@@ -34,6 +34,10 @@ type config struct {
 	windowSize          time.Duration
 	metricsAddr         string
 	logLevel            string
+	metadataSyncTimeout time.Duration
+	allowUnsyncedMeta   bool
+	ledgerMaxBytes      int64
+	ledgerMaxAge        time.Duration
 }
 
 func main() {
@@ -60,20 +64,32 @@ func main() {
 	kubeClient := maybeKubernetesClient()
 	if kubeClient != nil {
 		runner := k8smeta.NewInformerRunner(kubeClient, metaCache, func() { m.K8sWatchErrors.Inc() })
+		metadataReady := make(chan error, 1)
 		go func() {
-			if err := runner.Run(ctx); err != nil && ctx.Err() == nil {
+			if err := runner.Run(ctx, metadataReady); err != nil && ctx.Err() == nil {
 				log.Printf("kubernetes informer stopped: %v", err)
 				m.K8sWatchErrors.Inc()
 			}
 		}()
+		if err := waitForMetadataSync(ctx, metadataReady, cfg.metadataSyncTimeout, cfg.allowUnsyncedMeta); err != nil {
+			log.Fatal(err)
+		}
 	} else {
 		log.Print("kubernetes in-cluster config not available; running with empty metadata cache")
 	}
 
 	labelReader := experiment.NewReader(kubeClient, cfg.namespace, cfg.experimentConfigMap)
-	labels := labelReader.Read(ctx)
+	labels, err := labelReader.ReadWithStatus(ctx)
+	if err != nil {
+		m.ExperimentLabelReadErrors.Inc()
+		log.Printf("read experiment labels: %v; using last known labels", err)
+	}
 
-	writer, err := ledger.NewWriter(cfg.ledgerPath)
+	writer, err := ledger.NewWriterWithOptions(ledger.WriterOptions{
+		Path:     cfg.ledgerPath,
+		MaxBytes: cfg.ledgerMaxBytes,
+		MaxAge:   cfg.ledgerMaxAge,
+	})
 	if err != nil {
 		log.Fatalf("open ledger writer: %v", err)
 	}
@@ -129,7 +145,12 @@ func main() {
 			m.K8sCachePods.Set(float64(pods))
 			m.K8sCacheServices.Set(float64(services))
 		case <-labelTicker.C:
-			labels = labelReader.Read(ctx)
+			var err error
+			labels, err = labelReader.ReadWithStatus(ctx)
+			if err != nil {
+				m.ExperimentLabelReadErrors.Inc()
+				log.Printf("read experiment labels: %v; using last known labels", err)
+			}
 		}
 	}
 }
@@ -146,8 +167,43 @@ func parseFlags() config {
 	flag.DurationVar(&cfg.windowSize, "window-size", 30*time.Second, "long connection summary window size")
 	flag.StringVar(&cfg.metricsAddr, "metrics-addr", ":9090", "metrics listen address")
 	flag.StringVar(&cfg.logLevel, "log-level", "info", "log level")
+	flag.DurationVar(&cfg.metadataSyncTimeout, "metadata-sync-timeout", 30*time.Second, "maximum time to wait for Kubernetes metadata cache sync before processing events")
+	flag.BoolVar(&cfg.allowUnsyncedMeta, "allow-unsynced-metadata", false, "continue if Kubernetes metadata cache sync fails or times out")
+	flag.Int64Var(&cfg.ledgerMaxBytes, "ledger-max-bytes", 100*1024*1024, "rotate ledger when current file reaches this many bytes; 0 disables size rotation")
+	flag.DurationVar(&cfg.ledgerMaxAge, "ledger-max-age", 0, "rotate ledger after this duration; 0 disables age rotation")
 	flag.Parse()
 	return cfg
+}
+
+func waitForMetadataSync(ctx context.Context, ready <-chan error, timeout time.Duration, allowUnsynced bool) error {
+	var timeoutC <-chan time.Time
+	var timer *time.Timer
+	if timeout > 0 {
+		timer = time.NewTimer(timeout)
+		timeoutC = timer.C
+		defer timer.Stop()
+	}
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case err := <-ready:
+		if err == nil {
+			log.Print("kubernetes metadata cache synced; starting collector")
+			return nil
+		}
+		if allowUnsynced {
+			log.Printf("kubernetes metadata cache sync failed; continuing with possibly incomplete metadata: %v", err)
+			return nil
+		}
+		return fmt.Errorf("kubernetes metadata cache sync failed: %w", err)
+	case <-timeoutC:
+		if allowUnsynced {
+			log.Printf("kubernetes metadata cache sync timed out after %s; continuing with possibly incomplete metadata", timeout)
+			return nil
+		}
+		return fmt.Errorf("kubernetes metadata cache sync timed out after %s", timeout)
+	}
 }
 
 func maybeKubernetesClient() kubernetes.Interface {

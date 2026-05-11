@@ -24,21 +24,25 @@ spec:
           image: flow-ledger:v0
           imagePullPolicy: IfNotPresent
           args:
-            - --mode=ebpf
+            # v0 Kubernetes deployment is intentionally mock-backed. It validates
+            # DaemonSet lifecycle, metadata enrichment, JSONL writing, and metrics;
+            # it does not collect real node traffic yet.
+            - --mode=mock
+            - --mock-events-path=/etc/flow-ledger/mock/flow_events.jsonl
             - --node-name=$(NODE_NAME)
             - --ledger-path=/var/lib/flow-ledger/flows.jsonl
+            - --ledger-max-bytes=104857600
+            - --ledger-max-age=0s
             - --namespace=flow-ledger-system
             - --experiment-configmap=flow-ledger-experiment
+            - --metadata-sync-timeout=30s
+            - --allow-unsynced-metadata=false
             - --metrics-addr=:9090
           env:
             - name: NODE_NAME
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
-          securityContext:
-            privileged: true
-            capabilities:
-              add: ["BPF", "NET_ADMIN", "SYS_ADMIN", "SYS_RESOURCE"]
           ports:
             - name: metrics
               containerPort: 9090
@@ -46,20 +50,14 @@ spec:
           volumeMounts:
             - name: flow-ledger-data
               mountPath: /var/lib/flow-ledger
-            - name: bpffs
-              mountPath: /sys/fs/bpf
-            - name: debugfs
-              mountPath: /sys/kernel/debug
+            - name: mock-events
+              mountPath: /etc/flow-ledger/mock
+              readOnly: true
       volumes:
         - name: flow-ledger-data
           hostPath:
             path: /var/lib/flow-ledger
             type: DirectoryOrCreate
-        - name: bpffs
-          hostPath:
-            path: /sys/fs/bpf
-            type: DirectoryOrCreate
-        - name: debugfs
-          hostPath:
-            path: /sys/kernel/debug
-            type: DirectoryOrCreate
+        - name: mock-events
+          configMap:
+            name: flow-ledger-mock-events

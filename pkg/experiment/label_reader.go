@@ -21,27 +21,52 @@ func DefaultLabels() Labels {
 }
 
 type Reader struct {
-	client    kubernetes.Interface
-	namespace string
-	name      string
-	current   Labels
+	getter     configMapGetter
+	namespace  string
+	name       string
+	current    Labels
+	hasCurrent bool
+}
+
+type configMapGetter interface {
+	Get(ctx context.Context, namespace, name string) (*corev1.ConfigMap, error)
+}
+
+type kubernetesConfigMapGetter struct {
+	client kubernetes.Interface
 }
 
 func NewReader(client kubernetes.Interface, namespace, name string) *Reader {
-	return &Reader{client: client, namespace: namespace, name: name, current: DefaultLabels()}
+	var getter configMapGetter
+	if client != nil {
+		getter = kubernetesConfigMapGetter{client: client}
+	}
+	return &Reader{getter: getter, namespace: namespace, name: name, current: DefaultLabels()}
 }
 
 func (r *Reader) Read(ctx context.Context) Labels {
-	if r == nil || r.client == nil {
-		return DefaultLabels()
+	labels, _ := r.ReadWithStatus(ctx)
+	return labels
+}
+
+func (r *Reader) ReadWithStatus(ctx context.Context) (Labels, error) {
+	if r == nil || r.getter == nil {
+		return DefaultLabels(), nil
 	}
-	cm, err := r.client.CoreV1().ConfigMaps(r.namespace).Get(ctx, r.name, metav1.GetOptions{})
+	cm, err := r.getter.Get(ctx, r.namespace, r.name)
 	if err != nil {
-		r.current = DefaultLabels()
-		return r.current
+		if r.hasCurrent {
+			return r.current, err
+		}
+		return DefaultLabels(), err
 	}
 	r.current = labelsFromConfigMap(cm)
-	return r.current
+	r.hasCurrent = true
+	return r.current, nil
+}
+
+func (g kubernetesConfigMapGetter) Get(ctx context.Context, namespace, name string) (*corev1.ConfigMap, error) {
+	return g.client.CoreV1().ConfigMaps(namespace).Get(ctx, name, metav1.GetOptions{})
 }
 
 func labelsFromConfigMap(cm *corev1.ConfigMap) Labels {

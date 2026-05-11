@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: flow-ledger-mock-events
+  namespace: flow-ledger-system
+data:
+  flow_events.jsonl: |
+    {"timestamp_ns":100000000000,"event_type":"CONNECT","src_ip":"10.244.1.10","src_port":43120,"dst_ip":"10.96.0.10","dst_port":443,"protocol":"tcp"}
+    {"timestamp_ns":101000000000,"event_type":"STATS","src_ip":"10.244.1.10","src_port":43120,"dst_ip":"10.96.0.10","dst_port":443,"protocol":"tcp","bytes_sent":1024,"bytes_recv":4096,"packets_sent":9,"packets_recv":14}
+    {"timestamp_ns":102000000000,"event_type":"CLOSE","src_ip":"10.244.1.10","src_port":43120,"dst_ip":"10.96.0.10","dst_port":443,"protocol":"tcp","bytes_sent":1024,"bytes_recv":4096,"packets_sent":9,"packets_recv":14}

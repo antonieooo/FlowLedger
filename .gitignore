@@ -1,0 +1,7 @@
+flows.jsonl
+*.jsonl
+!testdata/*.jsonl
+/bin/
+/dist/
+/coverage.out
+.DS_Store

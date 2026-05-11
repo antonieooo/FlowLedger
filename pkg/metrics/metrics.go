@@ -10,15 +10,16 @@ import (
 )
 
 type Metrics struct {
-	EventsTotal          prometheus.Counter
-	SessionsActive       prometheus.Gauge
-	SessionsEmittedTotal prometheus.Counter
-	UnknownSrcMappings   prometheus.Counter
-	UnknownDstMappings   prometheus.Counter
-	LedgerWriteErrors    prometheus.Counter
-	K8sCachePods         prometheus.Gauge
-	K8sCacheServices     prometheus.Gauge
-	K8sWatchErrors       prometheus.Counter
+	EventsTotal               prometheus.Counter
+	SessionsActive            prometheus.Gauge
+	SessionsEmittedTotal      prometheus.Counter
+	UnknownSrcMappings        prometheus.Counter
+	UnknownDstMappings        prometheus.Counter
+	LedgerWriteErrors         prometheus.Counter
+	K8sCachePods              prometheus.Gauge
+	K8sCacheServices          prometheus.Gauge
+	K8sWatchErrors            prometheus.Counter
+	ExperimentLabelReadErrors prometheus.Counter
 }
 
 func New() *Metrics {
@@ -59,6 +60,10 @@ func New() *Metrics {
 			Name: "flowledger_k8s_watch_errors_total",
 			Help: "Total Kubernetes watch/cache errors.",
 		}),
+		ExperimentLabelReadErrors: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "flowledger_experiment_label_read_errors_total",
+			Help: "Total experiment label ConfigMap read errors.",
+		}),
 	}
 	prometheus.MustRegister(
 		m.EventsTotal,
@@ -70,6 +75,7 @@ func New() *Metrics {
 		m.K8sCachePods,
 		m.K8sCacheServices,
 		m.K8sWatchErrors,
+		m.ExperimentLabelReadErrors,
 	)
 	return m
 }

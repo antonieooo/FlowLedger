@@ -1,26 +1,43 @@
 # Flow Ledger v0
 
-Flow Ledger v0 is a Kubernetes node agent prototype that records TCP/TLS connection metadata as JSONL session records with Kubernetes identity context. It is designed to run once per Linux node as a DaemonSet.
+Flow Ledger v0 is a Kubernetes node-agent prototype for recording TCP/TLS flow metadata as JSONL `session_summary` and `window_summary` records with Kubernetes identity context.
 
-## What v0 Does Not Do
+It is a flow/session metadata ledger. It is not an IDS, alerting system, machine-learning system, packet capture tool, or TLS decryption tool.
 
-- No machine learning model.
-- No alerting.
+## What v0 Implements
+
+- Mock flow-event ingestion from JSONL.
+- Session/window aggregation for `CONNECT`, `ACCEPT`, `STATS`, and `CLOSE` events.
+- Kubernetes metadata cache using client-go informers for Pods, Services, EndpointSlices, workload controllers, Jobs, CronJobs, and ServiceAccounts.
+- Endpoint identity enrichment for Pod IPs, Service ClusterIPs, EndpointSlice backends, external IPs, and `unknown`.
+- Experiment labels from the `flow-ledger-experiment` ConfigMap with last-known-good behavior on read failures.
+- JSONL ledger writing with basic size/age rotation.
+- Prometheus metrics on `/metrics`.
+- A Kubernetes DaemonSet manifest for lifecycle, metadata, ledger, and metrics validation using mock events.
+
+## What v0 Does Not Implement
+
+- No real eBPF traffic collection yet. The `ebpf` collector is still a compile-safe stub.
+- No fast-path detection yet.
+- No slow-path review yet.
+- No alerting yet.
+- No machine learning model yet.
 - No TLS decryption.
 - No payload capture or storage.
+- No production retention, compression, or upload pipeline for ledger files.
 - No assumption that every flow maps to a Pod; `unknown` mapping is normal.
 
 ## Components
 
-- `collector`: reads raw flow events from mock JSONL, with an eBPF collector stub kept compile-safe for v0.
-- `sessionizer`: aggregates `CONNECT`, `ACCEPT`, `STATS`, and `CLOSE` events into sessions.
-- `k8smeta`: watches Pods, Services, EndpointSlices, workload controllers, Jobs, CronJobs, and ServiceAccounts with client-go informers.
-- `identity`: maps session endpoints to Pods, Services, EndpointSlice backends, external IPs, or unknown.
-- `ledger`: writes JSONL records.
-- `experiment`: reads labels from the `flow-ledger-experiment` ConfigMap.
-- `metrics`: exposes Prometheus metrics on `/metrics`.
+- `collector`: reads raw flow events from mock JSONL; the eBPF collector is intentionally a v0 stub.
+- `sessionizer`: aggregates flow events into session/window summaries.
+- `k8smeta`: watches Kubernetes metadata and maintains local lookup caches.
+- `identity`: maps session endpoints to Kubernetes or external identities.
+- `ledger`: writes JSONL records and rotates the active ledger file.
+- `experiment`: reads scenario labels from a ConfigMap.
+- `metrics`: exposes Prometheus metrics.
 
-## Run Locally In Mock Mode
+## Run Local Mock Mode
 
 ```bash
 go run ./cmd/node-agent \
@@ -41,7 +58,18 @@ curl http://localhost:9090/metrics
 
 Without an in-cluster Kubernetes config, metadata cache startup is skipped and identity fields resolve to `unknown`.
 
-## Deploy To Kubernetes
+Useful ledger flags:
+
+```bash
+--ledger-max-bytes=104857600
+--ledger-max-age=0s
+```
+
+`--ledger-max-bytes=0` disables size-based rotation. `--ledger-max-age=0s` disables age-based rotation.
+
+## Deploy To Kubernetes For Lifecycle Validation
+
+The default manifests do not collect real node traffic. They run the node-agent as a DaemonSet in mock mode with mock events mounted from `flow-ledger-mock-events`. This validates image startup, RBAC, informer sync, metadata enrichment behavior, JSONL writing, and metrics exposure.
 
 Build and publish an image for your cluster:
 
@@ -66,6 +94,7 @@ Expected resources:
 - Namespace: `flow-ledger-system`
 - ServiceAccount, ClusterRole, ClusterRoleBinding
 - ConfigMap: `flow-ledger-experiment`
+- ConfigMap: `flow-ledger-mock-events`
 - DaemonSet: `flow-ledger-node-agent`
 
 The DaemonSet mounts `/var/lib/flow-ledger` from each node. View records on a node:
@@ -80,6 +109,17 @@ View metrics:
 kubectl -n flow-ledger-system port-forward ds/flow-ledger-node-agent 9090:9090
 curl http://localhost:9090/metrics
 ```
+
+## Metadata Sync
+
+When running in Kubernetes, the agent waits for informer cache sync before starting the collector. The default timeout is 30 seconds:
+
+```bash
+--metadata-sync-timeout=30s
+--allow-unsynced-metadata=false
+```
+
+If sync times out and `--allow-unsynced-metadata=false`, the agent exits instead of writing early records with incomplete metadata. Local runs without in-cluster config skip this gate and use an empty metadata cache.
 
 ## JSONL Record Fields
 
@@ -96,6 +136,8 @@ Each line is a `session_summary` or `window_summary`.
 
 Mapping confidence values are `high`, `medium`, `low`, and `unknown`. Mapping methods include `pod_ip`, `service_cluster_ip`, `endpoint_slice`, `external_ip`, and `unknown`.
 
+`rollout_window` is reserved for future rollout detection and is currently always `false`. `pod_restart_window` is based on low-confidence pod mapping windows.
+
 ## Metrics
 
 - `flowledger_events_total`
@@ -107,10 +149,22 @@ Mapping confidence values are `high`, `medium`, `low`, and `unknown`. Mapping me
 - `flowledger_k8s_cache_pods`
 - `flowledger_k8s_cache_services`
 - `flowledger_k8s_watch_errors_total`
+- `flowledger_experiment_label_read_errors_total`
 
-## Current Limitations
+## Known Limitations
 
-- The eBPF collector is a v0 stub; use mock mode for local validation.
+- The eBPF collector is a v0 stub; use mock mode for validation.
+- Kubernetes deployment validates lifecycle and metadata plumbing only, not real traffic collection.
 - Session byte and packet counters treat event counters as cumulative and keep the maximum seen value.
-- Owner resolution depends on informer cache freshness and may temporarily emit `BarePod`, `ReplicaSet`, or `unknown` during startup.
+- Owner resolution depends on informer cache freshness and may temporarily emit `BarePod`, `ReplicaSet`, or `unknown` during startup or cache churn.
 - Node-origin detection is minimal in v0; hostNetwork Pods are preserved when they can be mapped by Pod IP.
+- Ledger rotation is local-only and does not compress, upload, or enforce global retention.
+
+## Next Steps Toward Real eBPF Collection
+
+- Define the kernel/user-space event ABI for TCP connect, accept, stats, and close events.
+- Generate Go bindings for the BPF object and load it with `github.com/cilium/ebpf`.
+- Attach probes or tracepoints appropriate for the target kernels and document required privileges.
+- Convert raw kernel events into the existing `collector.FlowEvent` shape.
+- Add integration tests or a privileged smoke-test path that is separate from regular unit tests.
+- Add deployment manifests for experimental real eBPF mode only after the collector emits real flow events.

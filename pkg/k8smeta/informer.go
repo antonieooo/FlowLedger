@@ -33,9 +33,11 @@ func NewInformerRunner(client kubernetes.Interface, metaCache *Cache, onWatchErr
 	}
 }
 
-func (r *InformerRunner) Run(ctx context.Context) error {
+func (r *InformerRunner) Run(ctx context.Context, ready chan<- error) error {
 	if r.client == nil || r.metaCache == nil {
-		return fmt.Errorf("kubernetes client and cache are required")
+		err := fmt.Errorf("kubernetes client and cache are required")
+		notifyReady(ready, err)
+		return err
 	}
 	runtime.ErrorHandlers = append(runtime.ErrorHandlers, func(_ context.Context, err error, _ string, _ ...interface{}) {
 		if err != nil && r.onWatchError != nil {
@@ -196,10 +198,23 @@ func (r *InformerRunner) Run(ctx context.Context) error {
 		jobs.HasSynced,
 		cronJobs.HasSynced,
 	); !ok {
-		return fmt.Errorf("timed out waiting for Kubernetes metadata cache sync")
+		err := fmt.Errorf("timed out waiting for Kubernetes metadata cache sync")
+		notifyReady(ready, err)
+		return err
 	}
+	notifyReady(ready, nil)
 	<-ctx.Done()
 	return ctx.Err()
+}
+
+func notifyReady(ready chan<- error, err error) {
+	if ready == nil {
+		return
+	}
+	select {
+	case ready <- err:
+	default:
+	}
 }
 
 func podFromDelete(obj interface{}) *corev1.Pod {

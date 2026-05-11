@@ -25,6 +25,9 @@ type Cache struct {
 
 	serviceByClusterIPPort map[string]*ServiceInfo
 	endpointByIPPort       map[string]*EndpointInfo
+	endpointOwnerByIPPort  map[string]string
+	endpointKeysBySlice    map[string][]string
+	endpointSlicesByKey    map[string]struct{}
 
 	workloads           map[types.UID]*WorkloadInfo
 	replicaSetToDeploy  map[types.UID]*WorkloadInfo
@@ -49,6 +52,9 @@ func NewCache() *Cache {
 		podIPTombstone:         map[string]tombstone{},
 		serviceByClusterIPPort: map[string]*ServiceInfo{},
 		endpointByIPPort:       map[string]*EndpointInfo{},
+		endpointOwnerByIPPort:  map[string]string{},
+		endpointKeysBySlice:    map[string][]string{},
+		endpointSlicesByKey:    map[string]struct{}{},
 		workloads:              map[types.UID]*WorkloadInfo{},
 		replicaSetToDeploy:     map[types.UID]*WorkloadInfo{},
 		replicaSetDeployUID:    map[types.UID]types.UID{},
@@ -141,11 +147,9 @@ func (c *Cache) UpsertEndpointSlice(slice *discoveryv1.EndpointSlice) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	serviceName := slice.Labels[discoveryv1.LabelServiceName]
-	for k, existing := range c.endpointByIPPort {
-		if existing.Service != nil && existing.Service.Namespace == slice.Namespace && existing.Service.Name == serviceName {
-			delete(c.endpointByIPPort, k)
-		}
-	}
+	sKey := endpointSliceKey(slice)
+	c.deleteEndpointSliceEndpointsLocked(sKey)
+	keys := []string{}
 	for _, ep := range slice.Endpoints {
 		var backend *PodInfo
 		if ep.TargetRef != nil && ep.TargetRef.Kind == "Pod" {
@@ -162,25 +166,26 @@ func (c *Cache) UpsertEndpointSlice(slice *discoveryv1.EndpointSlice) {
 					IP:      addr,
 					Port:    *port.Port,
 				}
-				c.endpointByIPPort[ServiceKey(addr, *port.Port)] = info
+				key := ServiceKey(addr, *port.Port)
+				c.endpointByIPPort[key] = info
+				c.endpointOwnerByIPPort[key] = sKey
+				keys = append(keys, key)
 			}
 		}
 	}
-	c.endpointSlices++
+	c.endpointKeysBySlice[sKey] = keys
+	c.endpointSlicesByKey[sKey] = struct{}{}
+	c.endpointSlices = len(c.endpointSlicesByKey)
 }
 
 func (c *Cache) DeleteEndpointSlice(slice *discoveryv1.EndpointSlice) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	serviceName := slice.Labels[discoveryv1.LabelServiceName]
-	for k, existing := range c.endpointByIPPort {
-		if existing.Service != nil && existing.Service.Namespace == slice.Namespace && existing.Service.Name == serviceName {
-			delete(c.endpointByIPPort, k)
-		}
-	}
-	if c.endpointSlices > 0 {
-		c.endpointSlices--
-	}
+	sKey := endpointSliceKey(slice)
+	c.deleteEndpointSliceEndpointsLocked(sKey)
+	delete(c.endpointKeysBySlice, sKey)
+	delete(c.endpointSlicesByKey, sKey)
+	c.endpointSlices = len(c.endpointSlicesByKey)
 }
 
 func (c *Cache) UpsertReplicaSet(rs *appsv1.ReplicaSet) {
@@ -293,6 +298,12 @@ func (c *Cache) Stats() (pods, services int) {
 	return c.pods, c.services
 }
 
+func (c *Cache) EndpointSliceCount() int {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.endpointSlices
+}
+
 func podInfoFromPod(pod *corev1.Pod) PodInfo {
 	var deleted *time.Time
 	if pod.DeletionTimestamp != nil {
@@ -380,4 +391,21 @@ func (c *Cache) findServiceByNamePortLocked(namespace, name string, port int32) 
 		}
 	}
 	return nil
+}
+
+func (c *Cache) deleteEndpointSliceEndpointsLocked(sliceKey string) {
+	for _, key := range c.endpointKeysBySlice[sliceKey] {
+		if c.endpointOwnerByIPPort[key] == sliceKey {
+			delete(c.endpointByIPPort, key)
+			delete(c.endpointOwnerByIPPort, key)
+		}
+	}
+	delete(c.endpointKeysBySlice, sliceKey)
+}
+
+func endpointSliceKey(slice *discoveryv1.EndpointSlice) string {
+	if slice.UID != "" {
+		return fmt.Sprintf("%s/%s/%s", slice.Namespace, slice.UID, slice.Name)
+	}
+	return fmt.Sprintf("%s/%s", slice.Namespace, slice.Name)
 }
