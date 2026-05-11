@@ -20,6 +20,23 @@ type FlowEvent struct {
 	BytesRecv   uint64 `json:"bytes_recv"`
 	PacketsSent uint64 `json:"packets_sent"`
 	PacketsRecv uint64 `json:"packets_recv"`
+
+	PacketSizes []uint64 `json:"packet_sizes,omitempty"`
+	IATMicros   []uint64 `json:"iat_us,omitempty"`
+
+	DirectionChanges uint64 `json:"direction_changes,omitempty"`
+	SYNCount         uint64 `json:"syn_count,omitempty"`
+	FINCount         uint64 `json:"fin_count,omitempty"`
+	RSTCount         uint64 `json:"rst_count,omitempty"`
+	RetransCount     uint64 `json:"retrans_count,omitempty"`
+	RTTEstimateUS    uint64 `json:"rtt_estimate_us,omitempty"`
+
+	TCPState    string `json:"tcp_state,omitempty"`
+	CloseReason string `json:"close_reason,omitempty"`
+
+	TrafficAccountingAvailable bool `json:"traffic_accounting_available,omitempty"`
+	PacketTimingAvailable     bool `json:"packet_timing_available,omitempty"`
+	TCPMetricsAvailable        bool `json:"tcp_metrics_available,omitempty"`
 }
 
 type Collector interface {

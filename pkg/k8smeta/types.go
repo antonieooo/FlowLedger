@@ -13,6 +13,9 @@ type PodInfo struct {
 	UID               types.UID
 	IP                string
 	NodeName          string
+	ContainerName     string
+	ContainerID       string
+	ImageDigest       string
 	ServiceAccount    string
 	OwnerReferences   []metav1.OwnerReference
 	Labels            map[string]string
@@ -23,13 +26,15 @@ type PodInfo struct {
 }
 
 type ServiceInfo struct {
-	Namespace  string
-	Name       string
-	UID        types.UID
-	ClusterIP  string
-	ClusterIPs []string
-	Port       int32
-	Protocol   string
+	Namespace   string
+	Name        string
+	UID         types.UID
+	ClusterIP   string
+	ClusterIPs  []string
+	Port        int32
+	PortName    string
+	AppProtocol string
+	Protocol    string
 }
 
 type EndpointInfo struct {

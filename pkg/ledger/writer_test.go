@@ -5,7 +5,14 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
+
+	"FlowLedger/pkg/experiment"
+	"FlowLedger/pkg/features"
+	"FlowLedger/pkg/identity"
+	"FlowLedger/pkg/sessionizer"
 )
 
 func TestLedgerWriterJSONL(t *testing.T) {
@@ -40,6 +47,87 @@ func TestLedgerWriterJSONL(t *testing.T) {
 	}
 	if got.FlowID != "flow-1" || got.RecordType != "session_summary" || got.DstPort != 443 {
 		t.Fatalf("unexpected record: %#v", got)
+	}
+}
+
+func TestBuildRecordV1Alpha2Fields(t *testing.T) {
+	now := time.Unix(100, 0).UTC()
+	ratio := 2.0
+	session := sessionizer.FlowSession{
+		RecordType:  "session_summary",
+		FlowID:      "flow-1",
+		NodeName:    "node-a",
+		StartTime:   now,
+		EndTime:     now.Add(time.Second),
+		DurationMS:  1000,
+		SrcIP:       "10.1.1.10",
+		SrcPort:     40000,
+		DstIP:       "1.1.1.1",
+		DstPort:     443,
+		Protocol:    "tcp",
+		IPFamily:    "ipv4",
+		BytesOut:    200,
+		BytesIn:     100,
+		PacketsOut:  2,
+		PacketsIn:   1,
+		CloseReason: "fin",
+		FeatureSnapshot: features.Snapshot{
+			BytesTotal:                 300,
+			PacketsTotal:               3,
+			ByteRatioOutIn:             &ratio,
+			PktSizeHistogram:           features.EmptyPacketSizeHistogram(),
+			TrafficAccountingAvailable: true,
+		},
+	}
+	resolved := identity.ResolvedFlow{
+		Src: identity.EndpointIdentity{
+			Namespace:  "default",
+			PodName:    "api",
+			Confidence: "high",
+			Method:     "pod_ip",
+		},
+		Dst: identity.EndpointIdentity{
+			External:   true,
+			Confidence: "low",
+			Method:     "external",
+		},
+		MappingMethod: "external",
+	}
+
+	record := BuildRecordWithContext(session, resolved, experiment.Labels{
+		ExperimentID:  "exp-1",
+		ScenarioLabel: "baseline",
+	}, BuildContext{
+		ClusterID:      "kind-thesis",
+		AgentID:        "node-a/pod-a",
+		CollectionMode: "mock",
+		HookSource:     "mock",
+	})
+	if record.SchemaVersion != features.SchemaVersion || record.FeatureSetVersion != features.FeatureSetVersion {
+		t.Fatalf("unexpected schema/feature versions: %#v", record)
+	}
+	if record.PayloadCollected || record.ProtocolGuess != "tls" || !record.IsTLSLike || !record.ReviewRequired {
+		t.Fatalf("unexpected reserved/model fields: %#v", record)
+	}
+	if record.Direction != "egress" || record.BytesTotal != 300 || record.ByteRatioOutIn == nil || *record.ByteRatioOutIn != 2 {
+		t.Fatalf("unexpected derived fields: %#v", record)
+	}
+
+	b, err := json.Marshal(record)
+	if err != nil {
+		t.Fatalf("json.Marshal: %v", err)
+	}
+	var fields map[string]any
+	if err := json.Unmarshal(b, &fields); err != nil {
+		t.Fatalf("json.Unmarshal map: %v", err)
+	}
+	for _, forbidden := range []string{"payload", "raw_payload", "http_path", "http_headers", "http_body"} {
+		if _, ok := fields[forbidden]; ok {
+			t.Fatalf("record contains forbidden field %q: %s", forbidden, b)
+		}
+	}
+	if strings.Contains(string(b), "http_path") || strings.Contains(string(b), "http_headers") || strings.Contains(string(b), "http_body") {
+		t.Fatalf("record contains forbidden HTTP payload metadata: %s", b)
 	}
 }
 

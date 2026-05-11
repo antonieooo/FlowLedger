@@ -9,19 +9,30 @@ import (
 )
 
 type EndpointIdentity struct {
-	Namespace      string
-	PodName        string
-	PodUID         string
-	WorkloadKind   string
-	WorkloadName   string
-	WorkloadUID    string
-	ServiceAccount string
-	Revision       string
-	ServiceName    string
-	External       bool
-	Confidence     string
-	Method         string
-	Reason         string
+	Namespace        string
+	PodName          string
+	PodUID           string
+	NodeName         string
+	ContainerName    string
+	ContainerID      string
+	CgroupID         uint64
+	WorkloadKind     string
+	WorkloadName     string
+	WorkloadUID      string
+	ReplicaSet       string
+	PodTemplateHash  string
+	ImageDigest      string
+	ServiceAccount   string
+	Revision         string
+	ServiceName      string
+	ServiceUID       string
+	ServiceNamespace string
+	ServicePortName  string
+	AppProtocol      string
+	External         bool
+	Confidence       string
+	Method           string
+	Reason           string
 }
 
 type ResolvedFlow struct {
@@ -56,6 +67,7 @@ func (r *Resolver) resolveSource(session sessionizer.FlowSession) EndpointIdenti
 	}
 	if pod, ok := r.cache.PodByIP(session.SrcIP); ok {
 		id := identityFromPod(pod, session.StartTime, "pod_ip")
+		id.CgroupID = 0
 		if pod.HostNetwork {
 			id.Method = "pod_ip"
 			id.Reason = "hostNetwork"
@@ -63,7 +75,7 @@ func (r *Resolver) resolveSource(session sessionizer.FlowSession) EndpointIdenti
 		return id
 	}
 	if isProbablyExternal(session.SrcIP) {
-		id := unknown("external_ip")
+		id := unknown("external")
 		id.External = true
 		id.Confidence = "low"
 		return id
@@ -76,32 +88,41 @@ func (r *Resolver) resolveDestination(session sessionizer.FlowSession) EndpointI
 		return unknown("unknown")
 	}
 	if pod, ok := r.cache.PodByIP(session.DstIP); ok {
-		return identityFromPod(pod, session.StartTime, "pod_ip")
+		id := identityFromPod(pod, session.StartTime, "pod_ip")
+		if ep, ok := r.cache.EndpointByIPPort(session.DstIP, session.DstPort); ok && ep.Service != nil {
+			applyServiceContext(&id, ep.Service)
+			id.Method = "endpoint_slice"
+		}
+		return id
 	}
 	if svc, ok := r.cache.ServiceByClusterIPPort(session.DstIP, session.DstPort); ok {
 		return EndpointIdentity{
-			Namespace:   svc.Namespace,
-			ServiceName: svc.Name,
-			Confidence:  "medium",
-			Method:      "service_cluster_ip",
+			Namespace:        svc.Namespace,
+			ServiceName:      svc.Name,
+			ServiceUID:       string(svc.UID),
+			ServiceNamespace: svc.Namespace,
+			ServicePortName:  svc.PortName,
+			AppProtocol:      svc.AppProtocol,
+			Confidence:       "medium",
+			Method:           "service_cluster_ip",
 		}
 	}
 	if ep, ok := r.cache.EndpointByIPPort(session.DstIP, session.DstPort); ok {
 		id := EndpointIdentity{Confidence: "medium", Method: "endpoint_slice"}
 		if ep.Service != nil {
 			id.Namespace = ep.Service.Namespace
-			id.ServiceName = ep.Service.Name
+			applyServiceContext(&id, ep.Service)
 		}
 		if ep.Backend != nil {
 			id = identityFromPod(ep.Backend, session.StartTime, "endpoint_slice")
 			if ep.Service != nil {
-				id.ServiceName = ep.Service.Name
+				applyServiceContext(&id, ep.Service)
 			}
 		}
 		return id
 	}
 	if isProbablyExternal(session.DstIP) {
-		id := unknown("external_ip")
+		id := unknown("external")
 		id.External = true
 		id.Confidence = "low"
 		return id
@@ -114,6 +135,10 @@ func identityFromPod(pod *k8smeta.PodInfo, flowStart time.Time, method string) E
 		Namespace:      pod.Namespace,
 		PodName:        pod.Name,
 		PodUID:         string(pod.UID),
+		NodeName:       pod.NodeName,
+		ContainerName:  pod.ContainerName,
+		ContainerID:    pod.ContainerID,
+		ImageDigest:    pod.ImageDigest,
 		ServiceAccount: pod.ServiceAccount,
 		Confidence:     "high",
 		Method:         method,
@@ -123,6 +148,16 @@ func identityFromPod(pod *k8smeta.PodInfo, flowStart time.Time, method string) E
 		id.WorkloadName = pod.Workload.Name
 		id.WorkloadUID = string(pod.Workload.UID)
 		id.Revision = pod.Workload.Revision
+		id.PodTemplateHash = pod.Workload.PodTemplateHash
+		id.ImageDigest = firstNonEmpty(id.ImageDigest, pod.Workload.ImageID)
+		if pod.Workload.Kind == "Deployment" {
+			for _, owner := range pod.OwnerReferences {
+				if owner.Kind == "ReplicaSet" {
+					id.ReplicaSet = owner.Name
+					break
+				}
+			}
+		}
 	}
 	if !pod.CreationTimestamp.IsZero() && flowStart.Before(pod.CreationTimestamp) {
 		id.Confidence = "low"
@@ -139,6 +174,23 @@ func identityFromPod(pod *k8smeta.PodInfo, flowStart time.Time, method string) E
 
 func unknown(method string) EndpointIdentity {
 	return EndpointIdentity{Confidence: "unknown", Method: method}
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+func applyServiceContext(id *EndpointIdentity, svc *k8smeta.ServiceInfo) {
+	id.ServiceName = svc.Name
+	id.ServiceUID = string(svc.UID)
+	id.ServiceNamespace = svc.Namespace
+	id.ServicePortName = svc.PortName
+	id.AppProtocol = svc.AppProtocol
 }
 
 func pickMappingMethod(src, dst EndpointIdentity) string {

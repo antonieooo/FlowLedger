@@ -1,8 +1,8 @@
 # Flow Ledger v0
 
-Flow Ledger v0 is a Kubernetes node-agent prototype for recording TCP/TLS flow metadata as JSONL `session_summary` and `window_summary` records with Kubernetes identity context.
+Flow Ledger v0 is a Kubernetes-aware flow evidence ledger. It records aggregated TCP flow metadata as JSONL `session_summary` and `window_summary` records with Kubernetes identity, service, topology, and model-ready feature context.
 
-It is a flow/session metadata ledger. It is not an IDS, alerting system, machine-learning system, packet capture tool, or TLS decryption tool.
+It is a flow/session metadata ledger. It is not an IDS, alerting system, machine-learning system, packet capture tool, or TLS decryption tool. It does not collect payloads.
 
 ## What v0 Implements
 
@@ -15,6 +15,7 @@ It is a flow/session metadata ledger. It is not an IDS, alerting system, machine
 - Prometheus metrics on `/metrics`.
 - A Kubernetes DaemonSet manifest for lifecycle, metadata, ledger, and metrics validation using mock events.
 - An experimental Linux eBPF collector for IPv4 TCP lifecycle events from `sock/inet_sock_set_state`.
+- Schema `v1alpha2` records with flow lifecycle fields, traffic statistics, Kubernetes identity, service/topology context, TLS/protocol visibility placeholders, and Fast Path / Slow Path review placeholders.
 
 ## What v0 Does Not Implement
 
@@ -25,6 +26,8 @@ It is a flow/session metadata ledger. It is not an IDS, alerting system, machine
 - No machine learning model yet.
 - No TLS decryption.
 - No payload capture or storage.
+- No TLS ClientHello, SNI, JA3, JA4, HTTP path, HTTP header, or HTTP body capture in the current implementation.
+- No ML inference or Slow Path reviewer verdicts yet; model/review fields are placeholders with simple reason codes.
 - No production retention, compression, or upload pipeline for ledger files.
 - No assumption that every flow maps to a Pod; `unknown` mapping is normal.
 
@@ -173,20 +176,19 @@ If sync times out and `--allow-unsynced-metadata=false`, the agent exits instead
 
 ## JSONL Record Fields
 
-Each line is a `session_summary` or `window_summary`.
+Each line is a `session_summary` or `window_summary` using schema `v1alpha2`. See [docs/schema-v1alpha2.md](docs/schema-v1alpha2.md) for field semantics, availability, and an example record.
 
-- Flow timing: `flow_id`, `node_name`, `start_time`, `end_time`, `duration_ms`
-- Network tuple: `src_ip`, `src_port`, `dst_ip`, `dst_port`, `protocol`
-- Counters: `bytes_out`, `bytes_in`, `packets_out`, `packets_in`
-- Source identity: `src_namespace`, `src_pod_name`, `src_pod_uid`, `src_workload_kind`, `src_workload_name`, `src_workload_uid`, `src_service_account`, `src_revision`
-- Destination identity: `dst_namespace`, `dst_pod_name`, `dst_pod_uid`, `dst_workload_kind`, `dst_workload_name`, `dst_workload_uid`, `dst_service_account`, `dst_service_name`, `dst_external`
-- Mapping quality: `src_mapping_confidence`, `dst_mapping_confidence`, `mapping_method`
-- Experiment labels: `experiment_id`, `scenario_label`, `scenario_phase`, `attack_enabled`, `load_level`
-- Windows: `rollout_window`, `pod_restart_window`
+- Record metadata: `schema_version`, `cluster_id`, `node_name`, `agent_id`, `collection_mode`, `hook_source`, experiment labels.
+- Flow lifecycle: `flow_id`, `window_id`, 5-tuple, direction, IP family, connection timing, TCP state, close reason, long-lived flag.
+- Traffic statistics: bytes, packets, totals, ratios, rates, packet size histogram, IAT estimates, TCP counters, and availability flags.
+- TLS/protocol metadata: reserved visibility fields such as `protocol_guess`, `is_tls_like`, `sni_hash`, `ja3_or_ja4_hash`, and `visibility_degraded`; no TLS plaintext or payload is stored.
+- Kubernetes identity: source and destination Pod, node, workload, ReplicaSet, service account, container metadata when available, image digest when available, and mapping confidence.
+- Service/topology/policy context: destination service fields, namespace/workload relation flags, external destination flag, and reserved policy/baseline fields.
+- Fast/review placeholders: feature set version, model/review placeholders, reason codes, action suggestion, retention tier, and `payload_collected=false`.
 
-Mapping confidence values are `high`, `medium`, `low`, and `unknown`. Mapping methods include `pod_ip`, `service_cluster_ip`, `endpoint_slice`, `external_ip`, and `unknown`.
+Mapping confidence values are `high`, `medium`, `low`, and `unknown`. Mapping methods include `pod_ip`, `service_cluster_ip`, `endpoint_slice`, `external`, and `unknown`.
 
-`rollout_window` is reserved for future rollout detection and is currently always `false`. `pod_restart_window` is based on low-confidence pod mapping windows.
+`rollout_window`, `hpa_scaling_window`, `expected_edge`, and `network_policy_allowed` are reserved or conservative in v0. `pod_restart_window` is based on low-confidence pod mapping windows.
 
 ## Metrics
 

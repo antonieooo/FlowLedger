@@ -26,6 +26,8 @@ import (
 
 type config struct {
 	nodeName            string
+	clusterID           string
+	agentID             string
 	mode                string
 	mockEventsPath      string
 	ledgerPath          string
@@ -33,6 +35,7 @@ type config struct {
 	experimentConfigMap string
 	sessionTimeout      time.Duration
 	windowSize          time.Duration
+	longLivedThreshold  time.Duration
 	metricsAddr         string
 	logLevel            string
 	metadataSyncTimeout time.Duration
@@ -52,6 +55,9 @@ func main() {
 	}
 	if cfg.nodeName == "" {
 		log.Fatal("--node-name is required when NODE_NAME and hostname are unavailable")
+	}
+	if cfg.agentID == "" {
+		cfg.agentID = defaultAgentID(cfg.nodeName)
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -107,8 +113,14 @@ func main() {
 	}
 
 	events, errs := flowCollector.Run(ctx)
-	sessions := sessionizer.New(cfg.nodeName, cfg.sessionTimeout, cfg.windowSize)
+	sessions := sessionizer.NewWithLongLivedThreshold(cfg.nodeName, cfg.sessionTimeout, cfg.windowSize, cfg.longLivedThreshold)
 	resolver := identity.NewResolver(metaCache)
+	recordContext := ledger.BuildContext{
+		ClusterID:      cfg.clusterID,
+		AgentID:        cfg.agentID,
+		CollectionMode: cfg.mode,
+		HookSource:     hookSource(cfg.mode),
+	}
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 	labelTicker := time.NewTicker(30 * time.Second)
@@ -120,13 +132,13 @@ func main() {
 	for {
 		select {
 		case <-ctx.Done():
-			emitSessions(writer, resolver, labels, sessions.CloseAll("timeout", time.Now().UTC()), m)
+			emitSessions(writer, resolver, labels, sessions.CloseAll("timeout", time.Now().UTC()), m, recordContext)
 			return
 		case ev, ok := <-events:
 			if !ok {
 				if !eventsClosed {
 					eventsClosed = true
-					emitSessions(writer, resolver, labels, sessions.CloseAll("timeout", time.Now().UTC()), m)
+					emitSessions(writer, resolver, labels, sessions.CloseAll("timeout", time.Now().UTC()), m, recordContext)
 					log.Print("collector finished; node-agent remains up for metrics until interrupted")
 				}
 				events = nil
@@ -137,7 +149,7 @@ func main() {
 				m.EBPFEventsTotal.Inc()
 				m.EBPFEventsByType.WithLabelValues(ev.EventType).Inc()
 			}
-			emitSessions(writer, resolver, labels, sessions.Process(ev), m)
+			emitSessions(writer, resolver, labels, sessions.Process(ev), m, recordContext)
 			m.SessionsActive.Set(float64(sessions.ActiveCount()))
 		case err, ok := <-errs:
 			if ok && err != nil && err != context.Canceled {
@@ -151,7 +163,7 @@ func main() {
 				log.Printf("collector error: %v", err)
 			}
 		case <-ticker.C:
-			emitSessions(writer, resolver, labels, sessions.Sweep(time.Now().UTC()), m)
+			emitSessions(writer, resolver, labels, sessions.Sweep(time.Now().UTC()), m, recordContext)
 			m.SessionsActive.Set(float64(sessions.ActiveCount()))
 			pods, services := metaCache.Stats()
 			m.K8sCachePods.Set(float64(pods))
@@ -170,6 +182,8 @@ func main() {
 func parseFlags() config {
 	var cfg config
 	flag.StringVar(&cfg.nodeName, "node-name", "", "Kubernetes node name")
+	flag.StringVar(&cfg.clusterID, "cluster-id", os.Getenv("FLOWLEDGER_CLUSTER_ID"), "cluster identifier for ledger records")
+	flag.StringVar(&cfg.agentID, "agent-id", os.Getenv("FLOWLEDGER_AGENT_ID"), "agent identifier for ledger records")
 	flag.StringVar(&cfg.mode, "mode", "mock", "collector mode: mock or ebpf")
 	flag.StringVar(&cfg.mockEventsPath, "mock-events-path", "", "JSONL mock flow event path")
 	flag.StringVar(&cfg.ledgerPath, "ledger-path", "/var/lib/flow-ledger/flows.jsonl", "output JSONL path")
@@ -177,6 +191,7 @@ func parseFlags() config {
 	flag.StringVar(&cfg.experimentConfigMap, "experiment-configmap", "flow-ledger-experiment", "experiment label ConfigMap name")
 	flag.DurationVar(&cfg.sessionTimeout, "session-timeout", 60*time.Second, "session inactivity timeout")
 	flag.DurationVar(&cfg.windowSize, "window-size", 30*time.Second, "long connection summary window size")
+	flag.DurationVar(&cfg.longLivedThreshold, "long-lived-threshold", 5*time.Minute, "duration threshold for is_long_lived feature")
 	flag.StringVar(&cfg.metricsAddr, "metrics-addr", ":9090", "metrics listen address")
 	flag.StringVar(&cfg.logLevel, "log-level", "info", "log level")
 	flag.DurationVar(&cfg.metadataSyncTimeout, "metadata-sync-timeout", 30*time.Second, "maximum time to wait for Kubernetes metadata cache sync before processing events")
@@ -231,7 +246,7 @@ func maybeKubernetesClient() kubernetes.Interface {
 	return client
 }
 
-func emitSessions(w *ledger.Writer, resolver *identity.Resolver, labels experiment.Labels, sessions []sessionizer.FlowSession, m *flmetrics.Metrics) {
+func emitSessions(w *ledger.Writer, resolver *identity.Resolver, labels experiment.Labels, sessions []sessionizer.FlowSession, m *flmetrics.Metrics, recordContext ledger.BuildContext) {
 	for _, session := range sessions {
 		resolved := resolver.Resolve(session)
 		if resolved.Src.Confidence == "unknown" {
@@ -240,13 +255,35 @@ func emitSessions(w *ledger.Writer, resolver *identity.Resolver, labels experime
 		if resolved.Dst.Confidence == "unknown" {
 			m.UnknownDstMappings.Inc()
 		}
-		record := ledger.BuildRecord(session, resolved, labels)
+		record := ledger.BuildRecordWithContext(session, resolved, labels, recordContext)
 		if err := w.Write(record); err != nil {
 			m.LedgerWriteErrors.Inc()
 			log.Printf("write ledger record %s: %v", session.FlowID, err)
 			continue
 		}
 		m.SessionsEmittedTotal.Inc()
+	}
+}
+
+func defaultAgentID(nodeName string) string {
+	host, err := os.Hostname()
+	if err != nil || host == "" {
+		return nodeName
+	}
+	if nodeName == "" || nodeName == host {
+		return host
+	}
+	return nodeName + "/" + host
+}
+
+func hookSource(mode string) string {
+	switch mode {
+	case "mock":
+		return "mock"
+	case "ebpf":
+		return "tracepoint:sock:inet_sock_set_state"
+	default:
+		return "unknown"
 	}
 }
 

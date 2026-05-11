@@ -63,6 +63,15 @@ func (c *MockCollector) Run(ctx context.Context) (<-chan FlowEvent, <-chan error
 				if ev.Protocol == "" {
 					ev.Protocol = "tcp"
 				}
+				if ev.BytesSent > 0 || ev.BytesRecv > 0 || ev.PacketsSent > 0 || ev.PacketsRecv > 0 {
+					ev.TrafficAccountingAvailable = true
+				}
+				if len(ev.PacketSizes) > 0 || len(ev.IATMicros) > 0 {
+					ev.PacketTimingAvailable = true
+				}
+				if ev.SYNCount > 0 || ev.FINCount > 0 || ev.RSTCount > 0 || ev.RetransCount > 0 || ev.RTTEstimateUS > 0 {
+					ev.TCPMetricsAvailable = true
+				}
 
 				select {
 				case <-ctx.Done():

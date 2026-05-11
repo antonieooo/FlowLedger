@@ -25,6 +25,9 @@ func TestConvertRawEBPFEventIPv4Connect(t *testing.T) {
 	if ev.EventType != "CONNECT" || ev.SrcIP != "10.244.1.10" || ev.DstIP != "10.96.0.10" || ev.Protocol != "tcp" {
 		t.Fatalf("unexpected event: %#v", ev)
 	}
+	if ev.TCPState != "established" {
+		t.Fatalf("TCPState = %q, want established", ev.TCPState)
+	}
 	if ev.SrcPort != 43120 || ev.DstPort != 443 || ev.PID != 10 || ev.TGID != 20 || ev.CgroupID != 30 {
 		t.Fatalf("unexpected metadata: %#v", ev)
 	}
@@ -41,7 +44,7 @@ func TestConvertRawEBPFEventClose(t *testing.T) {
 	if err != nil {
 		t.Fatalf("convertRawEBPFEventToFlowEvent: %v", err)
 	}
-	if ev.EventType != "CLOSE" {
+	if ev.EventType != "CLOSE" || ev.TCPState != "close" || ev.CloseReason != "unknown" {
 		t.Fatalf("EventType = %q, want CLOSE", ev.EventType)
 	}
 }

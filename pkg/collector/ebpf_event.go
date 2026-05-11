@@ -48,7 +48,7 @@ func convertRawEBPFEventToFlowEvent(raw rawEBPFEvent) (FlowEvent, error) {
 		return FlowEvent{}, fmt.Errorf("unsupported ebpf protocol %d", raw.Protocol)
 	}
 
-	return FlowEvent{
+	ev := FlowEvent{
 		TimestampNS: raw.TimestampNS,
 		EventType:   eventType,
 		PID:         raw.PID,
@@ -64,7 +64,15 @@ func convertRawEBPFEventToFlowEvent(raw rawEBPFEvent) (FlowEvent, error) {
 		BytesRecv:   raw.BytesRecv,
 		PacketsSent: raw.PacketsSent,
 		PacketsRecv: raw.PacketsRecv,
-	}, nil
+	}
+	switch eventType {
+	case "CONNECT":
+		ev.TCPState = "established"
+	case "CLOSE":
+		ev.TCPState = "close"
+		ev.CloseReason = "unknown"
+	}
+	return ev, nil
 }
 
 func ebpfEventType(rawType uint32) (string, error) {

@@ -118,13 +118,15 @@ func (c *Cache) UpsertService(svc *corev1.Service) {
 		}
 		for _, p := range svc.Spec.Ports {
 			info := &ServiceInfo{
-				Namespace:  svc.Namespace,
-				Name:       svc.Name,
-				UID:        svc.UID,
-				ClusterIP:  ip,
-				ClusterIPs: append([]string{}, ips...),
-				Port:       p.Port,
-				Protocol:   string(p.Protocol),
+				Namespace:   svc.Namespace,
+				Name:        svc.Name,
+				UID:         svc.UID,
+				ClusterIP:   ip,
+				ClusterIPs:  append([]string{}, ips...),
+				Port:        p.Port,
+				PortName:    p.Name,
+				AppProtocol: serviceAppProtocol(p.AppProtocol, p.Name),
+				Protocol:    string(p.Protocol),
 			}
 			c.serviceByClusterIPPort[ServiceKey(ip, p.Port)] = info
 		}
@@ -310,12 +312,25 @@ func podInfoFromPod(pod *corev1.Pod) PodInfo {
 		t := pod.DeletionTimestamp.Time
 		deleted = &t
 	}
+	containerName := ""
+	if len(pod.Spec.Containers) > 0 {
+		containerName = pod.Spec.Containers[0].Name
+	}
+	containerID := ""
+	imageDigest := ""
+	if len(pod.Status.ContainerStatuses) > 0 {
+		containerID = pod.Status.ContainerStatuses[0].ContainerID
+		imageDigest = imageDigestFromImageID(pod.Status.ContainerStatuses[0].ImageID)
+	}
 	return PodInfo{
 		Namespace:         pod.Namespace,
 		Name:              pod.Name,
 		UID:               pod.UID,
 		IP:                pod.Status.PodIP,
 		NodeName:          pod.Spec.NodeName,
+		ContainerName:     containerName,
+		ContainerID:       containerID,
+		ImageDigest:       imageDigest,
 		ServiceAccount:    pod.Spec.ServiceAccountName,
 		OwnerReferences:   append([]metav1.OwnerReference{}, pod.OwnerReferences...),
 		Labels:            copyStringMap(pod.Labels),
@@ -340,6 +355,27 @@ func workloadFromObject(kind, namespace, name string, uid types.UID, labels, ann
 		w.Image = containers[0].Image
 	}
 	return w
+}
+
+func serviceAppProtocol(appProtocol *string, portName string) string {
+	if appProtocol != nil {
+		return *appProtocol
+	}
+	switch portName {
+	case "http", "http2", "https", "grpc", "grpc-web":
+		return portName
+	default:
+		return ""
+	}
+}
+
+func imageDigestFromImageID(imageID string) string {
+	for i := len(imageID) - 1; i >= 0; i-- {
+		if imageID[i] == '@' {
+			return imageID[i+1:]
+		}
+	}
+	return ""
 }
 
 func copyStringMap(in map[string]string) map[string]string {
