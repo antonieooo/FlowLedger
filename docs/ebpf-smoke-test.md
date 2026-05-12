@@ -2,12 +2,13 @@
 
 ## Purpose
 
-This smoke test verifies the local Linux eBPF collector path for real TCP lifecycle events:
+This smoke test verifies the local Linux eBPF collector path for real TCP lifecycle and lightweight counter events:
 
 - The eBPF collector can start.
 - The eBPF program can attach to `sock/inet_sock_set_state`.
+- The eBPF program can attach to `tcp_sendmsg` / `tcp_recvmsg` accounting hooks when enabled.
 - The ring buffer can deliver kernel events to Go userspace.
-- `CONNECT` and `CLOSE` events can be converted into `collector.FlowEvent`.
+- `CONNECT`, `STATS`, and `CLOSE` events can be converted into `collector.FlowEvent`.
 - The sessionizer can emit `session_summary` records.
 - `flows.jsonl` can be written.
 - Metrics can reflect eBPF events.
@@ -17,7 +18,7 @@ This smoke test does not verify:
 - Kubernetes DaemonSet deployment.
 - Pod identity enrichment.
 - Service or EndpointSlice mapping.
-- Bytes or packets accounting.
+- Exact wire-level packet accounting.
 - TLS metadata.
 - Malicious traffic detection.
 - ML or alerting.
@@ -32,7 +33,7 @@ Use a Linux or WSL2 Ubuntu environment with:
 - Optional `bpftool`.
 - Kernel support for eBPF, tracepoints, and ring buffers.
 - A passing `go test ./...` run.
-- Awareness that the current eBPF collector only supports IPv4 TCP lifecycle events.
+- Awareness that the current eBPF collector only supports IPv4 TCP lifecycle and lightweight send/recv accounting.
 
 Install common dependencies:
 
@@ -72,7 +73,8 @@ sudo go run ./cmd/node-agent \
   --mode ebpf \
   --ledger-path ./flows.jsonl \
   --node-name local-ebpf-test \
-  --metrics-addr :9090
+  --metrics-addr :9090 \
+  --ebpf-enable-traffic-accounting=true
 ```
 
 Expected logs should include:
@@ -81,6 +83,7 @@ Expected logs should include:
 - `mode=ebpf`
 - `kubernetes in-cluster config not available; running with empty metadata cache`, which is normal outside Kubernetes.
 - `ebpf collector attached tracepoint sock/inet_sock_set_state`
+- `ebpf collector attached tcp send/recv accounting hooks`
 - `ebpf collector started ringbuf reader`
 
 ## Generate Real TCP Traffic
@@ -106,10 +109,24 @@ Terminal B:
 echo "hello" | nc 127.0.0.1 18080
 ```
 
+For a larger local transfer:
+
+Terminal A:
+
+```sh
+nc -l 127.0.0.1 18080 > /tmp/flowledger-nc.out
+```
+
+Terminal B:
+
+```sh
+dd if=/dev/zero bs=1024 count=100 | nc 127.0.0.1 18080
+```
+
 Notes:
 
-- The current eBPF collector only observes TCP lifecycle state changes, so HTTPS/TLS content is not decrypted.
-- `bytes` and `packets` may be `0`; this is a known limitation.
+- The current eBPF collector observes TCP lifecycle state changes and lightweight send/recv counters. HTTPS/TLS content is not decrypted.
+- Packet counters are syscall/message approximations, not exact wire packet counts.
 - Local loopback visibility can vary by kernel path. If loopback does not produce useful events, prefer external IPv4 traffic with `curl -4`.
 
 ## Verify flows.jsonl
@@ -130,7 +147,9 @@ Expected records should include at least one:
 - Event-derived `start_time`, `end_time`, and `duration_ms`.
 - Non-empty `src_ip`, `dst_ip`, `src_port`, and `dst_port`.
 - `src_mapping_confidence` and `dst_mapping_confidence` may be `unknown`, which is normal in a local non-Kubernetes environment.
-- `bytes_out`, `bytes_in`, `packets_out`, and `packets_in` may currently be `0`.
+- `STATS` records or final `CLOSE` records with `traffic_accounting_available=true`.
+- `bytes_out` or `bytes_in` should be non-zero for flows that hit the send/recv hooks.
+- `packets_out` and `packets_in` are approximate syscall/message counters.
 
 ## Verify Metrics
 
@@ -146,6 +165,11 @@ Focus on:
 - `flowledger_ebpf_events_by_type_total`
 - `flowledger_ebpf_read_errors_total`
 - `flowledger_ebpf_attach_errors_total`
+- `flowledger_ebpf_stats_events_total`
+- `flowledger_ebpf_connect_events_total`
+- `flowledger_ebpf_close_events_total`
+- `flowledger_ebpf_ringbuf_reserve_failures_total`
+- `flowledger_ebpf_map_full_drops_total`
 - `flowledger_sessions_emitted_total`
 
 Expected behavior:
@@ -153,6 +177,8 @@ Expected behavior:
 - `flowledger_ebpf_events_total` is greater than `0`.
 - `CONNECT` event count is greater than `0`.
 - `CLOSE` event count is preferably greater than `0`.
+- `STATS` events should increase during longer or larger transfers.
+- Ring buffer reserve failures and map full drops should not continuously increase.
 - Read errors should not continuously increase.
 - Attach errors should be `0`.
 - Sessions emitted should increase as connections close.
@@ -190,7 +216,7 @@ This is normal in local WSL/Linux tests. The process is not running as a Kuberne
 
 ### E. bytes/packets are zero
 
-The first eBPF collector version only observes TCP lifecycle events. It does not attach to `tcp_sendmsg` or `tcp_recvmsg`, so byte and packet counters being `0` is expected.
+Check that the agent was started with `--ebpf-enable-traffic-accounting=true` and that logs show the tcp send/recv accounting hooks attached. Very short connections may close before a periodic `STATS` event, but the final `CLOSE` should carry counters if the send/recv hooks observed the flow. If counters remain zero, the current kernel may not expose the expected hook path for that traffic.
 
 ### F. IPv6 traffic not captured
 
@@ -205,6 +231,7 @@ The smoke test passes when:
 - eBPF attach has no error.
 - After real `curl` or `nc` TCP connections, eBPF event metrics increase.
 - `flows.jsonl` contains at least one `session_summary` from a real connection.
+- With traffic accounting enabled, at least one `STATS` or `CLOSE` record has `traffic_accounting_available=true` and non-zero byte counters.
 - The JSONL output can be parsed by `jq`.
 - Ring buffer or read errors do not continuously increase.
 
@@ -217,6 +244,6 @@ The smoke test passes when:
 - Does not verify TLS tunnel identification.
 - Does not capture payload.
 - Does not decrypt TLS.
-- `bytes` and `packets` are currently `0`.
+- Packet counters are approximate syscall/message counters until TC/SKB hooks are implemented.
 - IPv4 TCP only.
 - PID and CgroupID at this tracepoint are best-effort and should not be treated as strong attribution evidence.

@@ -14,12 +14,12 @@ It is a flow/session metadata ledger. It is not an IDS, alerting system, machine
 - JSONL ledger writing with basic size/age rotation.
 - Prometheus metrics on `/metrics`.
 - A Kubernetes DaemonSet manifest for lifecycle, metadata, ledger, and metrics validation using mock events.
-- An experimental Linux eBPF collector for IPv4 TCP lifecycle events from `sock/inet_sock_set_state`.
+- An experimental Linux eBPF collector for IPv4 TCP lifecycle events plus lightweight send/recv traffic accounting.
 - Schema `v1alpha2` records with flow lifecycle fields, traffic statistics, Kubernetes identity, service/topology context, TLS/protocol visibility placeholders, and Fast Path / Slow Path review placeholders.
 
 ## What v0 Does Not Implement
 
-- No full traffic accounting yet; eBPF bytes and packet counters are currently zero.
+- No wire-level packet accounting yet; eBPF packet counters are syscall/message-level approximations from `tcp_sendmsg` and `tcp_recvmsg`.
 - No fast-path detection yet.
 - No slow-path review yet.
 - No alerting yet.
@@ -132,16 +132,31 @@ curl http://localhost:9090/metrics
 
 ## Experimental eBPF Collector
 
-The eBPF collector is Linux-only and experimental. It attaches to the `sock/inet_sock_set_state` tracepoint and emits TCP IPv4 lifecycle events into the existing FlowLedger pipeline.
+The eBPF collector is Linux-only and experimental. It attaches to the `sock/inet_sock_set_state` tracepoint for lifecycle events and, when enabled, `tcp_sendmsg` / `tcp_recvmsg` kprobe hooks for lightweight traffic accounting.
 
 Current capture behavior:
 
 - `newstate == TCP_ESTABLISHED` becomes `CONNECT`.
 - `newstate == TCP_CLOSE` becomes `CLOSE`.
 - IPv6 is not emitted yet.
-- Bytes and packet counters are emitted as `0`.
+- eBPF maps aggregate cumulative `bytes_sent`, `bytes_recv`, `packets_sent`, and `packets_recv` per flow.
+- `STATS` summary events are emitted at a fixed interval instead of per packet/message.
+- Packet counters are approximate syscall/message counters, not exact wire packet counts.
 - No payload is captured.
 - TLS is not decrypted.
+
+Traffic accounting flags:
+
+```bash
+--ebpf-flow-map-max-entries=65536
+--ebpf-stats-emit-interval=5s
+--ebpf-enable-traffic-accounting=true
+--ebpf-enable-tcp-basic-metrics=true
+--ebpf-enable-packet-timing=false
+--ebpf-enable-packet-histogram=false
+```
+
+`--ebpf-flow-map-max-entries` is applied to the eBPF LRU flow map before load. The current STATS interval is mirrored by a BPF compile-time constant; change `EBPF_EMIT_INTERVAL_NS` in `bpf/flow_events.bpf.c` and run `go generate ./...` if you need a different kernel-side interval. Packet timing and packet histogram flags are reserved and currently do not attach extra hooks.
 
 Local Linux test, usually requiring root or equivalent BPF permissions:
 
@@ -210,8 +225,8 @@ Mapping confidence values are `high`, `medium`, `low`, and `unknown`. Mapping me
 ## Known Limitations
 
 - The default Kubernetes deployment validates lifecycle and metadata plumbing only, not real traffic collection.
-- The experimental eBPF collector captures TCP IPv4 connect/close lifecycle only.
-- eBPF byte and packet counters are currently zero until send/receive accounting is added.
+- The experimental eBPF collector captures TCP IPv4 lifecycle and lightweight send/receive counters only.
+- eBPF packet counters are syscall/message-level approximations until TC/SKB hooks are added.
 - Session byte and packet counters treat event counters as cumulative and keep the maximum seen value.
 - Owner resolution depends on informer cache freshness and may temporarily emit `BarePod`, `ReplicaSet`, or `unknown` during startup or cache churn.
 - Node-origin detection is minimal in v0; hostNetwork Pods are preserved when they can be mapped by Pod IP.
@@ -219,8 +234,8 @@ Mapping confidence values are `high`, `medium`, `low`, and `unknown`. Mapping me
 
 ## Next Steps Toward Richer eBPF Collection
 
-- Add `tcp_sendmsg` / `tcp_recvmsg` or equivalent accounting for bytes.
-- Add packet counters only if they can be collected without payload capture.
+- Add TC/SKB hooks for true wire-level packet counters if needed.
+- Add packet timing and packet size histograms without payload capture.
 - Add IPv6 event conversion.
 - Add netns inode enrichment from `skaddr` or task context.
 - Add integration tests or a privileged smoke-test path that is separate from regular unit tests.

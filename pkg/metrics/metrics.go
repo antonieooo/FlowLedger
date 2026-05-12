@@ -10,20 +10,29 @@ import (
 )
 
 type Metrics struct {
-	EventsTotal               prometheus.Counter
-	SessionsActive            prometheus.Gauge
-	SessionsEmittedTotal      prometheus.Counter
-	UnknownSrcMappings        prometheus.Counter
-	UnknownDstMappings        prometheus.Counter
-	LedgerWriteErrors         prometheus.Counter
-	K8sCachePods              prometheus.Gauge
-	K8sCacheServices          prometheus.Gauge
-	K8sWatchErrors            prometheus.Counter
-	ExperimentLabelReadErrors prometheus.Counter
-	EBPFEventsTotal           prometheus.Counter
-	EBPFReadErrors            prometheus.Counter
-	EBPFAttachErrors          prometheus.Counter
-	EBPFEventsByType          *prometheus.CounterVec
+	EventsTotal                  prometheus.Counter
+	SessionsActive               prometheus.Gauge
+	SessionsEmittedTotal         prometheus.Counter
+	UnknownSrcMappings           prometheus.Counter
+	UnknownDstMappings           prometheus.Counter
+	LedgerWriteErrors            prometheus.Counter
+	K8sCachePods                 prometheus.Gauge
+	K8sCacheServices             prometheus.Gauge
+	K8sWatchErrors               prometheus.Counter
+	ExperimentLabelReadErrors    prometheus.Counter
+	EBPFEventsTotal              prometheus.Counter
+	EBPFReadErrors               prometheus.Counter
+	EBPFAttachErrors             prometheus.Counter
+	EBPFEventsByType             *prometheus.CounterVec
+	EBPFFlowMapEntries           prometheus.Gauge
+	EBPFFlowMapMaxEntries        prometheus.Gauge
+	EBPFMapFullDropsTotal        prometheus.Counter
+	EBPFRingbufReserveFailures   prometheus.Counter
+	EBPFLostEventsTotal          prometheus.Counter
+	EBPFStatsEventsTotal         prometheus.Counter
+	EBPFConnectEventsTotal       prometheus.Counter
+	EBPFCloseEventsTotal         prometheus.Counter
+	EBPFTrafficAccountingEnabled prometheus.Gauge
 }
 
 func New() *Metrics {
@@ -84,6 +93,42 @@ func New() *Metrics {
 			Name: "flowledger_ebpf_events_by_type_total",
 			Help: "Total eBPF flow events read from the kernel by event type.",
 		}, []string{"event_type"}),
+		EBPFFlowMapEntries: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "flowledger_ebpf_flow_map_entries",
+			Help: "Current eBPF flow map entries when exported by the collector.",
+		}),
+		EBPFFlowMapMaxEntries: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "flowledger_ebpf_flow_map_max_entries",
+			Help: "Configured maximum eBPF flow map entries.",
+		}),
+		EBPFMapFullDropsTotal: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "flowledger_ebpf_map_full_drops_total",
+			Help: "Total eBPF flow/drop map update failures.",
+		}),
+		EBPFRingbufReserveFailures: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "flowledger_ebpf_ringbuf_reserve_failures_total",
+			Help: "Total eBPF ring buffer reserve failures reported by the kernel program.",
+		}),
+		EBPFLostEventsTotal: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "flowledger_ebpf_lost_events_total",
+			Help: "Total eBPF events dropped before userspace processing.",
+		}),
+		EBPFStatsEventsTotal: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "flowledger_ebpf_stats_events_total",
+			Help: "Total eBPF STATS summary events.",
+		}),
+		EBPFConnectEventsTotal: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "flowledger_ebpf_connect_events_total",
+			Help: "Total eBPF CONNECT summary events.",
+		}),
+		EBPFCloseEventsTotal: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "flowledger_ebpf_close_events_total",
+			Help: "Total eBPF CLOSE summary events.",
+		}),
+		EBPFTrafficAccountingEnabled: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "flowledger_ebpf_traffic_accounting_enabled",
+			Help: "Whether eBPF send/recv traffic accounting hooks are enabled.",
+		}),
 	}
 	prometheus.MustRegister(
 		m.EventsTotal,
@@ -100,6 +145,15 @@ func New() *Metrics {
 		m.EBPFReadErrors,
 		m.EBPFAttachErrors,
 		m.EBPFEventsByType,
+		m.EBPFFlowMapEntries,
+		m.EBPFFlowMapMaxEntries,
+		m.EBPFMapFullDropsTotal,
+		m.EBPFRingbufReserveFailures,
+		m.EBPFLostEventsTotal,
+		m.EBPFStatsEventsTotal,
+		m.EBPFConnectEventsTotal,
+		m.EBPFCloseEventsTotal,
+		m.EBPFTrafficAccountingEnabled,
 	)
 	return m
 }

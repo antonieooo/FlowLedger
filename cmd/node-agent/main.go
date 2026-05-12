@@ -25,23 +25,29 @@ import (
 )
 
 type config struct {
-	nodeName            string
-	clusterID           string
-	agentID             string
-	mode                string
-	mockEventsPath      string
-	ledgerPath          string
-	namespace           string
-	experimentConfigMap string
-	sessionTimeout      time.Duration
-	windowSize          time.Duration
-	longLivedThreshold  time.Duration
-	metricsAddr         string
-	logLevel            string
-	metadataSyncTimeout time.Duration
-	allowUnsyncedMeta   bool
-	ledgerMaxBytes      int64
-	ledgerMaxAge        time.Duration
+	nodeName                    string
+	clusterID                   string
+	agentID                     string
+	mode                        string
+	mockEventsPath              string
+	ledgerPath                  string
+	namespace                   string
+	experimentConfigMap         string
+	sessionTimeout              time.Duration
+	windowSize                  time.Duration
+	longLivedThreshold          time.Duration
+	metricsAddr                 string
+	logLevel                    string
+	metadataSyncTimeout         time.Duration
+	allowUnsyncedMeta           bool
+	ledgerMaxBytes              int64
+	ledgerMaxAge                time.Duration
+	ebpfFlowMapMaxEntries       uint
+	ebpfStatsEmitInterval       time.Duration
+	ebpfEnableTrafficAccounting bool
+	ebpfEnableTCPBasicMetrics   bool
+	ebpfEnablePacketTiming      bool
+	ebpfEnablePacketHistogram   bool
 }
 
 func main() {
@@ -107,9 +113,20 @@ func main() {
 	case "mock":
 		flowCollector = collector.NewMockCollector(cfg.mockEventsPath)
 	case "ebpf":
-		flowCollector = collector.NewEBPFCollector()
+		flowCollector = collector.NewEBPFCollectorWithOptions(collector.EBPFOptions{
+			FlowMapMaxEntries:       uint32(cfg.ebpfFlowMapMaxEntries),
+			StatsEmitInterval:       cfg.ebpfStatsEmitInterval,
+			EnableTrafficAccounting: cfg.ebpfEnableTrafficAccounting,
+			EnableTCPBasicMetrics:   cfg.ebpfEnableTCPBasicMetrics,
+			EnablePacketTiming:      cfg.ebpfEnablePacketTiming,
+			EnablePacketHistogram:   cfg.ebpfEnablePacketHistogram,
+		})
 	default:
 		log.Fatalf("unsupported --mode %q", cfg.mode)
+	}
+	m.EBPFFlowMapMaxEntries.Set(float64(cfg.ebpfFlowMapMaxEntries))
+	if cfg.mode == "ebpf" && cfg.ebpfEnableTrafficAccounting {
+		m.EBPFTrafficAccountingEnabled.Set(1)
 	}
 
 	events, errs := flowCollector.Run(ctx)
@@ -144,10 +161,22 @@ func main() {
 				events = nil
 				continue
 			}
+			if cfg.mode == "ebpf" && ev.EventType == "DROP" {
+				applyEBPFDropMetric(m, ev)
+				continue
+			}
 			m.EventsTotal.Inc()
 			if cfg.mode == "ebpf" {
 				m.EBPFEventsTotal.Inc()
 				m.EBPFEventsByType.WithLabelValues(ev.EventType).Inc()
+				switch ev.EventType {
+				case "CONNECT":
+					m.EBPFConnectEventsTotal.Inc()
+				case "STATS":
+					m.EBPFStatsEventsTotal.Inc()
+				case "CLOSE":
+					m.EBPFCloseEventsTotal.Inc()
+				}
 			}
 			emitSessions(writer, resolver, labels, sessions.Process(ev), m, recordContext)
 			m.SessionsActive.Set(float64(sessions.ActiveCount()))
@@ -198,6 +227,12 @@ func parseFlags() config {
 	flag.BoolVar(&cfg.allowUnsyncedMeta, "allow-unsynced-metadata", false, "continue if Kubernetes metadata cache sync fails or times out")
 	flag.Int64Var(&cfg.ledgerMaxBytes, "ledger-max-bytes", 100*1024*1024, "rotate ledger when current file reaches this many bytes; 0 disables size rotation")
 	flag.DurationVar(&cfg.ledgerMaxAge, "ledger-max-age", 0, "rotate ledger after this duration; 0 disables age rotation")
+	flag.UintVar(&cfg.ebpfFlowMapMaxEntries, "ebpf-flow-map-max-entries", 65536, "maximum entries for the eBPF flow stats map")
+	flag.DurationVar(&cfg.ebpfStatsEmitInterval, "ebpf-stats-emit-interval", 5*time.Second, "target eBPF STATS summary emit interval; currently mirrored by a BPF compile-time constant")
+	flag.BoolVar(&cfg.ebpfEnableTrafficAccounting, "ebpf-enable-traffic-accounting", true, "attach eBPF tcp_sendmsg/tcp_recvmsg accounting hooks")
+	flag.BoolVar(&cfg.ebpfEnableTCPBasicMetrics, "ebpf-enable-tcp-basic-metrics", true, "enable basic eBPF TCP lifecycle counters when supported")
+	flag.BoolVar(&cfg.ebpfEnablePacketTiming, "ebpf-enable-packet-timing", false, "reserved: enable eBPF packet timing features when implemented")
+	flag.BoolVar(&cfg.ebpfEnablePacketHistogram, "ebpf-enable-packet-histogram", false, "reserved: enable eBPF packet size histogram features when implemented")
 	flag.Parse()
 	return cfg
 }
@@ -284,6 +319,23 @@ func hookSource(mode string) string {
 		return "tracepoint:sock:inet_sock_set_state"
 	default:
 		return "unknown"
+	}
+}
+
+func applyEBPFDropMetric(m *flmetrics.Metrics, ev collector.FlowEvent) {
+	count := ev.DropCount
+	if count == 0 {
+		count = 1
+	}
+	switch ev.DropReason {
+	case "map_update_failed":
+		m.EBPFMapFullDropsTotal.Add(float64(count))
+	case "ringbuf_reserve_failed":
+		m.EBPFRingbufReserveFailures.Add(float64(count))
+	case "unsupported_family", "recv_arg_missed":
+		return
+	default:
+		m.EBPFLostEventsTotal.Add(float64(count))
 	}
 }
 

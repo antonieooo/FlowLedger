@@ -47,7 +47,7 @@ FlowLedger writes JSONL records. Each line is either:
 - TCP behavior: `syn_count`, `fin_count`, `rst_count`, `retrans_count`, `rtt_estimate_us`
 - Availability flags: `traffic_accounting_available`, `packet_timing_available`, `tcp_metrics_available`
 
-Unavailable numeric estimates are serialized as `null` where the type is an estimate, or `0` for counters. The packet size histogram uses fixed buckets:
+Unavailable numeric estimates are serialized as `null` where the type is an estimate, or `0` for counters. With the current eBPF traffic-accounting hooks, packet counters are syscall/message-level approximations from `tcp_sendmsg` and `tcp_recvmsg`, not exact wire packet counts. The packet size histogram uses fixed buckets:
 
 ```text
 0-63, 64-127, 128-255, 256-511, 512-1023, 1024-1500, >1500
@@ -115,14 +115,17 @@ Currently real:
 
 - Mock and eBPF lifecycle events.
 - eBPF IPv4 TCP `CONNECT` and `CLOSE` from `sock/inet_sock_set_state`.
+- eBPF cumulative `bytes_sent` / `bytes_recv` when traffic accounting is enabled.
+- eBPF approximate `packets_sent` / `packets_recv` when traffic accounting is enabled.
+- eBPF `STATS` summary events emitted at the configured kernel interval.
 - Session/window aggregation.
 - Mock-provided bytes, packets, packet sizes, IATs, retransmits, and RTT estimates.
 - Kubernetes Pod IP, Service ClusterIP, EndpointSlice backend, owner/workload, and external IP mapping.
 - JSONL rotation and Prometheus counters.
 
-Currently reserved, unknown, or unavailable:
+Still unavailable:
 
-- eBPF byte and packet accounting.
+- True wire-level packet counts from eBPF when only `tcp_sendmsg` / `tcp_recvmsg` hooks are enabled.
 - Packet timing from eBPF.
 - TLS ClientHello/SNI/JA3/JA4 parsing.
 - NetworkPolicy allow/deny evaluation.
@@ -133,7 +136,8 @@ Currently reserved, unknown, or unavailable:
 ## eBPF Collector Limits
 
 - IPv4 TCP lifecycle only.
-- Current eBPF counters for bytes and packets are `0`.
+- Current eBPF byte counters are cumulative send/receive byte counts when traffic accounting is enabled.
+- Current eBPF packet counters are approximate syscall/message counts, not exact wire packets.
 - No payload capture.
 - No TLS decryption.
 - PID and CgroupID at the current tracepoint are best-effort attribution signals.

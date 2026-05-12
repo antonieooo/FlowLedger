@@ -30,7 +30,7 @@ var PacketSizeHistogramBuckets = []string{
 }
 
 type Snapshot struct {
-	BytesTotal  uint64
+	BytesTotal   uint64
 	PacketsTotal uint64
 
 	ByteRatioOutIn   *float64
@@ -60,7 +60,7 @@ type Snapshot struct {
 	RTTEstimateUS *uint64
 
 	TrafficAccountingAvailable bool
-	PacketTimingAvailable     bool
+	PacketTimingAvailable      bool
 	TCPMetricsAvailable        bool
 	IsLongLived                bool
 }
@@ -127,7 +127,7 @@ func (a *Accumulator) Snapshot(bytesOut, bytesIn, packetsOut, packetsIn uint64, 
 	iatMicros := append([]uint64{}, a.iatMicros...)
 
 	return Snapshot{
-		BytesTotal:  bytesTotal,
+		BytesTotal:   bytesTotal,
 		PacketsTotal: packetsTotal,
 
 		ByteRatioOutIn:   SafeRatio(bytesOut, bytesIn),
@@ -157,7 +157,7 @@ func (a *Accumulator) Snapshot(bytesOut, bytesIn, packetsOut, packetsIn uint64, 
 		RTTEstimateUS: a.rttEstimateUS,
 
 		TrafficAccountingAvailable: a.trafficAccountingAvailable,
-		PacketTimingAvailable:     a.packetTimingAvailable,
+		PacketTimingAvailable:      a.packetTimingAvailable,
 		TCPMetricsAvailable:        a.tcpMetricsAvailable,
 		IsLongLived:                duration >= longLivedThreshold,
 	}

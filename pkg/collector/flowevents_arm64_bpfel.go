@@ -12,6 +12,34 @@ import (
 	"github.com/cilium/ebpf"
 )
 
+type flowEventsFlowKey struct {
+	SrcIp     uint32
+	DstIp     uint32
+	SrcPort   uint16
+	DstPort   uint16
+	Protocol  uint8
+	Direction uint8
+	Pad0      uint16
+	CgroupId  uint64
+}
+
+type flowEventsFlowStats struct {
+	StartNs                    uint64
+	LastSeenNs                 uint64
+	LastEmitNs                 uint64
+	BytesSent                  uint64
+	BytesRecv                  uint64
+	PacketsSent                uint64
+	PacketsRecv                uint64
+	SynCount                   uint32
+	FinCount                   uint32
+	RstCount                   uint32
+	CloseSeen                  uint8
+	TrafficAccountingAvailable uint8
+	TcpMetricsAvailable        uint8
+	Pad1                       uint8
+}
+
 // loadFlowEvents returns the embedded CollectionSpec for flowEvents.
 func loadFlowEvents() (*ebpf.CollectionSpec, error) {
 	reader := bytes.NewReader(_FlowEventsBytes)
@@ -54,13 +82,19 @@ type flowEventsSpecs struct {
 // It can be passed ebpf.CollectionSpec.Assign.
 type flowEventsProgramSpecs struct {
 	HandleInetSockSetState *ebpf.ProgramSpec `ebpf:"handle_inet_sock_set_state"`
+	HandleTcpRecvmsgEntry  *ebpf.ProgramSpec `ebpf:"handle_tcp_recvmsg_entry"`
+	HandleTcpRecvmsgReturn *ebpf.ProgramSpec `ebpf:"handle_tcp_recvmsg_return"`
+	HandleTcpSendmsg       *ebpf.ProgramSpec `ebpf:"handle_tcp_sendmsg"`
 }
 
 // flowEventsMapSpecs contains maps before they are loaded into the kernel.
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type flowEventsMapSpecs struct {
-	Events *ebpf.MapSpec `ebpf:"events"`
+	DropCounters *ebpf.MapSpec `ebpf:"drop_counters"`
+	Events       *ebpf.MapSpec `ebpf:"events"`
+	FlowStatsMap *ebpf.MapSpec `ebpf:"flow_stats_map"`
+	RecvArgsMap  *ebpf.MapSpec `ebpf:"recv_args_map"`
 }
 
 // flowEventsObjects contains all objects after they have been loaded into the kernel.
@@ -82,12 +116,18 @@ func (o *flowEventsObjects) Close() error {
 //
 // It can be passed to loadFlowEventsObjects or ebpf.CollectionSpec.LoadAndAssign.
 type flowEventsMaps struct {
-	Events *ebpf.Map `ebpf:"events"`
+	DropCounters *ebpf.Map `ebpf:"drop_counters"`
+	Events       *ebpf.Map `ebpf:"events"`
+	FlowStatsMap *ebpf.Map `ebpf:"flow_stats_map"`
+	RecvArgsMap  *ebpf.Map `ebpf:"recv_args_map"`
 }
 
 func (m *flowEventsMaps) Close() error {
 	return _FlowEventsClose(
+		m.DropCounters,
 		m.Events,
+		m.FlowStatsMap,
+		m.RecvArgsMap,
 	)
 }
 
@@ -96,11 +136,17 @@ func (m *flowEventsMaps) Close() error {
 // It can be passed to loadFlowEventsObjects or ebpf.CollectionSpec.LoadAndAssign.
 type flowEventsPrograms struct {
 	HandleInetSockSetState *ebpf.Program `ebpf:"handle_inet_sock_set_state"`
+	HandleTcpRecvmsgEntry  *ebpf.Program `ebpf:"handle_tcp_recvmsg_entry"`
+	HandleTcpRecvmsgReturn *ebpf.Program `ebpf:"handle_tcp_recvmsg_return"`
+	HandleTcpSendmsg       *ebpf.Program `ebpf:"handle_tcp_sendmsg"`
 }
 
 func (p *flowEventsPrograms) Close() error {
 	return _FlowEventsClose(
 		p.HandleInetSockSetState,
+		p.HandleTcpRecvmsgEntry,
+		p.HandleTcpRecvmsgReturn,
+		p.HandleTcpSendmsg,
 	)
 }
 

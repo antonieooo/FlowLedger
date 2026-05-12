@@ -101,3 +101,71 @@ func TestSessionizerWindowIDAndLongLived(t *testing.T) {
 		t.Fatalf("unexpected final session: %#v", out)
 	}
 }
+
+func TestSessionizerCumulativeStats(t *testing.T) {
+	base := time.Unix(200, 0).UTC()
+	s := New("node-a", time.Minute, 30*time.Second)
+	common := collector.FlowEvent{
+		SrcIP: "10.1.1.10", SrcPort: 40000,
+		DstIP: "10.1.1.20", DstPort: 443,
+		Protocol:                   "tcp",
+		TrafficAccountingAvailable: true,
+	}
+	common.TimestampNS = uint64(base.UnixNano())
+	common.EventType = "CONNECT"
+	s.Process(common)
+	common.TimestampNS = uint64(base.Add(time.Second).UnixNano())
+	common.EventType = "STATS"
+	common.BytesSent = 100
+	common.BytesRecv = 200
+	common.PacketsSent = 1
+	common.PacketsRecv = 2
+	s.Process(common)
+	common.TimestampNS = uint64(base.Add(2 * time.Second).UnixNano())
+	common.BytesSent = 300
+	common.BytesRecv = 500
+	common.PacketsSent = 3
+	common.PacketsRecv = 4
+	s.Process(common)
+	common.TimestampNS = uint64(base.Add(3 * time.Second).UnixNano())
+	common.EventType = "CLOSE"
+	out := s.Process(common)
+	if len(out) != 1 {
+		t.Fatalf("CLOSE emitted %d sessions, want 1", len(out))
+	}
+	got := out[0]
+	if got.BytesOut != 300 || got.BytesIn != 500 || got.PacketsOut != 3 || got.PacketsIn != 4 {
+		t.Fatalf("unexpected cumulative counters: %#v", got)
+	}
+	if got.FeatureSnapshot.BytesTotal != 800 || got.FeatureSnapshot.PacketsTotal != 7 {
+		t.Fatalf("unexpected feature totals: %#v", got.FeatureSnapshot)
+	}
+}
+
+func TestSessionizerWindowSummaryWithStats(t *testing.T) {
+	base := time.Unix(300, 0).UTC()
+	s := New("node-a", time.Minute, time.Second)
+	ev := collector.FlowEvent{
+		TimestampNS: uint64(base.UnixNano()),
+		EventType:   "CONNECT",
+		SrcIP:       "10.1.1.10",
+		SrcPort:     40000,
+		DstIP:       "10.1.1.20",
+		DstPort:     443,
+		Protocol:    "tcp",
+	}
+	s.Process(ev)
+	ev.TimestampNS = uint64(base.Add(2 * time.Second).UnixNano())
+	ev.EventType = "STATS"
+	ev.BytesSent = 100
+	ev.BytesRecv = 200
+	ev.PacketsSent = 2
+	ev.PacketsRecv = 3
+	out := s.Process(ev)
+	if len(out) != 1 || out[0].RecordType != "window_summary" {
+		t.Fatalf("unexpected window output: %#v", out)
+	}
+	if out[0].BytesOut != 100 || out[0].BytesIn != 200 || out[0].PacketsOut != 2 || out[0].PacketsIn != 3 {
+		t.Fatalf("unexpected window counters: %#v", out[0])
+	}
+}

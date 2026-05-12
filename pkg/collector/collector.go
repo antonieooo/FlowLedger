@@ -33,9 +33,11 @@ type FlowEvent struct {
 
 	TCPState    string `json:"tcp_state,omitempty"`
 	CloseReason string `json:"close_reason,omitempty"`
+	DropReason  string `json:"drop_reason,omitempty"`
+	DropCount   uint64 `json:"drop_count,omitempty"`
 
 	TrafficAccountingAvailable bool `json:"traffic_accounting_available,omitempty"`
-	PacketTimingAvailable     bool `json:"packet_timing_available,omitempty"`
+	PacketTimingAvailable      bool `json:"packet_timing_available,omitempty"`
 	TCPMetricsAvailable        bool `json:"tcp_metrics_available,omitempty"`
 }
 

@@ -5,11 +5,25 @@ package collector
 import (
 	"context"
 	"errors"
+	"time"
 )
 
 type EBPFCollector struct{}
 
+type EBPFOptions struct {
+	FlowMapMaxEntries       uint32
+	StatsEmitInterval       time.Duration
+	EnableTrafficAccounting bool
+	EnableTCPBasicMetrics   bool
+	EnablePacketTiming      bool
+	EnablePacketHistogram   bool
+}
+
 func NewEBPFCollector() *EBPFCollector {
+	return &EBPFCollector{}
+}
+
+func NewEBPFCollectorWithOptions(EBPFOptions) *EBPFCollector {
 	return &EBPFCollector{}
 }
 
