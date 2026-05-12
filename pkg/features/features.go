@@ -186,12 +186,12 @@ func (a *Accumulator) Snapshot(bytesOut, bytesIn, packetsOut, packetsIn uint64, 
 	iatStd := stddevUint64(iatMicros)
 	if histogramHasData(a.iatHistogram) {
 		// IAT percentiles from cgroup_skb are histogram estimates. Standard
-		// deviation cannot be recovered from histogram buckets alone.
+		// deviation cannot be recovered from histogram buckets alone. Keep
+		// P50/P95/Std on the same histogram-derived distribution instead of
+		// mixing histogram percentiles with raw-sample standard deviation.
 		iatP50 = estimateHistogramPercentile(iatHistogram, iatBucketBounds(), 50)
 		iatP95 = estimateHistogramPercentile(iatHistogram, iatBucketBounds(), 95)
-		if len(iatMicros) == 0 {
-			iatStd = nil
-		}
+		iatStd = nil
 	}
 
 	return Snapshot{

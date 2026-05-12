@@ -79,7 +79,6 @@ type rawTLSHandshakeEvent struct {
 	Protocol    uint8
 	Direction   uint8
 	_           uint16
-	CgroupID    uint64
 	TimestampNS uint64
 	PayloadLen  uint32
 	CapturedLen uint32
@@ -150,7 +149,6 @@ func convertRawTLSHandshakeEventToFlowEvent(raw rawTLSHandshakeEvent) FlowEvent 
 	return FlowEvent{
 		TimestampNS:    raw.TimestampNS,
 		EventType:      "TLS_HANDSHAKE",
-		CgroupID:       raw.CgroupID,
 		SrcIP:          ipv4String(raw.SrcIPv4),
 		SrcPort:        raw.SrcPort,
 		DstIP:          ipv4String(raw.DstIPv4),

@@ -3,7 +3,15 @@ package collector
 import (
 	"encoding/binary"
 	"testing"
+	"unsafe"
 )
+
+func TestRawTLSHandshakeEventBinarySize(t *testing.T) {
+	const want = uintptr(1056)
+	if got := unsafe.Sizeof(rawTLSHandshakeEvent{}); got != want {
+		t.Fatalf("rawTLSHandshakeEvent size = %d, want %d", got, want)
+	}
+}
 
 func TestConvertRawEBPFEventIPv4Connect(t *testing.T) {
 	ev, err := convertRawEBPFEventToFlowEvent(rawEBPFEvent{
@@ -165,7 +173,6 @@ func TestConvertRawTLSHandshakeEvent(t *testing.T) {
 		SrcPort:     43120,
 		DstPort:     443,
 		Protocol:    ebpfProtocolTCP,
-		CgroupID:    99,
 		TimestampNS: 123,
 		PayloadLen:  uint32(len(hello)),
 		CapturedLen: uint32(len(hello)),

@@ -153,7 +153,7 @@ Currently real:
 - Mock-provided bytes, packets, packet sizes, IATs, retransmits, and RTT estimates.
 - Kubernetes Pod IP, Service ClusterIP, EndpointSlice backend, owner/workload, and external IP mapping.
 - Linux cgroup ID to Pod UID mapping for local source identity when the node exposes Kubernetes cgroup paths.
-- eBPF netns identifiers when available from the hook; cgroup_skb currently reports the kernel netns cookie rather than a strict inode.
+- eBPF netns identifiers when available from the lifecycle hook; cgroup_skb STATS events reuse the stored lifecycle netns inode.
 - JSONL rotation and Prometheus counters.
 
 Still unavailable:

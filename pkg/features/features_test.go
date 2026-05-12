@@ -87,6 +87,26 @@ func TestAccumulatorHistogramEstimatedPercentiles(t *testing.T) {
 	}
 }
 
+func TestAccumulatorIATStatsUseHistogramPathWhenMixed(t *testing.T) {
+	var acc Accumulator
+	acc.AddEvent(collector.FlowEvent{
+		EventType: "STATS",
+		IATMicros: []uint64{1, 2, 3},
+		IATHistogram: map[string]uint64{
+			"1000-10000": 10,
+		},
+		PacketTimingAvailable: true,
+	})
+
+	s := acc.Snapshot(0, 0, 0, 0, time.Second, 5*time.Minute)
+	if s.IATStd != nil {
+		t.Fatalf("mixed raw+histogram IATStd = %#v, want nil", s.IATStd)
+	}
+	if s.IATP50 == nil || *s.IATP50 < 4149 || *s.IATP50 > 4151 {
+		t.Fatalf("mixed raw+histogram IATP50 = %#v, want histogram estimate near 4150", s.IATP50)
+	}
+}
+
 func TestReasonCodes(t *testing.T) {
 	got := ReasonCodes(ReasonContext{
 		CrossNamespace:      true,

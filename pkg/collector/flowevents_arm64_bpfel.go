@@ -25,13 +25,14 @@ type flowEventsFlowKey struct {
 	Protocol  uint8
 	Direction uint8
 	Pad0      uint16
-	CgroupId  uint64
 }
 
 type flowEventsFlowStats struct {
 	StartNs                    uint64
 	LastSeenNs                 uint64
 	LastEmitNs                 uint64
+	CgroupId                   uint64
+	NetnsIno                   uint64
 	BytesSent                  uint64
 	BytesRecv                  uint64
 	PacketsSent                uint64

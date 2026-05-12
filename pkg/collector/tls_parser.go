@@ -25,14 +25,15 @@ type TLSHandshakeInfo struct {
 }
 
 type clientHelloSpec struct {
-	recordVersion     uint16
-	clientVersion     uint16
-	sni               string
-	alpn              string
-	supportedVersions []uint16
-	ciphers           []uint16
-	extensions        []uint16
-	signatureAlgos    []uint16
+	recordVersion      uint16
+	clientVersion      uint16
+	sni                string
+	alpn               string
+	supportedVersions  []uint16
+	ciphers            []uint16
+	extensions         []uint16
+	signatureAlgos     []uint16
+	signatureAlgosCert []uint16
 }
 
 func ParseTLSClientHello(data []byte) TLSHandshakeInfo {
@@ -150,6 +151,8 @@ func parseClientHello(data []byte) (clientHelloSpec, string) {
 			spec.supportedVersions = parseSupportedVersions(extData)
 		case 0x000d:
 			spec.signatureAlgos = parseUint16Vector(extData)
+		case 0x0032:
+			spec.signatureAlgosCert = parseUint16Vector(extData)
 		}
 	}
 	if pos != end {
@@ -187,6 +190,9 @@ func (s clientHelloSpec) ja4() string {
 	extensionsForCount := nonGREASEHex(s.extensions)
 	extensionsForHash := nonGREASEExtensionsForHash(s.extensions)
 	signatureAlgos := nonGREASEHexPreserveOrder(s.signatureAlgos)
+	if len(s.signatureAlgosCert) > 0 {
+		signatureAlgos = nonGREASEHexPreserveOrder(s.signatureAlgosCert)
+	}
 	return fmt.Sprintf("t%s%s%02d%02d%s_%s_%s",
 		version,
 		sniIndicator,

@@ -147,7 +147,7 @@ Current capture behavior:
 - IPv6 is not emitted yet.
 - eBPF maps aggregate cumulative `bytes_sent`, `bytes_recv`, `packets_sent`, and `packets_recv` per flow.
 - `cgroup_skb` packet hooks update packet size histograms, IAT histograms, min/max packet size, idle/burst counters, and real packet counters in the same flow map.
-- Events include cgroup ID and best-effort network namespace identity. Sock-based hooks read `net.ns.inum`; cgroup_skb uses the kernel netns cookie when direct socket context is unavailable.
+- Events include cgroup ID and best-effort network namespace identity. Sock-based lifecycle hooks read `net.ns.inum`; cgroup_skb STATS events reuse the netns inode stored on the existing flow entry.
 - `STATS` summary events are emitted at a fixed interval instead of per packet/message.
 - Packet counters are approximate syscall/message counters, not exact wire packet counts.
 - Histogram-derived percentiles are estimates; raw packet length and raw IAT sequences are not stored.

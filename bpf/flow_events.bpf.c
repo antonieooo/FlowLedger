@@ -154,13 +154,14 @@ struct flow_key {
 	__u8 protocol;
 	__u8 direction;
 	__u16 _pad0;
-	__u64 cgroup_id;
 };
 
 struct flow_stats {
 	__u64 start_ns;
 	__u64 last_seen_ns;
 	__u64 last_emit_ns;
+	__u64 cgroup_id;
+	__u64 netns_ino;
 	__u64 bytes_sent;
 	__u64 bytes_recv;
 	__u64 packets_sent;
@@ -293,7 +294,6 @@ struct {
 static __u64 (*bpf_ktime_get_ns)(void) = (void *)5;
 static __u64 (*bpf_get_current_pid_tgid)(void) = (void *)14;
 static __u64 (*bpf_get_current_cgroup_id)(void) = (void *)80;
-static __u64 (*bpf_get_netns_cookie)(void *ctx) = (void *)122;
 static void *(*bpf_map_lookup_elem)(void *map, const void *key) = (void *)1;
 static long (*bpf_map_update_elem)(void *map, const void *key, const void *value, __u64 flags) = (void *)2;
 static long (*bpf_map_delete_elem)(void *map, const void *key) = (void *)3;
@@ -348,7 +348,6 @@ static int key_from_sock(struct sock *sk, struct flow_key *key, __u8 direction)
 	key->dst_port = bpf_ntohs(dport);
 	key->protocol = IPPROTO_TCP;
 	key->direction = direction;
-	key->cgroup_id = bpf_get_current_cgroup_id();
 	return 0;
 }
 
@@ -373,7 +372,7 @@ static void fill_event_fields(struct flow_event *event, struct flow_key *key, st
 	__builtin_memset(event, 0, sizeof(*event));
 	event->timestamp_ns = now;
 	event->event_type = event_type;
-	event->cgroup_id = key->cgroup_id;
+	event->cgroup_id = bpf_get_current_cgroup_id();
 	event->family = AF_INET;
 	event->protocol = IPPROTO_TCP;
 	event->src_ipv4 = key->src_ip;
@@ -381,6 +380,7 @@ static void fill_event_fields(struct flow_event *event, struct flow_key *key, st
 	event->src_port = key->src_port;
 	event->dst_port = key->dst_port;
 	if (stats) {
+		event->cgroup_id = stats->cgroup_id;
 		event->bytes_sent = stats->bytes_sent;
 		event->bytes_recv = stats->bytes_recv;
 		event->packets_sent = stats->packets_sent;
@@ -457,6 +457,7 @@ static struct flow_stats *ensure_stats(struct flow_key *key, __u64 now)
 	init.start_ns = now;
 	init.last_seen_ns = now;
 	init.last_emit_ns = now;
+	init.cgroup_id = bpf_get_current_cgroup_id();
 	if (bpf_map_update_elem(&flow_stats_map, key, &init, BPF_ANY) != 0) {
 		increment_drop(DROP_MAP_UPDATE_FAILED);
 		return 0;
@@ -474,12 +475,16 @@ static void update_sent(struct flow_key *key, __u64 bytes, __u64 now, __u64 netn
 	if (!stats)
 		return;
 
+	if (stats->cgroup_id == 0)
+		stats->cgroup_id = bpf_get_current_cgroup_id();
+	if (stats->netns_ino == 0)
+		stats->netns_ino = netns_ino;
 	__sync_fetch_and_add(&stats->bytes_sent, bytes);
 	__sync_fetch_and_add(&stats->packets_sent, 1);
 	stats->last_seen_ns = now;
 	stats->traffic_accounting_available = 1;
 	if (now - stats->last_emit_ns >= EBPF_EMIT_INTERVAL_NS) {
-		emit_flow_event(key, stats, EVENT_STATS, now, netns_ino);
+		emit_flow_event(key, stats, EVENT_STATS, now, stats->netns_ino);
 		stats->last_emit_ns = now;
 	}
 }
@@ -494,12 +499,16 @@ static void update_recv(struct flow_key *key, __u64 bytes, __u64 now, __u64 netn
 	if (!stats)
 		return;
 
+	if (stats->cgroup_id == 0)
+		stats->cgroup_id = bpf_get_current_cgroup_id();
+	if (netns_ino != 0 && stats->netns_ino == 0)
+		stats->netns_ino = netns_ino;
 	__sync_fetch_and_add(&stats->bytes_recv, bytes);
 	__sync_fetch_and_add(&stats->packets_recv, 1);
 	stats->last_seen_ns = now;
 	stats->traffic_accounting_available = 1;
 	if (now - stats->last_emit_ns >= EBPF_EMIT_INTERVAL_NS) {
-		emit_flow_event(key, stats, EVENT_STATS, now, netns_ino);
+		emit_flow_event(key, stats, EVENT_STATS, now, stats->netns_ino);
 		stats->last_emit_ns = now;
 	}
 }
@@ -541,7 +550,6 @@ static int key_from_skb(struct __sk_buff *skb, struct flow_key *key, int ingress
 	struct ipv4_header ip = {};
 	struct tcp_ports ports = {};
 	__u32 ihl_bytes;
-	__u64 cgroup_id;
 
 	if (bpf_skb_load_bytes(skb, 0, &ip, sizeof(ip)) != 0)
 		return -1;
@@ -574,10 +582,6 @@ static int key_from_skb(struct __sk_buff *skb, struct flow_key *key, int ingress
 	}
 	key->protocol = IPPROTO_TCP;
 	key->direction = DIRECTION_UNKNOWN;
-	cgroup_id = bpf_skb_cgroup_id(skb);
-	if (cgroup_id == 0)
-		cgroup_id = bpf_get_current_cgroup_id();
-	key->cgroup_id = cgroup_id;
 	return 0;
 }
 
@@ -677,10 +681,11 @@ static void maybe_emit_tls_client_hello(struct __sk_buff *skb, struct flow_key *
 	bpf_ringbuf_submit(event, 0);
 }
 
-static void update_packet_stats(struct flow_key *key, __u64 packet_len, int ingress, __u64 now, __u64 netns_ino)
+static void update_packet_stats(struct __sk_buff *skb, struct flow_key *key, __u64 packet_len, int ingress, __u64 now)
 {
 	struct flow_stats *stats;
 	__u64 *last_packet_ns;
+	__u64 cgroup_id;
 	__u64 iat_us;
 	int pkt_bucket;
 	int iat_idx;
@@ -688,6 +693,12 @@ static void update_packet_stats(struct flow_key *key, __u64 packet_len, int ingr
 	stats = bpf_map_lookup_elem(&flow_stats_map, key);
 	if (!stats)
 		return;
+	if (stats->cgroup_id == 0) {
+		cgroup_id = bpf_skb_cgroup_id(skb);
+		if (cgroup_id == 0)
+			cgroup_id = bpf_get_current_cgroup_id();
+		stats->cgroup_id = cgroup_id;
+	}
 
 	pkt_bucket = packet_size_bucket(packet_len);
 	if (pkt_bucket >= 0 && pkt_bucket < 7)
@@ -720,7 +731,7 @@ static void update_packet_stats(struct flow_key *key, __u64 packet_len, int ingr
 
 	stats->last_seen_ns = now;
 	if (now - stats->last_emit_ns >= EBPF_EMIT_INTERVAL_NS) {
-		emit_flow_event_no_pid(key, stats, EVENT_STATS, now, netns_ino);
+		emit_flow_event_no_pid(key, stats, EVENT_STATS, now, stats->netns_ino);
 		stats->last_emit_ns = now;
 	}
 }
@@ -745,12 +756,13 @@ int handle_inet_sock_set_state(struct trace_event_raw_inet_sock_set_state *ctx)
 	key.dst_port = ctx->dport;
 	key.protocol = IPPROTO_TCP;
 	key.direction = DIRECTION_UNKNOWN;
-	key.cgroup_id = bpf_get_current_cgroup_id();
 
 	if (ctx->newstate == TCP_ESTABLISHED) {
 		init.start_ns = now;
 		init.last_seen_ns = now;
 		init.last_emit_ns = now;
+		init.cgroup_id = bpf_get_current_cgroup_id();
+		init.netns_ino = netns_ino;
 		init.syn_count = 1;
 		init.tcp_metrics_available = 1;
 		if (bpf_map_update_elem(&flow_stats_map, &key, &init, BPF_ANY) != 0) {
@@ -828,7 +840,7 @@ int handle_cgroup_skb_ingress(struct __sk_buff *skb)
 	struct flow_key key;
 
 	if (key_from_skb(skb, &key, 1) == 0)
-		update_packet_stats(&key, skb->len, 1, bpf_ktime_get_ns(), bpf_get_netns_cookie(skb));
+		update_packet_stats(skb, &key, skb->len, 1, bpf_ktime_get_ns());
 	return CGROUP_SKB_PASS;
 }
 
@@ -839,7 +851,7 @@ int handle_cgroup_skb_egress(struct __sk_buff *skb)
 	struct flow_stats *stats;
 
 	if (key_from_skb(skb, &key, 0) == 0) {
-		update_packet_stats(&key, skb->len, 0, bpf_ktime_get_ns(), bpf_get_netns_cookie(skb));
+		update_packet_stats(skb, &key, skb->len, 0, bpf_ktime_get_ns());
 		stats = bpf_map_lookup_elem(&flow_stats_map, &key);
 		maybe_emit_tls_client_hello(skb, &key, stats);
 	}
