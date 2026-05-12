@@ -11,12 +11,13 @@ import (
 type EBPFCollector struct{}
 
 type EBPFOptions struct {
-	FlowMapMaxEntries       uint32
-	StatsEmitInterval       time.Duration
-	EnableTrafficAccounting bool
-	EnableTCPBasicMetrics   bool
-	EnablePacketTiming      bool
-	EnablePacketHistogram   bool
+	FlowMapMaxEntries         uint32
+	StatsEmitInterval         time.Duration
+	EnableTrafficAccounting   bool
+	EnableTCPBasicMetrics     bool
+	EnablePacketTiming        bool
+	EnablePacketHistogram     bool
+	EnableTLSHandshakeInspect bool
 }
 
 func NewEBPFCollector() *EBPFCollector {

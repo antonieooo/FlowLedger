@@ -2,6 +2,9 @@ package identity
 
 import (
 	"net/netip"
+	"os"
+	"regexp"
+	"strconv"
 	"time"
 
 	"FlowLedger/pkg/k8smeta"
@@ -43,11 +46,21 @@ type ResolvedFlow struct {
 }
 
 type Resolver struct {
-	cache *k8smeta.Cache
+	cache        *k8smeta.Cache
+	cgroups      CgroupLookup
+	hostNetnsIno uint64
+}
+
+type CgroupLookup interface {
+	Resolve(cgroupID uint64) (podUID string, containerID string, ok bool)
 }
 
 func NewResolver(cache *k8smeta.Cache) *Resolver {
-	return &Resolver{cache: cache}
+	return NewResolverWithCgroups(cache, nil)
+}
+
+func NewResolverWithCgroups(cache *k8smeta.Cache, cgroups CgroupLookup) *Resolver {
+	return &Resolver{cache: cache, cgroups: cgroups, hostNetnsIno: HostNetnsIno()}
 }
 
 func (r *Resolver) Resolve(session sessionizer.FlowSession) ResolvedFlow {
@@ -65,9 +78,25 @@ func (r *Resolver) resolveSource(session sessionizer.FlowSession) EndpointIdenti
 	if r.cache == nil {
 		return unknown("unknown")
 	}
+	if session.CgroupID != 0 && r.cgroups != nil {
+		if podUID, containerID, ok := r.cgroups.Resolve(session.CgroupID); ok {
+			if pod, podOK := r.cache.PodByUID(podUID); podOK {
+				id := identityFromPod(pod, session.StartTime, "cgroup_id")
+				id.CgroupID = session.CgroupID
+				if containerID != "" {
+					id.ContainerID = containerID
+				}
+				return id
+			}
+		}
+	}
 	if pod, ok := r.cache.PodByIP(session.SrcIP); ok {
 		id := identityFromPod(pod, session.StartTime, "pod_ip")
 		id.CgroupID = 0
+		if session.NetnsIno != 0 && r.hostNetnsIno != 0 && session.NetnsIno == r.hostNetnsIno {
+			id.Confidence = "medium"
+			id.Reason = "host_netns"
+		}
 		if pod.HostNetwork {
 			id.Method = "pod_ip"
 			id.Reason = "hostNetwork"
@@ -81,6 +110,24 @@ func (r *Resolver) resolveSource(session sessionizer.FlowSession) EndpointIdenti
 		return id
 	}
 	return unknown("unknown")
+}
+
+var netnsLinkRE = regexp.MustCompile(`net:\[(\d+)\]`)
+
+func HostNetnsIno() uint64 {
+	raw, err := os.Readlink("/proc/self/ns/net")
+	if err != nil {
+		return 0
+	}
+	match := netnsLinkRE.FindStringSubmatch(raw)
+	if len(match) != 2 {
+		return 0
+	}
+	v, err := strconv.ParseUint(match[1], 10, 64)
+	if err != nil {
+		return 0
+	}
+	return v
 }
 
 func (r *Resolver) resolveDestination(session sessionizer.FlowSession) EndpointIdentity {
@@ -194,6 +241,9 @@ func applyServiceContext(id *EndpointIdentity, svc *k8smeta.ServiceInfo) {
 }
 
 func pickMappingMethod(src, dst EndpointIdentity) string {
+	if src.Method == "cgroup_id" {
+		return src.Method
+	}
 	if dst.Method != "" && dst.Method != "unknown" {
 		return dst.Method
 	}

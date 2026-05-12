@@ -64,6 +64,44 @@ func TestSessionizerTimeout(t *testing.T) {
 	}
 }
 
+func TestSessionizerTLSHandshakeUpdatesExistingSessionOnly(t *testing.T) {
+	base := time.Unix(100, 0).UTC()
+	s := New("node-a", 60*time.Second, 30*time.Second)
+	common := collector.FlowEvent{
+		SrcIP: "10.1.1.10", SrcPort: 40000,
+		DstIP: "10.1.1.20", DstPort: 443,
+		Protocol: "tcp",
+	}
+	tlsEvent := common
+	tlsEvent.TimestampNS = uint64(base.UnixNano())
+	tlsEvent.EventType = "TLS_HANDSHAKE"
+	tlsEvent.HandshakeSeen = true
+	tlsEvent.TLSVersion = "1.3"
+	tlsEvent.SNIHash = "a379a6f6eeafb9a5"
+	tlsEvent.ALPN = "h2"
+	tlsEvent.JA4 = "t13d0000h2_000000000000_000000000000"
+	tlsEvent.TLSParseStatus = "parsed"
+	if s.ProcessTLSHandshake(tlsEvent) {
+		t.Fatal("TLS handshake matched before CONNECT")
+	}
+
+	common.TimestampNS = uint64(base.UnixNano())
+	common.EventType = "CONNECT"
+	s.Process(common)
+	if !s.ProcessTLSHandshake(tlsEvent) {
+		t.Fatal("TLS handshake did not match active session")
+	}
+	common.TimestampNS = uint64(base.Add(time.Second).UnixNano())
+	common.EventType = "CLOSE"
+	out := s.Process(common)
+	if len(out) != 1 {
+		t.Fatalf("CLOSE emitted %d sessions, want 1", len(out))
+	}
+	if !out[0].HandshakeSeen || out[0].JA4 != tlsEvent.JA4 || out[0].SNIHash != tlsEvent.SNIHash || out[0].TLSParseStatus != "parsed" {
+		t.Fatalf("TLS fields were not retained: %#v", out[0])
+	}
+}
+
 func TestSessionizerWindowIDAndLongLived(t *testing.T) {
 	base := time.Unix(100, 0).UTC()
 	s := NewWithLongLivedThreshold("node-a", time.Minute, time.Second, 2*time.Second)

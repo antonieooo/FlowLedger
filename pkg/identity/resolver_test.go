@@ -52,6 +52,45 @@ func TestIdentityResolverPodIP(t *testing.T) {
 	}
 }
 
+type fakeCgroupLookup map[uint64]struct {
+	podUID      string
+	containerID string
+}
+
+func (f fakeCgroupLookup) Resolve(cgroupID uint64) (string, string, bool) {
+	v, ok := f[cgroupID]
+	return v.podUID, v.containerID, ok
+}
+
+func TestIdentityResolverCgroupIDPreferredOverPodIP(t *testing.T) {
+	cache := k8smeta.NewCache()
+	cache.UpsertPod(&corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "new-api", Namespace: "default", UID: types.UID("new-pod-uid")},
+		Status:     corev1.PodStatus{PodIP: "10.1.1.10"},
+	})
+	cache.UpsertPod(&corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "old-api", Namespace: "default", UID: types.UID("old-pod-uid")},
+		Status:     corev1.PodStatus{PodIP: "10.1.1.99"},
+	})
+	resolver := NewResolverWithCgroups(cache, fakeCgroupLookup{
+		42: {podUID: "old-pod-uid", containerID: "containerd://old"},
+	})
+
+	resolved := resolver.Resolve(sessionizer.FlowSession{
+		StartTime: time.Unix(100, 0).UTC(),
+		CgroupID:  42,
+		SrcIP:     "10.1.1.10", SrcPort: 40000,
+		DstIP: "10.1.1.20", DstPort: 443,
+		Protocol: "tcp",
+	})
+	if resolved.Src.PodUID != "old-pod-uid" || resolved.Src.PodName != "old-api" || resolved.Src.Method != "cgroup_id" || resolved.Src.Confidence != "high" {
+		t.Fatalf("unexpected cgroup identity: %#v", resolved.Src)
+	}
+	if resolved.MappingMethod != "cgroup_id" {
+		t.Fatalf("MappingMethod = %q, want cgroup_id", resolved.MappingMethod)
+	}
+}
+
 func TestIdentityResolverServiceIP(t *testing.T) {
 	cache := k8smeta.NewCache()
 	cache.UpsertService(&corev1.Service{

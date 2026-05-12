@@ -41,6 +41,52 @@ func TestAccumulatorSnapshotStats(t *testing.T) {
 	}
 }
 
+func TestAccumulatorHistogramEstimatedPercentiles(t *testing.T) {
+	minSize := uint64(64)
+	maxSize := uint64(255)
+	var acc Accumulator
+	acc.AddEvent(collector.FlowEvent{
+		EventType: "STATS",
+		PacketSizeHistogram: map[string]uint64{
+			"64-127":  10,
+			"128-255": 10,
+		},
+		IATHistogram: map[string]uint64{
+			"100-1000":   4,
+			"1000-10000": 6,
+		},
+		PktSizeMin:                 &minSize,
+		PktSizeMax:                 &maxSize,
+		IdleGapCount:               1,
+		BurstCount:                 2,
+		PacketTimingAvailable:      true,
+		RealPacketsSent:            12,
+		RealPacketsRecv:            8,
+		TCPMetricsAvailable:        false,
+		TrafficAccountingAvailable: true,
+	})
+
+	s := acc.Snapshot(1000, 2000, 3, 4, time.Second, 5*time.Minute)
+	if s.PktSizeP50 == nil || *s.PktSizeP50 < 126 || *s.PktSizeP50 > 128 {
+		t.Fatalf("histogram packet p50 = %#v, want estimate near 127", s.PktSizeP50)
+	}
+	if s.PktSizeP95 == nil || *s.PktSizeP95 < 241 || *s.PktSizeP95 > 244 {
+		t.Fatalf("histogram packet p95 = %#v, want estimate near 242", s.PktSizeP95)
+	}
+	if s.IATP50 == nil || *s.IATP50 < 2499 || *s.IATP50 > 2501 {
+		t.Fatalf("histogram iat p50 = %#v, want estimate near 2500", s.IATP50)
+	}
+	if s.IATStd != nil {
+		t.Fatalf("histogram-only IATStd = %#v, want nil", s.IATStd)
+	}
+	if s.PktSizeMin == nil || *s.PktSizeMin != 64 || s.PktSizeMax == nil || *s.PktSizeMax != 255 {
+		t.Fatalf("unexpected min/max: %#v %#v", s.PktSizeMin, s.PktSizeMax)
+	}
+	if s.IdleGapCount != 1 || s.BurstCount != 2 {
+		t.Fatalf("unexpected burst/idle counts: %#v", s)
+	}
+}
+
 func TestReasonCodes(t *testing.T) {
 	got := ReasonCodes(ReasonContext{
 		CrossNamespace:      true,

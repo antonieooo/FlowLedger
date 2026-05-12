@@ -43,6 +43,7 @@ type Record struct {
 	TCPState      string `json:"tcp_state"`
 	CloseReason   string `json:"close_reason"`
 	IsLongLived   bool   `json:"is_long_lived"`
+	NetnsIno      uint64 `json:"netns_ino"`
 
 	BytesOut                   uint64            `json:"bytes_out"`
 	BytesIn                    uint64            `json:"bytes_in"`
@@ -80,12 +81,19 @@ type Record struct {
 	TLSVersion               string            `json:"tls_version"`
 	SNIHash                  string            `json:"sni_hash"`
 	ALPN                     string            `json:"alpn"`
-	JA3OrJA4Hash             string            `json:"ja3_or_ja4_hash"`
+	JA4                      string            `json:"ja4"`
+	TLSParseStatus           string            `json:"tls_parse_status"`
 	TLSRecordSizeHistogram   map[string]uint64 `json:"tls_record_size_histogram"`
 	HandshakeSeen            bool              `json:"handshake_seen"`
 	SNIVisibility            string            `json:"sni_visibility"`
 	VisibilityDegraded       bool              `json:"visibility_degraded"`
 	VisibilityDegradedReason string            `json:"visibility_degraded_reason"`
+
+	SamplingApplied    bool    `json:"sampling_applied"`
+	SamplingRate       float64 `json:"sampling_rate"`
+	SamplingReason     string  `json:"sampling_reason"`
+	HistogramTruncated bool    `json:"histogram_truncated"`
+	IATOverflow        bool    `json:"iat_overflow"`
 
 	SrcNamespace       string `json:"src_namespace"`
 	SrcPodName         string `json:"src_pod_name"`
@@ -296,8 +304,9 @@ func BuildRecordWithContext(session sessionizer.FlowSession, resolved identity.R
 	sameNamespace := nonEmptyEqual(resolved.Src.Namespace, resolved.Dst.Namespace)
 	sameWorkload := nonEmptyEqual(resolved.Src.WorkloadUID, resolved.Dst.WorkloadUID)
 	crossNamespace := resolved.Src.Namespace != "" && resolved.Dst.Namespace != "" && resolved.Src.Namespace != resolved.Dst.Namespace
-	visibilityDegraded := !snapshot.TrafficAccountingAvailable || isTLSLike
-	visibilityReason := visibilityDegradedReason(snapshot, isTLSLike)
+	tlsMetadataUnavailable := isTLSLike && !session.HandshakeSeen
+	visibilityDegraded := !snapshot.TrafficAccountingAvailable || tlsMetadataUnavailable
+	visibilityReason := visibilityDegradedReason(snapshot, tlsMetadataUnavailable)
 	reasonCodes := features.ReasonCodes(features.ReasonContext{
 		CrossNamespace:      crossNamespace,
 		ExternalDestination: resolved.Dst.External,
@@ -340,6 +349,7 @@ func BuildRecordWithContext(session sessionizer.FlowSession, resolved identity.R
 		TCPState:      firstNonEmpty(session.TCPState, features.Unknown),
 		CloseReason:   firstNonEmpty(session.CloseReason, features.Unknown),
 		IsLongLived:   snapshot.IsLongLived,
+		NetnsIno:      session.NetnsIno,
 
 		BytesOut:                   session.BytesOut,
 		BytesIn:                    session.BytesIn,
@@ -374,15 +384,22 @@ func BuildRecordWithContext(session sessionizer.FlowSession, resolved identity.R
 
 		ProtocolGuess:            protocolGuess,
 		IsTLSLike:                isTLSLike,
-		TLSVersion:               features.Unknown,
-		SNIHash:                  "",
-		ALPN:                     "",
-		JA3OrJA4Hash:             "",
+		TLSVersion:               session.TLSVersion,
+		SNIHash:                  session.SNIHash,
+		ALPN:                     session.ALPN,
+		JA4:                      session.JA4,
+		TLSParseStatus:           firstNonEmpty(session.TLSParseStatus, "not_inspected"),
 		TLSRecordSizeHistogram:   features.EmptyPacketSizeHistogram(),
-		HandshakeSeen:            false,
+		HandshakeSeen:            session.HandshakeSeen,
 		SNIVisibility:            features.Unknown,
 		VisibilityDegraded:       visibilityDegraded,
 		VisibilityDegradedReason: visibilityReason,
+
+		SamplingApplied:    session.SamplingApplied,
+		SamplingRate:       samplingRate(session.SamplingRate),
+		SamplingReason:     firstNonEmpty(session.SamplingReason, "none"),
+		HistogramTruncated: session.HistogramTruncated,
+		IATOverflow:        session.IATOverflow,
 
 		SrcNamespace:       resolved.Src.Namespace,
 		SrcPodName:         resolved.Src.PodName,
@@ -455,6 +472,13 @@ func BuildRecordWithContext(session sessionizer.FlowSession, resolved identity.R
 		LoadLevel:        labels.LoadLevel,
 		PodRestartWindow: resolved.PodRestartWindow,
 	}
+}
+
+func samplingRate(v float64) float64 {
+	if v <= 0 {
+		return 1.0
+	}
+	return v
 }
 
 func formatTime(t time.Time) string {

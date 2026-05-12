@@ -24,6 +24,15 @@ type FlowEvent struct {
 	PacketSizes []uint64 `json:"packet_sizes,omitempty"`
 	IATMicros   []uint64 `json:"iat_us,omitempty"`
 
+	PacketSizeHistogram map[string]uint64 `json:"packet_size_histogram,omitempty"`
+	IATHistogram        map[string]uint64 `json:"iat_histogram,omitempty"`
+	PktSizeMin          *uint64           `json:"pkt_size_min,omitempty"`
+	PktSizeMax          *uint64           `json:"pkt_size_max,omitempty"`
+	IdleGapCount        uint64            `json:"idle_gap_count,omitempty"`
+	BurstCount          uint64            `json:"burst_count,omitempty"`
+	RealPacketsSent     uint64            `json:"real_packets_sent,omitempty"`
+	RealPacketsRecv     uint64            `json:"real_packets_recv,omitempty"`
+
 	DirectionChanges uint64 `json:"direction_changes,omitempty"`
 	SYNCount         uint64 `json:"syn_count,omitempty"`
 	FINCount         uint64 `json:"fin_count,omitempty"`
@@ -35,6 +44,13 @@ type FlowEvent struct {
 	CloseReason string `json:"close_reason,omitempty"`
 	DropReason  string `json:"drop_reason,omitempty"`
 	DropCount   uint64 `json:"drop_count,omitempty"`
+
+	HandshakeSeen  bool   `json:"handshake_seen,omitempty"`
+	TLSVersion     string `json:"tls_version,omitempty"`
+	SNIHash        string `json:"sni_hash,omitempty"`
+	ALPN           string `json:"alpn,omitempty"`
+	JA4            string `json:"ja4,omitempty"`
+	TLSParseStatus string `json:"tls_parse_status,omitempty"`
 
 	TrafficAccountingAvailable bool `json:"traffic_accounting_available,omitempty"`
 	PacketTimingAvailable      bool `json:"packet_timing_available,omitempty"`

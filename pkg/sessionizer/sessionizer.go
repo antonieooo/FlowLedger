@@ -12,31 +12,43 @@ import (
 )
 
 type FlowSession struct {
-	RecordType      string
-	FlowID          string
-	WindowID        uint64
-	NodeName        string
-	StartTime       time.Time
-	EndTime         time.Time
-	DurationMS      int64
-	SrcIP           string
-	SrcPort         uint16
-	DstIP           string
-	DstPort         uint16
-	Protocol        string
-	CgroupID        uint64
-	Direction       string
-	IPFamily        string
-	TCPState        string
-	BytesOut        uint64
-	BytesIn         uint64
-	PacketsOut      uint64
-	PacketsIn       uint64
-	EventCount      uint64
-	CloseReason     string
-	LastUpdated     time.Time
-	LastEmitted     time.Time
-	FeatureSnapshot features.Snapshot
+	RecordType         string
+	FlowID             string
+	WindowID           uint64
+	NodeName           string
+	StartTime          time.Time
+	EndTime            time.Time
+	DurationMS         int64
+	SrcIP              string
+	SrcPort            uint16
+	DstIP              string
+	DstPort            uint16
+	Protocol           string
+	CgroupID           uint64
+	NetnsIno           uint64
+	Direction          string
+	IPFamily           string
+	TCPState           string
+	BytesOut           uint64
+	BytesIn            uint64
+	PacketsOut         uint64
+	PacketsIn          uint64
+	EventCount         uint64
+	CloseReason        string
+	HandshakeSeen      bool
+	TLSVersion         string
+	SNIHash            string
+	ALPN               string
+	JA4                string
+	TLSParseStatus     string
+	SamplingApplied    bool
+	SamplingRate       float64
+	SamplingReason     string
+	HistogramTruncated bool
+	IATOverflow        bool
+	LastUpdated        time.Time
+	LastEmitted        time.Time
+	FeatureSnapshot    features.Snapshot
 
 	windowSeq   uint64
 	accumulator features.Accumulator
@@ -68,6 +80,10 @@ func NewWithLongLivedThreshold(nodeName string, timeout, windowSize, longLivedTh
 }
 
 func (s *Sessionizer) Process(ev collector.FlowEvent) []FlowSession {
+	if strings.ToUpper(ev.EventType) == "TLS_HANDSHAKE" {
+		s.ProcessTLSHandshake(ev)
+		return nil
+	}
 	key := flowKey(ev)
 	now := eventTime(ev)
 	if ev.Protocol == "" {
@@ -87,6 +103,7 @@ func (s *Sessionizer) Process(ev collector.FlowEvent) []FlowSession {
 			DstPort:     ev.DstPort,
 			Protocol:    strings.ToLower(ev.Protocol),
 			CgroupID:    ev.CgroupID,
+			NetnsIno:    ev.NetnsIno,
 			Direction:   features.BaseDirection(ev.SrcIP, ev.DstIP),
 			IPFamily:    features.IPFamily(ev.SrcIP, ev.DstIP),
 			TCPState:    ev.TCPState,
@@ -96,6 +113,12 @@ func (s *Sessionizer) Process(ev collector.FlowEvent) []FlowSession {
 	}
 
 	session.EventCount++
+	if session.SamplingRate == 0 {
+		session.SamplingRate = 1.0
+	}
+	if session.SamplingReason == "" {
+		session.SamplingReason = "none"
+	}
 	session.LastUpdated = now
 	session.EndTime = now
 	session.DurationMS = session.EndTime.Sub(session.StartTime).Milliseconds()
@@ -139,6 +162,22 @@ func (s *Sessionizer) Process(ev collector.FlowEvent) []FlowSession {
 		}
 	}
 	return out
+}
+
+func (s *Sessionizer) ProcessTLSHandshake(ev collector.FlowEvent) bool {
+	key := flowKey(ev)
+	session := s.sessions[key]
+	if session == nil {
+		return false
+	}
+	session.HandshakeSeen = ev.HandshakeSeen
+	session.TLSVersion = ev.TLSVersion
+	session.SNIHash = ev.SNIHash
+	session.ALPN = ev.ALPN
+	session.JA4 = ev.JA4
+	session.TLSParseStatus = ev.TLSParseStatus
+	session.LastUpdated = eventTime(ev)
+	return true
 }
 
 func (s *Sessionizer) Sweep(now time.Time) []FlowSession {

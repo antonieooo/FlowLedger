@@ -33,6 +33,11 @@ type Metrics struct {
 	EBPFConnectEventsTotal       prometheus.Counter
 	EBPFCloseEventsTotal         prometheus.Counter
 	EBPFTrafficAccountingEnabled prometheus.Gauge
+	TLSHandshakesParsed          *prometheus.CounterVec
+	TLSUnmatchedTotal            prometheus.Counter
+	TLSBufferReserveFailedTotal  prometheus.Counter
+	CgroupResolutionsTotal       *prometheus.CounterVec
+	CgroupMapSize                prometheus.Gauge
 }
 
 func New() *Metrics {
@@ -129,6 +134,26 @@ func New() *Metrics {
 			Name: "flowledger_ebpf_traffic_accounting_enabled",
 			Help: "Whether eBPF send/recv traffic accounting hooks are enabled.",
 		}),
+		TLSHandshakesParsed: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "flowledger_tls_handshakes_parsed_total",
+			Help: "Total TLS ClientHello inspection events by parse status.",
+		}, []string{"status"}),
+		TLSUnmatchedTotal: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "flowledger_tls_unmatched_total",
+			Help: "Total TLS handshake events that could not be joined to an active flow session.",
+		}),
+		TLSBufferReserveFailedTotal: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "flowledger_tls_buffer_reserve_failed_total",
+			Help: "Total TLS handshake ring buffer reserve failures reported by the kernel program.",
+		}),
+		CgroupResolutionsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "flowledger_cgroup_resolutions_total",
+			Help: "Total cgroup_id to pod identity resolution attempts by result.",
+		}, []string{"result"}),
+		CgroupMapSize: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "flowledger_cgroup_map_size",
+			Help: "Current number of cgroup_id entries in the local cgroup resolver map.",
+		}),
 	}
 	prometheus.MustRegister(
 		m.EventsTotal,
@@ -154,6 +179,11 @@ func New() *Metrics {
 		m.EBPFConnectEventsTotal,
 		m.EBPFCloseEventsTotal,
 		m.EBPFTrafficAccountingEnabled,
+		m.TLSHandshakesParsed,
+		m.TLSUnmatchedTotal,
+		m.TLSBufferReserveFailedTotal,
+		m.CgroupResolutionsTotal,
+		m.CgroupMapSize,
 	)
 	return m
 }

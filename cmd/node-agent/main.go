@@ -25,29 +25,30 @@ import (
 )
 
 type config struct {
-	nodeName                    string
-	clusterID                   string
-	agentID                     string
-	mode                        string
-	mockEventsPath              string
-	ledgerPath                  string
-	namespace                   string
-	experimentConfigMap         string
-	sessionTimeout              time.Duration
-	windowSize                  time.Duration
-	longLivedThreshold          time.Duration
-	metricsAddr                 string
-	logLevel                    string
-	metadataSyncTimeout         time.Duration
-	allowUnsyncedMeta           bool
-	ledgerMaxBytes              int64
-	ledgerMaxAge                time.Duration
-	ebpfFlowMapMaxEntries       uint
-	ebpfStatsEmitInterval       time.Duration
-	ebpfEnableTrafficAccounting bool
-	ebpfEnableTCPBasicMetrics   bool
-	ebpfEnablePacketTiming      bool
-	ebpfEnablePacketHistogram   bool
+	nodeName                      string
+	clusterID                     string
+	agentID                       string
+	mode                          string
+	mockEventsPath                string
+	ledgerPath                    string
+	namespace                     string
+	experimentConfigMap           string
+	sessionTimeout                time.Duration
+	windowSize                    time.Duration
+	longLivedThreshold            time.Duration
+	metricsAddr                   string
+	logLevel                      string
+	metadataSyncTimeout           time.Duration
+	allowUnsyncedMeta             bool
+	ledgerMaxBytes                int64
+	ledgerMaxAge                  time.Duration
+	ebpfFlowMapMaxEntries         uint
+	ebpfStatsEmitInterval         time.Duration
+	ebpfEnableTrafficAccounting   bool
+	ebpfEnableTCPBasicMetrics     bool
+	ebpfEnablePacketTiming        bool
+	ebpfEnablePacketHistogram     bool
+	ebpfEnableTLSHandshakeInspect bool
 }
 
 func main() {
@@ -74,6 +75,8 @@ func main() {
 	defer shutdownHTTP(metricsServer)
 
 	metaCache := k8smeta.NewCache()
+	cgroupResolver := k8smeta.NewCgroupResolver()
+	go cgroupResolver.Start(ctx)
 	kubeClient := maybeKubernetesClient()
 	if kubeClient != nil {
 		runner := k8smeta.NewInformerRunner(kubeClient, metaCache, func() { m.K8sWatchErrors.Inc() })
@@ -114,12 +117,13 @@ func main() {
 		flowCollector = collector.NewMockCollector(cfg.mockEventsPath)
 	case "ebpf":
 		flowCollector = collector.NewEBPFCollectorWithOptions(collector.EBPFOptions{
-			FlowMapMaxEntries:       uint32(cfg.ebpfFlowMapMaxEntries),
-			StatsEmitInterval:       cfg.ebpfStatsEmitInterval,
-			EnableTrafficAccounting: cfg.ebpfEnableTrafficAccounting,
-			EnableTCPBasicMetrics:   cfg.ebpfEnableTCPBasicMetrics,
-			EnablePacketTiming:      cfg.ebpfEnablePacketTiming,
-			EnablePacketHistogram:   cfg.ebpfEnablePacketHistogram,
+			FlowMapMaxEntries:         uint32(cfg.ebpfFlowMapMaxEntries),
+			StatsEmitInterval:         cfg.ebpfStatsEmitInterval,
+			EnableTrafficAccounting:   cfg.ebpfEnableTrafficAccounting,
+			EnableTCPBasicMetrics:     cfg.ebpfEnableTCPBasicMetrics,
+			EnablePacketTiming:        cfg.ebpfEnablePacketTiming,
+			EnablePacketHistogram:     cfg.ebpfEnablePacketHistogram,
+			EnableTLSHandshakeInspect: cfg.ebpfEnableTLSHandshakeInspect,
 		})
 	default:
 		log.Fatalf("unsupported --mode %q", cfg.mode)
@@ -131,7 +135,7 @@ func main() {
 
 	events, errs := flowCollector.Run(ctx)
 	sessions := sessionizer.NewWithLongLivedThreshold(cfg.nodeName, cfg.sessionTimeout, cfg.windowSize, cfg.longLivedThreshold)
-	resolver := identity.NewResolver(metaCache)
+	resolver := identity.NewResolverWithCgroups(metaCache, cgroupResolver)
 	recordContext := ledger.BuildContext{
 		ClusterID:      cfg.clusterID,
 		AgentID:        cfg.agentID,
@@ -146,6 +150,7 @@ func main() {
 	log.Printf("flow-ledger node-agent started mode=%s node=%s ledger=%s metrics=%s", cfg.mode, cfg.nodeName, cfg.ledgerPath, cfg.metricsAddr)
 
 	eventsClosed := false
+	var lastCgroupErrors uint64
 	for {
 		select {
 		case <-ctx.Done():
@@ -178,6 +183,17 @@ func main() {
 					m.EBPFCloseEventsTotal.Inc()
 				}
 			}
+			if ev.EventType == "TLS_HANDSHAKE" {
+				status := ev.TLSParseStatus
+				if status == "" {
+					status = collector.TLSParseStatusParseError
+				}
+				m.TLSHandshakesParsed.WithLabelValues(status).Inc()
+				if !sessions.ProcessTLSHandshake(ev) {
+					m.TLSUnmatchedTotal.Inc()
+				}
+				continue
+			}
 			emitSessions(writer, resolver, labels, sessions.Process(ev), m, recordContext)
 			m.SessionsActive.Set(float64(sessions.ActiveCount()))
 		case err, ok := <-errs:
@@ -197,6 +213,11 @@ func main() {
 			pods, services := metaCache.Stats()
 			m.K8sCachePods.Set(float64(pods))
 			m.K8sCacheServices.Set(float64(services))
+			m.CgroupMapSize.Set(float64(cgroupResolver.Size()))
+			if errs := cgroupResolver.ErrorCount(); errs > lastCgroupErrors {
+				m.CgroupResolutionsTotal.WithLabelValues("error").Add(float64(errs - lastCgroupErrors))
+				lastCgroupErrors = errs
+			}
 		case <-labelTicker.C:
 			var err error
 			labels, err = labelReader.ReadWithStatus(ctx)
@@ -231,8 +252,9 @@ func parseFlags() config {
 	flag.DurationVar(&cfg.ebpfStatsEmitInterval, "ebpf-stats-emit-interval", 5*time.Second, "target eBPF STATS summary emit interval; currently mirrored by a BPF compile-time constant")
 	flag.BoolVar(&cfg.ebpfEnableTrafficAccounting, "ebpf-enable-traffic-accounting", true, "attach eBPF tcp_sendmsg/tcp_recvmsg accounting hooks")
 	flag.BoolVar(&cfg.ebpfEnableTCPBasicMetrics, "ebpf-enable-tcp-basic-metrics", true, "enable basic eBPF TCP lifecycle counters when supported")
-	flag.BoolVar(&cfg.ebpfEnablePacketTiming, "ebpf-enable-packet-timing", false, "reserved: enable eBPF packet timing features when implemented")
-	flag.BoolVar(&cfg.ebpfEnablePacketHistogram, "ebpf-enable-packet-histogram", false, "reserved: enable eBPF packet size histogram features when implemented")
+	flag.BoolVar(&cfg.ebpfEnablePacketTiming, "ebpf-enable-packet-timing", true, "attach eBPF cgroup_skb hooks for histogram-based IAT features")
+	flag.BoolVar(&cfg.ebpfEnablePacketHistogram, "ebpf-enable-packet-histogram", true, "attach eBPF cgroup_skb hooks for packet size histogram features")
+	flag.BoolVar(&cfg.ebpfEnableTLSHandshakeInspect, "ebpf-enable-tls-handshake-inspect", true, "inspect at most the first 1024 bytes of the first TLS ClientHello per flow")
 	flag.Parse()
 	return cfg
 }
@@ -284,6 +306,13 @@ func maybeKubernetesClient() kubernetes.Interface {
 func emitSessions(w *ledger.Writer, resolver *identity.Resolver, labels experiment.Labels, sessions []sessionizer.FlowSession, m *flmetrics.Metrics, recordContext ledger.BuildContext) {
 	for _, session := range sessions {
 		resolved := resolver.Resolve(session)
+		if session.CgroupID != 0 {
+			if resolved.Src.Method == "cgroup_id" {
+				m.CgroupResolutionsTotal.WithLabelValues("hit").Inc()
+			} else {
+				m.CgroupResolutionsTotal.WithLabelValues("miss").Inc()
+			}
+		}
 		if resolved.Src.Confidence == "unknown" {
 			m.UnknownSrcMappings.Inc()
 		}
@@ -332,6 +361,8 @@ func applyEBPFDropMetric(m *flmetrics.Metrics, ev collector.FlowEvent) {
 		m.EBPFMapFullDropsTotal.Add(float64(count))
 	case "ringbuf_reserve_failed":
 		m.EBPFRingbufReserveFailures.Add(float64(count))
+	case "tls_buffer_reserve_failed":
+		m.TLSBufferReserveFailedTotal.Add(float64(count))
 	case "unsupported_family", "recv_arg_missed":
 		return
 	default:

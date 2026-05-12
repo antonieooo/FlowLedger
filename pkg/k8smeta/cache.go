@@ -274,6 +274,17 @@ func (c *Cache) PodByIP(ip string) (*PodInfo, bool) {
 	return cp, ok
 }
 
+func (c *Cache) PodByUID(uid string) (*PodInfo, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	pod, ok := c.podByUID[types.UID(uid)]
+	cp := clonePod(pod)
+	if cp != nil {
+		cp.Workload = c.resolvePodLocked(pod)
+	}
+	return cp, ok
+}
+
 func (c *Cache) ServiceByClusterIPPort(ip string, port uint16) (*ServiceInfo, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()

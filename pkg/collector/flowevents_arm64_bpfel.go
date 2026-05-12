@@ -12,6 +12,11 @@ import (
 	"github.com/cilium/ebpf"
 )
 
+type flowEventsFlowConfig struct {
+	TlsHandshakeInspectEnabled uint8
+	Pad                        [7]uint8
+}
+
 type flowEventsFlowKey struct {
 	SrcIp     uint32
 	DstIp     uint32
@@ -31,13 +36,26 @@ type flowEventsFlowStats struct {
 	BytesRecv                  uint64
 	PacketsSent                uint64
 	PacketsRecv                uint64
+	PktSizeBuckets             [7]uint64
+	IatBuckets                 [6]uint64
+	PktSizeMin                 uint64
+	PktSizeMax                 uint64
+	IdleGapCount               uint64
+	BurstCount                 uint64
+	RealPacketsSent            uint64
+	RealPacketsRecv            uint64
+	LastPacketNsSent           uint64
+	LastPacketNsRecv           uint64
 	SynCount                   uint32
 	FinCount                   uint32
 	RstCount                   uint32
 	CloseSeen                  uint8
+	HandshakeInspected         uint8
 	TrafficAccountingAvailable uint8
+	PacketTimingAvailable      uint8
 	TcpMetricsAvailable        uint8
-	Pad1                       uint8
+	Pad1                       [3]uint8
+	_                          [4]byte
 }
 
 // loadFlowEvents returns the embedded CollectionSpec for flowEvents.
@@ -81,6 +99,8 @@ type flowEventsSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type flowEventsProgramSpecs struct {
+	HandleCgroupSkbEgress  *ebpf.ProgramSpec `ebpf:"handle_cgroup_skb_egress"`
+	HandleCgroupSkbIngress *ebpf.ProgramSpec `ebpf:"handle_cgroup_skb_ingress"`
 	HandleInetSockSetState *ebpf.ProgramSpec `ebpf:"handle_inet_sock_set_state"`
 	HandleTcpRecvmsgEntry  *ebpf.ProgramSpec `ebpf:"handle_tcp_recvmsg_entry"`
 	HandleTcpRecvmsgReturn *ebpf.ProgramSpec `ebpf:"handle_tcp_recvmsg_return"`
@@ -91,10 +111,12 @@ type flowEventsProgramSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type flowEventsMapSpecs struct {
-	DropCounters *ebpf.MapSpec `ebpf:"drop_counters"`
-	Events       *ebpf.MapSpec `ebpf:"events"`
-	FlowStatsMap *ebpf.MapSpec `ebpf:"flow_stats_map"`
-	RecvArgsMap  *ebpf.MapSpec `ebpf:"recv_args_map"`
+	ConfigMap          *ebpf.MapSpec `ebpf:"config_map"`
+	DropCounters       *ebpf.MapSpec `ebpf:"drop_counters"`
+	Events             *ebpf.MapSpec `ebpf:"events"`
+	FlowStatsMap       *ebpf.MapSpec `ebpf:"flow_stats_map"`
+	RecvArgsMap        *ebpf.MapSpec `ebpf:"recv_args_map"`
+	TlsHandshakeEvents *ebpf.MapSpec `ebpf:"tls_handshake_events"`
 }
 
 // flowEventsObjects contains all objects after they have been loaded into the kernel.
@@ -116,18 +138,22 @@ func (o *flowEventsObjects) Close() error {
 //
 // It can be passed to loadFlowEventsObjects or ebpf.CollectionSpec.LoadAndAssign.
 type flowEventsMaps struct {
-	DropCounters *ebpf.Map `ebpf:"drop_counters"`
-	Events       *ebpf.Map `ebpf:"events"`
-	FlowStatsMap *ebpf.Map `ebpf:"flow_stats_map"`
-	RecvArgsMap  *ebpf.Map `ebpf:"recv_args_map"`
+	ConfigMap          *ebpf.Map `ebpf:"config_map"`
+	DropCounters       *ebpf.Map `ebpf:"drop_counters"`
+	Events             *ebpf.Map `ebpf:"events"`
+	FlowStatsMap       *ebpf.Map `ebpf:"flow_stats_map"`
+	RecvArgsMap        *ebpf.Map `ebpf:"recv_args_map"`
+	TlsHandshakeEvents *ebpf.Map `ebpf:"tls_handshake_events"`
 }
 
 func (m *flowEventsMaps) Close() error {
 	return _FlowEventsClose(
+		m.ConfigMap,
 		m.DropCounters,
 		m.Events,
 		m.FlowStatsMap,
 		m.RecvArgsMap,
+		m.TlsHandshakeEvents,
 	)
 }
 
@@ -135,6 +161,8 @@ func (m *flowEventsMaps) Close() error {
 //
 // It can be passed to loadFlowEventsObjects or ebpf.CollectionSpec.LoadAndAssign.
 type flowEventsPrograms struct {
+	HandleCgroupSkbEgress  *ebpf.Program `ebpf:"handle_cgroup_skb_egress"`
+	HandleCgroupSkbIngress *ebpf.Program `ebpf:"handle_cgroup_skb_ingress"`
 	HandleInetSockSetState *ebpf.Program `ebpf:"handle_inet_sock_set_state"`
 	HandleTcpRecvmsgEntry  *ebpf.Program `ebpf:"handle_tcp_recvmsg_entry"`
 	HandleTcpRecvmsgReturn *ebpf.Program `ebpf:"handle_tcp_recvmsg_return"`
@@ -143,6 +171,8 @@ type flowEventsPrograms struct {
 
 func (p *flowEventsPrograms) Close() error {
 	return _FlowEventsClose(
+		p.HandleCgroupSkbEgress,
+		p.HandleCgroupSkbIngress,
 		p.HandleInetSockSetState,
 		p.HandleTcpRecvmsgEntry,
 		p.HandleTcpRecvmsgReturn,

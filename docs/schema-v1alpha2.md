@@ -34,8 +34,10 @@ FlowLedger writes JSONL records. Each line is either:
 - `conn_start_time`, `conn_end_time`, `duration_ms`
 - `tcp_state`, `close_reason`
 - `is_long_lived`
+- `netns_ino`
 
 `flow_id` is stable for the observed 5-tuple plus connection start time. `window_id` increments for `window_summary` records and is `0` on `session_summary`.
+`netns_ino` is the observed network namespace inode when available from the eBPF hook; `0` means unknown.
 
 ### Traffic statistics
 
@@ -47,11 +49,19 @@ FlowLedger writes JSONL records. Each line is either:
 - TCP behavior: `syn_count`, `fin_count`, `rst_count`, `retrans_count`, `rtt_estimate_us`
 - Availability flags: `traffic_accounting_available`, `packet_timing_available`, `tcp_metrics_available`
 
-Unavailable numeric estimates are serialized as `null` where the type is an estimate, or `0` for counters. With the current eBPF traffic-accounting hooks, packet counters are syscall/message-level approximations from `tcp_sendmsg` and `tcp_recvmsg`, not exact wire packet counts. The packet size histogram uses fixed buckets:
+Unavailable numeric estimates are serialized as `null` where the type is an estimate, or `0` for counters. The legacy `packets_out` / `packets_in` counters remain syscall/message-level approximations from `tcp_sendmsg` and `tcp_recvmsg`. When the experimental `cgroup_skb` packet hooks are enabled, FlowLedger also derives packet-size and IAT summaries from packet-level histograms without storing raw packet sequences. The packet size histogram uses fixed buckets:
 
 ```text
 0-63, 64-127, 128-255, 256-511, 512-1023, 1024-1500, >1500
 ```
+
+The IAT histogram uses fixed microsecond buckets:
+
+```text
+<100, 100-1000, 1000-10000, 10000-100000, 100000-1000000, >1000000
+```
+
+Percentiles derived from eBPF histograms are estimates with bucket-width-bounded error. `iat_std` remains `null` when only histogram data is available, because standard deviation cannot be recovered without raw IAT samples.
 
 ### TLS and protocol metadata
 
@@ -60,14 +70,32 @@ Unavailable numeric estimates are serialized as `null` where the type is an esti
 - `tls_version`
 - `sni_hash`
 - `alpn`
-- `ja3_or_ja4_hash`
+- `ja4`
+- `tls_parse_status`
 - `tls_record_size_histogram`
 - `handshake_seen`
 - `sni_visibility`
 - `visibility_degraded`
 - `visibility_degraded_reason`
 
-Current implementation does not parse TLS ClientHello, decrypt TLS, store SNI plaintext, store certificates, or save HTTP path/header/body/payload. TLS fields are schema placeholders except for weak port-based `protocol_guess` and `is_tls_like`.
+Current implementation parses only the first egress TLS ClientHello record when the experimental eBPF TLS inspection flag is enabled. It does not decrypt TLS, store SNI plaintext, store certificates, reassemble fragmented ClientHellos, or save HTTP path/header/body/payload.
+
+SNI plaintext is never stored. Only a 16-character SHA-256 prefix of the lowercased SNI is recorded in `sni_hash`. The mapping from `sni_hash` to plaintext SNI is not maintained by FlowLedger.
+
+The TLS ClientHello capture limit is 1024 bytes. If the first captured bytes look like a TLS ClientHello but do not contain a complete ClientHello, `tls_parse_status` is `fragmented` and FlowLedger does not attempt reassembly in this schema version.
+
+### Data quality and sampling
+
+- `sampling_applied`
+- `sampling_rate`
+- `sampling_reason`
+- `histogram_truncated`
+- `iat_overflow`
+- `tls_parse_status`
+
+Permitted `sampling_reason` values are `none`, `rate_limit`, `map_full`, and `oversubscribed`. As of this version FlowLedger does not make sampling decisions: `sampling_applied` is always `false`, `sampling_rate` is `1.0`, and `sampling_reason` is `none`.
+
+Permitted `tls_parse_status` values are `parsed`, `fragmented`, `not_clienthello`, `parse_error`, and `not_inspected`. `histogram_truncated` and `iat_overflow` are reserved data-quality flags and currently default to `false`.
 
 ### Kubernetes identity
 
@@ -81,7 +109,7 @@ Source and destination endpoints include:
 - Image digest
 - Mapping confidence
 
-Field prefixes are `src_` and `dst_`. Missing container ID, cgroup ID, or image digest values are empty or `0`; they are not fabricated.
+Field prefixes are `src_` and `dst_`. Missing container ID, cgroup ID, or image digest values are empty or `0`; they are not fabricated. On Linux nodes, FlowLedger can prefer local source identity from a cgroup ID to Pod UID resolver when `/sys/fs/cgroup/kubepods.slice` is available; otherwise it falls back to Pod IP mapping.
 
 ### Service, topology, and policy context
 
@@ -117,17 +145,22 @@ Currently real:
 - eBPF IPv4 TCP `CONNECT` and `CLOSE` from `sock/inet_sock_set_state`.
 - eBPF cumulative `bytes_sent` / `bytes_recv` when traffic accounting is enabled.
 - eBPF approximate `packets_sent` / `packets_recv` when traffic accounting is enabled.
+- eBPF packet size histogram, packet min/max, histogram-estimated `pkt_size_p50` / `pkt_size_p95`, and real packet counts inside the collector when `cgroup_skb` packet hooks are attached.
+- eBPF IAT histogram, histogram-estimated `iat_p50` / `iat_p95`, `idle_gap_count`, and `burst_count` when packet timing is enabled.
+- eBPF first-ClientHello inspection for `handshake_seen`, `tls_version`, `sni_hash`, `alpn`, `ja4`, and `tls_parse_status` when TLS inspection is enabled.
 - eBPF `STATS` summary events emitted at the configured kernel interval.
 - Session/window aggregation.
 - Mock-provided bytes, packets, packet sizes, IATs, retransmits, and RTT estimates.
 - Kubernetes Pod IP, Service ClusterIP, EndpointSlice backend, owner/workload, and external IP mapping.
+- Linux cgroup ID to Pod UID mapping for local source identity when the node exposes Kubernetes cgroup paths.
+- eBPF netns identifiers when available from the hook; cgroup_skb currently reports the kernel netns cookie rather than a strict inode.
 - JSONL rotation and Prometheus counters.
 
 Still unavailable:
 
-- True wire-level packet counts from eBPF when only `tcp_sendmsg` / `tcp_recvmsg` hooks are enabled.
-- Packet timing from eBPF.
-- TLS ClientHello/SNI/JA3/JA4 parsing.
+- Exact packet-size and IAT percentiles; eBPF mode estimates percentiles from histograms and does not retain raw packet/IAT sequences.
+- `iat_std` from eBPF histogram-only data.
+- ServerHello/JA4S parsing, certificate fingerprinting, TLS record size histograms beyond the first ClientHello, and fragmented ClientHello reassembly.
 - NetworkPolicy allow/deny evaluation.
 - Global expected-edge baselines.
 - HPA scaling window detection.
@@ -137,9 +170,11 @@ Still unavailable:
 
 - IPv4 TCP lifecycle only.
 - Current eBPF byte counters are cumulative send/receive byte counts when traffic accounting is enabled.
-- Current eBPF packet counters are approximate syscall/message counts, not exact wire packets.
+- Current `packets_out` / `packets_in` fields are approximate syscall/message counts, not exact wire packets. Packet-level cgroup_skb counters are used for histogram-derived features without changing those field semantics.
+- Packet histogram and IAT hooks require cgroup v2 and attach to `cgroup_skb/ingress` and `cgroup_skb/egress`.
 - No payload capture.
 - No TLS decryption.
+- TLS ClientHello inspection is limited to the first 1024 bytes of the first egress TLS handshake record per flow.
 - PID and CgroupID at the current tracepoint are best-effort attribution signals.
 
 ## Example
