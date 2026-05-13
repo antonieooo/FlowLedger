@@ -51,11 +51,12 @@ type flowEventsFlowStats struct {
 	FinCount                   uint32
 	RstCount                   uint32
 	CloseSeen                  uint8
-	HandshakeInspected         uint8
+	ClientHelloInspected       uint8
+	ServerHelloInspected       uint8
 	TrafficAccountingAvailable uint8
 	PacketTimingAvailable      uint8
 	TcpMetricsAvailable        uint8
-	Pad1                       [3]uint8
+	Pad1                       [2]uint8
 	_                          [4]byte
 }
 

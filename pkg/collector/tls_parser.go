@@ -12,6 +12,7 @@ const (
 	TLSParseStatusParsed         = "parsed"
 	TLSParseStatusFragmented     = "fragmented"
 	TLSParseStatusNotClientHello = "not_clienthello"
+	TLSParseStatusNotServerHello = "not_serverhello"
 	TLSParseStatusParseError     = "parse_error"
 )
 
@@ -21,6 +22,14 @@ type TLSHandshakeInfo struct {
 	SNIHash       string
 	ALPN          string
 	JA4           string
+	Status        string
+}
+
+type ServerHelloInfo struct {
+	HandshakeSeen bool
+	TLSVersion    string
+	ALPN          string
+	JA4S          string
 	Status        string
 }
 
@@ -34,6 +43,15 @@ type clientHelloSpec struct {
 	extensions         []uint16
 	signatureAlgos     []uint16
 	signatureAlgosCert []uint16
+}
+
+type serverHelloSpec struct {
+	recordVersion    uint16
+	legacyVersion    uint16
+	supportedVersion uint16
+	cipher           uint16
+	alpn             string
+	extensions       []uint16
 }
 
 func ParseTLSClientHello(data []byte) TLSHandshakeInfo {
@@ -53,6 +71,20 @@ func ParseTLSClientHello(data []byte) TLSHandshakeInfo {
 		info.SNIHash = hex.EncodeToString(sum[:])[:16]
 	}
 	return info
+}
+
+func ParseTLSServerHello(data []byte) ServerHelloInfo {
+	spec, status := parseServerHello(data)
+	if status != TLSParseStatusParsed {
+		return ServerHelloInfo{Status: status}
+	}
+	return ServerHelloInfo{
+		HandshakeSeen: true,
+		TLSVersion:    tlsVersionString(spec.effectiveVersion()),
+		ALPN:          spec.alpn,
+		JA4S:          spec.ja4s(),
+		Status:        TLSParseStatusParsed,
+	}
 }
 
 func parseClientHello(data []byte) (clientHelloSpec, string) {
@@ -161,6 +193,90 @@ func parseClientHello(data []byte) (clientHelloSpec, string) {
 	return spec, TLSParseStatusParsed
 }
 
+func parseServerHello(data []byte) (serverHelloSpec, string) {
+	var spec serverHelloSpec
+	if len(data) == 0 || data[0] != 0x16 {
+		return spec, TLSParseStatusNotServerHello
+	}
+	if len(data) < 6 {
+		return spec, TLSParseStatusFragmented
+	}
+	if data[5] != 0x02 {
+		return spec, TLSParseStatusNotServerHello
+	}
+	if len(data) < 9 {
+		return spec, TLSParseStatusFragmented
+	}
+
+	spec.recordVersion = be16(data[1:3])
+	recordLen := int(be16(data[3:5]))
+	if len(data) < 5+recordLen {
+		return spec, TLSParseStatusFragmented
+	}
+	handshakeLen := int(data[6])<<16 | int(data[7])<<8 | int(data[8])
+	if len(data) < 9+handshakeLen {
+		return spec, TLSParseStatusFragmented
+	}
+
+	body := data[9 : 9+handshakeLen]
+	if len(body) < 38 {
+		return spec, TLSParseStatusParseError
+	}
+	spec.legacyVersion = be16(body[0:2])
+	pos := 34
+
+	sessionIDLen := int(body[pos])
+	pos++
+	if !has(body, pos, sessionIDLen) {
+		return spec, TLSParseStatusParseError
+	}
+	pos += sessionIDLen
+
+	if !has(body, pos, 3) {
+		return spec, TLSParseStatusParseError
+	}
+	spec.cipher = be16(body[pos : pos+2])
+	pos += 2
+	pos++
+
+	if pos == len(body) {
+		return spec, TLSParseStatusParsed
+	}
+	if !has(body, pos, 2) {
+		return spec, TLSParseStatusParseError
+	}
+	extensionsLen := int(be16(body[pos : pos+2]))
+	pos += 2
+	if !has(body, pos, extensionsLen) {
+		return spec, TLSParseStatusParseError
+	}
+	end := pos + extensionsLen
+	for pos < end {
+		if !has(body, pos, 4) {
+			return spec, TLSParseStatusParseError
+		}
+		extType := be16(body[pos : pos+2])
+		extLen := int(be16(body[pos+2 : pos+4]))
+		pos += 4
+		if !has(body, pos, extLen) {
+			return spec, TLSParseStatusParseError
+		}
+		extData := body[pos : pos+extLen]
+		pos += extLen
+		spec.extensions = append(spec.extensions, extType)
+		switch extType {
+		case 0x0010:
+			spec.alpn = parseALPN(extData)
+		case 0x002b:
+			spec.supportedVersion = parseServerSupportedVersion(extData)
+		}
+	}
+	if pos != end {
+		return spec, TLSParseStatusParseError
+	}
+	return spec, TLSParseStatusParsed
+}
+
 func (s clientHelloSpec) effectiveVersion() uint16 {
 	var best uint16
 	for _, v := range s.supportedVersions {
@@ -178,6 +294,16 @@ func (s clientHelloSpec) effectiveVersion() uint16 {
 		return s.recordVersion
 	}
 	return s.clientVersion
+}
+
+func (s serverHelloSpec) effectiveVersion() uint16 {
+	if s.supportedVersion != 0 && !isGREASE(s.supportedVersion) {
+		return s.supportedVersion
+	}
+	if s.legacyVersion != 0 {
+		return s.legacyVersion
+	}
+	return s.recordVersion
 }
 
 func (s clientHelloSpec) ja4() string {
@@ -201,6 +327,17 @@ func (s clientHelloSpec) ja4() string {
 		ja4ALPN(s.alpn),
 		hashList(ciphers),
 		hashExtensions(extensionsForHash, signatureAlgos),
+	)
+}
+
+func (s serverHelloSpec) ja4s() string {
+	extensions := nonGREASEHexPreserveOrder(s.extensions)
+	return fmt.Sprintf("t%s%02d%s_%04x_%s",
+		ja4TLSVersion(s.effectiveVersion()),
+		cap99(len(extensions)),
+		ja4ALPN(s.alpn),
+		s.cipher,
+		hashList(extensions),
 	)
 }
 
@@ -265,6 +402,13 @@ func parseSupportedVersions(data []byte) []uint16 {
 		out = append(out, be16(data[1+i:1+i+2]))
 	}
 	return out
+}
+
+func parseServerSupportedVersion(data []byte) uint16 {
+	if len(data) != 2 {
+		return 0
+	}
+	return be16(data)
 }
 
 func parseUint16Vector(data []byte) []uint16 {

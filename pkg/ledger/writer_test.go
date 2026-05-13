@@ -54,23 +54,33 @@ func TestBuildRecordV1Alpha2Fields(t *testing.T) {
 	now := time.Unix(100, 0).UTC()
 	ratio := 2.0
 	session := sessionizer.FlowSession{
-		RecordType:  "session_summary",
-		FlowID:      "flow-1",
-		NodeName:    "node-a",
-		StartTime:   now,
-		EndTime:     now.Add(time.Second),
-		DurationMS:  1000,
-		SrcIP:       "10.1.1.10",
-		SrcPort:     40000,
-		DstIP:       "1.1.1.1",
-		DstPort:     443,
-		Protocol:    "tcp",
-		IPFamily:    "ipv4",
-		BytesOut:    200,
-		BytesIn:     100,
-		PacketsOut:  2,
-		PacketsIn:   1,
-		CloseReason: "fin",
+		RecordType:           "session_summary",
+		FlowID:               "flow-1",
+		NodeName:             "node-a",
+		StartTime:            now,
+		EndTime:              now.Add(time.Second),
+		DurationMS:           1000,
+		SrcIP:                "10.1.1.10",
+		SrcPort:              40000,
+		DstIP:                "1.1.1.1",
+		DstPort:              443,
+		Protocol:             "tcp",
+		IPFamily:             "ipv4",
+		BytesOut:             200,
+		BytesIn:              100,
+		PacketsOut:           2,
+		PacketsIn:            1,
+		CloseReason:          "fin",
+		HandshakeSeen:        true,
+		TLSVersion:           "1.3",
+		ALPN:                 "h2",
+		JA4:                  "t13d1516h2_8daaf6152771_e5627efa2ab1",
+		TLSParseStatus:       "parsed",
+		ServerHelloSeen:      true,
+		TLSVersionNegotiated: "1.2",
+		ALPNNegotiated:       "h2",
+		JA4S:                 "t1201h2_c02f_0b08e3dcc50f",
+		TLSServerParseStatus: "parsed",
 		FeatureSnapshot: features.Snapshot{
 			BytesTotal:                 300,
 			PacketsTotal:               3,
@@ -125,6 +135,9 @@ func TestBuildRecordV1Alpha2Fields(t *testing.T) {
 		if _, ok := fields[forbidden]; ok {
 			t.Fatalf("record contains forbidden field %q: %s", forbidden, b)
 		}
+	}
+	if record.JA4 == "" || record.JA4S == "" || !record.ServerHelloSeen || record.TLSVersionNegotiated != "1.2" {
+		t.Fatalf("missing TLS client/server fields: %#v", record)
 	}
 	if strings.Contains(string(b), "http_path") || strings.Contains(string(b), "http_headers") || strings.Contains(string(b), "http_body") {
 		t.Fatalf("record contains forbidden HTTP payload metadata: %s", b)

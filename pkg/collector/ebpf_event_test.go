@@ -186,6 +186,30 @@ func TestConvertRawTLSHandshakeEvent(t *testing.T) {
 	}
 }
 
+func TestConvertRawTLSServerHelloEvent(t *testing.T) {
+	hello := mustDecodeHex(t, "160303005b020000570303000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f130100000f002b00020304001000050003026832")
+	var data [1024]byte
+	copy(data[:], hello)
+	ev := convertRawTLSHandshakeEventToFlowEvent(rawTLSHandshakeEvent{
+		SrcIPv4:     ipv4Raw(10, 244, 1, 10),
+		DstIPv4:     ipv4Raw(93, 184, 216, 34),
+		SrcPort:     43120,
+		DstPort:     443,
+		Protocol:    ebpfProtocolTCP,
+		Direction:   tlsDirectionServerHello,
+		TimestampNS: 123,
+		PayloadLen:  uint32(len(hello)),
+		CapturedLen: uint32(len(hello)),
+		Data:        data,
+	})
+	if ev.EventType != "TLS_HANDSHAKE" || !ev.ServerHelloSeen || ev.TLSServerParseStatus != TLSParseStatusParsed {
+		t.Fatalf("unexpected tls server event: %#v", ev)
+	}
+	if ev.JA4 != "" || ev.SNIHash != "" || ev.JA4S != "t1302h2_1301_14e9539264dc" || ev.TLSVersionNegotiated != "1.3" {
+		t.Fatalf("unexpected tls server fields: %#v", ev)
+	}
+}
+
 func ipv4Raw(a, b, c, d byte) uint32 {
 	return binary.LittleEndian.Uint32([]byte{a, b, c, d})
 }

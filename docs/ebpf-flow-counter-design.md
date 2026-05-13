@@ -10,7 +10,7 @@ Per-packet ring buffer events would create high userspace overhead, large JSONL 
 - periodic `STATS` events when counters changed and the emit interval has elapsed
 - one `CLOSE` event with final counters
 
-No TLS plaintext, HTTP path, HTTP headers, or HTTP body is captured. TLS ClientHello inspection is limited to the first 1024 bytes of the first egress handshake record per flow and is sent to userspace only for metadata parsing.
+No TLS plaintext, HTTP path, HTTP headers, or HTTP body is captured. TLS ClientHello and ServerHello inspection are each limited to the first 1024 bytes of the first matching handshake record per flow and are sent to userspace only for metadata parsing.
 
 ## Maps
 
@@ -43,7 +43,7 @@ No TLS plaintext, HTTP path, HTTP headers, or HTTP body is captured. TLS ClientH
 `tls_handshake_events`
 
 - Type: `BPF_MAP_TYPE_RINGBUF`
-- Purpose: bounded first-ClientHello capture for userspace JA4/SNI-hash/ALPN parsing
+- Purpose: bounded first-ClientHello and first-ServerHello capture for userspace JA4/SNI-hash/ALPN and JA4S parsing
 - Max bytes copied per flow: `1024`
 
 ## Hooks
@@ -73,8 +73,9 @@ No TLS plaintext, HTTP path, HTTP headers, or HTTP body is captured. TLS ClientH
 - Look up the existing lifecycle-owned flow entry; they do not create flow entries.
 - Update packet size histogram buckets, IAT histogram buckets, packet min/max, idle gaps, bursts, and real packet counters.
 - May emit `STATS` if the flow's emit interval elapsed.
-- Never export per-packet records; TLS payload inspection is limited to the first ClientHello bytes described below.
-- On egress, optionally inspect the first payload bytes once per flow. If they look like TLS ClientHello, copy up to 1024 bytes to `tls_handshake_events` and set `handshake_inspected`.
+- Never export per-packet records; TLS payload inspection is limited to the first ClientHello and ServerHello bytes described below.
+- On egress, optionally inspect the first payload bytes once per flow. If they look like TLS ClientHello, copy up to 1024 bytes to `tls_handshake_events` and set `client_hello_inspected`.
+- On ingress, optionally inspect the first payload bytes once per flow. If they look like TLS ServerHello, copy up to 1024 bytes to `tls_handshake_events` and set `server_hello_inspected`.
 
 ## Snapshot Semantics
 
@@ -98,9 +99,9 @@ They are not deltas. The Go sessionizer keeps the maximum counter value seen for
 - `--ebpf-flow-map-max-entries` can adjust the flow map size before object load.
 - `--ebpf-enable-traffic-accounting=false` can run lifecycle-only collection.
 - `--ebpf-enable-packet-histogram=false --ebpf-enable-packet-timing=false` skips `cgroup_skb` packet hooks entirely.
-- `--ebpf-enable-tls-handshake-inspect=false` disables ClientHello events through the BPF config map.
+- `--ebpf-enable-tls-handshake-inspect=false` disables ClientHello and ServerHello events through the BPF config map.
 - Packet histograms and IAT histograms are kept as fixed-size bucket counters only.
-- Each flow is inspected at most once for TLS ClientHello.
+- Each flow is inspected at most once per TLS handshake direction.
 
 ## Known Limitations
 
@@ -113,7 +114,7 @@ They are not deltas. The Go sessionizer keeps the maximum counter value seen for
 - cgroup_skb attach requires cgroup v2; on cgroup v1 hosts the agent logs a warning and continues without packet histogram/timing hooks.
 - No RTT estimate or retransmit detection from eBPF yet.
 - No HTTP, gRPC, generic payload parsing, or post-handshake TLS parsing.
-- TLS inspection handles ClientHello only. It does not decrypt TLS, store plaintext SNI, parse ServerHello, capture certificates, or reassemble fragmented ClientHellos.
+- TLS inspection handles ClientHello and ServerHello only. It does not decrypt TLS, store plaintext SNI, capture certificates, or reassemble fragmented handshakes.
 - CgroupID is best-effort attribution context and is not a stable Kubernetes identity by itself.
 
 ## Future Work

@@ -14,6 +14,10 @@ const (
 
 	ebpfFamilyIPv4  = 2
 	ebpfProtocolTCP = 6
+
+	tlsDirectionUnknown     = 0
+	tlsDirectionClientHello = 1
+	tlsDirectionServerHello = 2
 )
 
 var ebpfPacketSizeHistogramBuckets = []string{
@@ -145,22 +149,44 @@ func convertRawTLSHandshakeEventToFlowEvent(raw rawTLSHandshakeEvent) FlowEvent 
 	if capturedLen > len(raw.Data) {
 		capturedLen = len(raw.Data)
 	}
-	info := ParseTLSClientHello(raw.Data[:capturedLen])
-	return FlowEvent{
-		TimestampNS:    raw.TimestampNS,
-		EventType:      "TLS_HANDSHAKE",
-		SrcIP:          ipv4String(raw.SrcIPv4),
-		SrcPort:        raw.SrcPort,
-		DstIP:          ipv4String(raw.DstIPv4),
-		DstPort:        raw.DstPort,
-		Protocol:       "tcp",
-		HandshakeSeen:  info.HandshakeSeen,
-		TLSVersion:     info.TLSVersion,
-		SNIHash:        info.SNIHash,
-		ALPN:           info.ALPN,
-		JA4:            info.JA4,
-		TLSParseStatus: info.Status,
+	ev := FlowEvent{
+		TimestampNS: raw.TimestampNS,
+		EventType:   "TLS_HANDSHAKE",
+		SrcIP:       ipv4String(raw.SrcIPv4),
+		SrcPort:     raw.SrcPort,
+		DstIP:       ipv4String(raw.DstIPv4),
+		DstPort:     raw.DstPort,
+		Protocol:    "tcp",
 	}
+	switch raw.Direction {
+	case tlsDirectionServerHello:
+		info := ParseTLSServerHello(raw.Data[:capturedLen])
+		ev.TLSHandshakeDirection = tlsDirectionServerHello
+		ev.ServerHelloSeen = info.HandshakeSeen
+		ev.TLSVersionNegotiated = info.TLSVersion
+		ev.ALPNNegotiated = info.ALPN
+		ev.JA4S = info.JA4S
+		ev.TLSServerParseStatus = info.Status
+	case tlsDirectionUnknown, tlsDirectionClientHello:
+		info := ParseTLSClientHello(raw.Data[:capturedLen])
+		ev.TLSHandshakeDirection = raw.Direction
+		ev.HandshakeSeen = info.HandshakeSeen
+		ev.TLSVersion = info.TLSVersion
+		ev.SNIHash = info.SNIHash
+		ev.ALPN = info.ALPN
+		ev.JA4 = info.JA4
+		ev.TLSParseStatus = info.Status
+	default:
+		info := ParseTLSClientHello(raw.Data[:capturedLen])
+		ev.TLSHandshakeDirection = raw.Direction
+		ev.HandshakeSeen = info.HandshakeSeen
+		ev.TLSVersion = info.TLSVersion
+		ev.SNIHash = info.SNIHash
+		ev.ALPN = info.ALPN
+		ev.JA4 = info.JA4
+		ev.TLSParseStatus = info.Status
+	}
+	return ev
 }
 
 func ebpfEventType(rawType uint32) (string, error) {

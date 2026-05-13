@@ -4,6 +4,7 @@ package k8smeta
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
@@ -14,10 +15,10 @@ import (
 	"time"
 )
 
-var podUIDInCgroupPath = regexp.MustCompile(`pod([0-9a-fA-F_]{36})`)
+var podUIDInCgroupPath = regexp.MustCompile(`pod([0-9a-fA-F_-]{32,36})\.slice`)
 
 type CgroupResolver struct {
-	root     string
+	roots    []string
 	period   time.Duration
 	mu       sync.RWMutex
 	entries  map[uint64]cgroupEntry
@@ -31,7 +32,10 @@ type cgroupEntry struct {
 
 func NewCgroupResolver() *CgroupResolver {
 	return &CgroupResolver{
-		root:    "/sys/fs/cgroup/kubepods.slice",
+		roots: []string{
+			"/sys/fs/cgroup/kubepods.slice",
+			"/sys/fs/cgroup/kubelet.slice/kubelet-kubepods.slice",
+		},
 		period:  10 * time.Second,
 		entries: map[uint64]cgroupEntry{},
 	}
@@ -90,30 +94,38 @@ func (r *CgroupResolver) ErrorCount() uint64 {
 }
 
 func (r *CgroupResolver) scan() error {
-	if _, err := os.Stat(r.root); err != nil {
-		return err
-	}
+	foundRoot := false
 	next := map[uint64]cgroupEntry{}
-	err := filepath.WalkDir(r.root, func(path string, d os.DirEntry, err error) error {
+
+	for _, root := range r.roots {
+		if _, err := os.Stat(root); err != nil {
+			continue
+		}
+		foundRoot = true
+		err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+			if err != nil {
+				return nil
+			}
+			if !d.IsDir() {
+				return nil
+			}
+			podUID := podUIDFromCgroupPath(path)
+			if podUID == "" {
+				return nil
+			}
+			id, err := cgroupID(path)
+			if err != nil {
+				return nil
+			}
+			next[id] = cgroupEntry{podUID: podUID, containerID: containerIDFromCgroupPath(path)}
+			return nil
+		})
 		if err != nil {
-			return nil
+			return err
 		}
-		if !d.IsDir() {
-			return nil
-		}
-		podUID := podUIDFromCgroupPath(path)
-		if podUID == "" {
-			return nil
-		}
-		id, err := cgroupID(path)
-		if err != nil {
-			return nil
-		}
-		next[id] = cgroupEntry{podUID: podUID, containerID: containerIDFromCgroupPath(path)}
-		return nil
-	})
-	if err != nil {
-		return err
+	}
+	if !foundRoot {
+		return fmt.Errorf("no supported Kubernetes cgroup root found under /sys/fs/cgroup")
 	}
 	r.mu.Lock()
 	r.entries = next
@@ -126,7 +138,11 @@ func podUIDFromCgroupPath(path string) string {
 	if len(match) != 2 {
 		return ""
 	}
-	return strings.ReplaceAll(match[1], "_", "-")
+	uid := strings.ReplaceAll(match[1], "_", "-")
+	if len(uid) == 32 {
+		return uid[0:8] + "-" + uid[8:12] + "-" + uid[12:16] + "-" + uid[16:20] + "-" + uid[20:32]
+	}
+	return uid
 }
 
 func containerIDFromCgroupPath(path string) string {

@@ -74,15 +74,24 @@ Percentiles derived from eBPF histograms are estimates with bucket-width-bounded
 - `tls_parse_status`
 - `tls_record_size_histogram`
 - `handshake_seen`
+- `server_hello_seen`
+- `tls_version_negotiated`
+- `alpn_negotiated`
+- `ja4s`
+- `tls_server_parse_status`
 - `sni_visibility`
 - `visibility_degraded`
 - `visibility_degraded_reason`
 
-Current implementation parses only the first egress TLS ClientHello record when the experimental eBPF TLS inspection flag is enabled. It does not decrypt TLS, store SNI plaintext, store certificates, reassemble fragmented ClientHellos, or save HTTP path/header/body/payload.
+Current implementation parses only the first egress TLS ClientHello and first ingress TLS ServerHello record when the experimental eBPF TLS inspection flag is enabled. It does not decrypt TLS, store SNI plaintext, store certificates, reassemble fragmented handshakes, or save HTTP path/header/body/payload.
 
 SNI plaintext is never stored. Only a 16-character SHA-256 prefix of the lowercased SNI is recorded in `sni_hash`. The mapping from `sni_hash` to plaintext SNI is not maintained by FlowLedger.
 
-The TLS ClientHello capture limit is 1024 bytes. If the first captured bytes look like a TLS ClientHello but do not contain a complete ClientHello, `tls_parse_status` is `fragmented` and FlowLedger does not attempt reassembly in this schema version.
+The TLS ClientHello and ServerHello capture limit is 1024 bytes per direction. If the first captured bytes look like a TLS handshake but do not contain a complete handshake, the relevant parse status is `fragmented` and FlowLedger does not attempt reassembly in this schema version.
+
+`tls_version` is derived from the highest non-GREASE version offered by the ClientHello `supported_versions` extension when present, falling back to the ClientHello legacy version. `tls_version_negotiated` is derived from the ServerHello `supported_versions` extension when present, falling back to the ServerHello legacy version; it may differ from `tls_version`.
+
+`alpn` is the first ALPN value offered by the client. `alpn_negotiated` is the single ALPN selected by the server and may be empty if no ALPN was negotiated. `ja4` is the ClientHello JA4 fingerprint. `ja4s` is the ServerHello JA4S fingerprint. `server_hello_seen` records whether a ServerHello parsed successfully for the flow.
 
 ### Data quality and sampling
 
@@ -95,7 +104,7 @@ The TLS ClientHello capture limit is 1024 bytes. If the first captured bytes loo
 
 Permitted `sampling_reason` values are `none`, `rate_limit`, `map_full`, and `oversubscribed`. As of this version FlowLedger does not make sampling decisions: `sampling_applied` is always `false`, `sampling_rate` is `1.0`, and `sampling_reason` is `none`.
 
-Permitted `tls_parse_status` values are `parsed`, `fragmented`, `not_clienthello`, `parse_error`, and `not_inspected`. `histogram_truncated` and `iat_overflow` are reserved data-quality flags and currently default to `false`.
+Permitted `tls_parse_status` values are `parsed`, `fragmented`, `not_clienthello`, `parse_error`, and `not_inspected`. Permitted `tls_server_parse_status` values are `parsed`, `fragmented`, `not_serverhello`, `parse_error`, and `not_inspected`. `histogram_truncated` and `iat_overflow` are reserved data-quality flags and currently default to `false`.
 
 ### Kubernetes identity
 
@@ -109,7 +118,7 @@ Source and destination endpoints include:
 - Image digest
 - Mapping confidence
 
-Field prefixes are `src_` and `dst_`. Missing container ID, cgroup ID, or image digest values are empty or `0`; they are not fabricated. On Linux nodes, FlowLedger can prefer local source identity from a cgroup ID to Pod UID resolver when `/sys/fs/cgroup/kubepods.slice` is available; otherwise it falls back to Pod IP mapping.
+Field prefixes are `src_` and `dst_`. Missing container ID, cgroup ID, or image digest values are empty or `0`; they are not fabricated. On Linux nodes, FlowLedger can prefer local source identity from a cgroup ID to Pod UID resolver when Kubernetes cgroup paths are available under `/sys/fs/cgroup/kubepods.slice` or `/sys/fs/cgroup/kubelet.slice/kubelet-kubepods.slice`; otherwise it falls back to Pod IP mapping.
 
 ### Service, topology, and policy context
 
@@ -148,6 +157,7 @@ Currently real:
 - eBPF packet size histogram, packet min/max, histogram-estimated `pkt_size_p50` / `pkt_size_p95`, and real packet counts inside the collector when `cgroup_skb` packet hooks are attached.
 - eBPF IAT histogram, histogram-estimated `iat_p50` / `iat_p95`, `idle_gap_count`, and `burst_count` when packet timing is enabled.
 - eBPF first-ClientHello inspection for `handshake_seen`, `tls_version`, `sni_hash`, `alpn`, `ja4`, and `tls_parse_status` when TLS inspection is enabled.
+- eBPF first-ServerHello inspection for `server_hello_seen`, `tls_version_negotiated`, `alpn_negotiated`, `ja4s`, and `tls_server_parse_status` when TLS inspection is enabled.
 - eBPF `STATS` summary events emitted at the configured kernel interval.
 - Session/window aggregation.
 - Mock-provided bytes, packets, packet sizes, IATs, retransmits, and RTT estimates.
@@ -160,7 +170,7 @@ Still unavailable:
 
 - Exact packet-size and IAT percentiles; eBPF mode estimates percentiles from histograms and does not retain raw packet/IAT sequences.
 - `iat_std` from eBPF histogram-only data.
-- ServerHello/JA4S parsing, certificate fingerprinting, TLS record size histograms beyond the first ClientHello, and fragmented ClientHello reassembly.
+- Certificate fingerprinting, TLS record size histograms beyond the first captured ClientHello/ServerHello records, and fragmented handshake reassembly.
 - NetworkPolicy allow/deny evaluation.
 - Global expected-edge baselines.
 - HPA scaling window detection.
@@ -174,7 +184,7 @@ Still unavailable:
 - Packet histogram and IAT hooks require cgroup v2 and attach to `cgroup_skb/ingress` and `cgroup_skb/egress`.
 - No payload capture.
 - No TLS decryption.
-- TLS ClientHello inspection is limited to the first 1024 bytes of the first egress TLS handshake record per flow.
+- TLS ClientHello and ServerHello inspection are each limited to the first 1024 bytes of the first matching TLS handshake record per flow.
 - PID and CgroupID at the current tracepoint are best-effort attribution signals.
 
 ## Example
@@ -197,7 +207,7 @@ Still unavailable:
   "src_ip": "10.244.1.166",
   "src_port": 35626,
   "dst_ip": "104.20.23.154",
-  "dst_port": 80,
+  "dst_port": 443,
   "protocol": "tcp",
   "direction": "egress",
   "ip_family": "ipv4",
@@ -216,9 +226,18 @@ Still unavailable:
   "traffic_accounting_available": false,
   "packet_timing_available": false,
   "tcp_metrics_available": false,
-  "protocol_guess": "http",
-  "is_tls_like": false,
-  "handshake_seen": false,
+  "protocol_guess": "tls",
+  "is_tls_like": true,
+  "handshake_seen": true,
+  "server_hello_seen": true,
+  "tls_version": "1.3",
+  "tls_version_negotiated": "1.2",
+  "alpn": "h2",
+  "alpn_negotiated": "h2",
+  "ja4": "t13d1516h2_8daaf6152771_e5627efa2ab1",
+  "ja4s": "t1201h2_c02f_0b08e3dcc50f",
+  "tls_parse_status": "parsed",
+  "tls_server_parse_status": "parsed",
   "sni_visibility": "unknown",
   "visibility_degraded": true,
   "visibility_degraded_reason": "traffic_accounting_unavailable",

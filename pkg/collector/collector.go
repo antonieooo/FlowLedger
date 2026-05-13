@@ -52,6 +52,14 @@ type FlowEvent struct {
 	JA4            string `json:"ja4,omitempty"`
 	TLSParseStatus string `json:"tls_parse_status,omitempty"`
 
+	TLSHandshakeDirection  uint8  `json:"direction,omitempty"`
+	TLSHandshakePayloadHex string `json:"tls_payload_hex,omitempty"`
+	ServerHelloSeen        bool   `json:"server_hello_seen,omitempty"`
+	TLSVersionNegotiated   string `json:"tls_version_negotiated,omitempty"`
+	ALPNNegotiated         string `json:"alpn_negotiated,omitempty"`
+	JA4S                   string `json:"ja4s,omitempty"`
+	TLSServerParseStatus   string `json:"tls_server_parse_status,omitempty"`
+
 	TrafficAccountingAvailable bool `json:"traffic_accounting_available,omitempty"`
 	PacketTimingAvailable      bool `json:"packet_timing_available,omitempty"`
 	TCPMetricsAvailable        bool `json:"tcp_metrics_available,omitempty"`

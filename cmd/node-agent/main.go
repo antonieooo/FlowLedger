@@ -184,13 +184,28 @@ func main() {
 				}
 			}
 			if ev.EventType == "TLS_HANDSHAKE" {
-				status := ev.TLSParseStatus
-				if status == "" {
-					status = collector.TLSParseStatusParseError
-				}
-				m.TLSHandshakesParsed.WithLabelValues(status).Inc()
-				if !sessions.ProcessTLSHandshake(ev) {
-					m.TLSUnmatchedTotal.Inc()
+				if ev.JA4S != "" || ev.ServerHelloSeen || ev.TLSServerParseStatus != "" {
+					status := ev.TLSServerParseStatus
+					if status == "" {
+						status = collector.TLSParseStatusParseError
+					}
+					if status == collector.TLSParseStatusParsed {
+						m.TLSServerHellosParsedTotal.Inc()
+					} else {
+						m.TLSServerHelloParseErrors.Inc()
+					}
+					if !sessions.ProcessTLSHandshake(ev) {
+						m.TLSServerHelloUnmatchedTotal.Inc()
+					}
+				} else {
+					status := ev.TLSParseStatus
+					if status == "" {
+						status = collector.TLSParseStatusParseError
+					}
+					m.TLSHandshakesParsed.WithLabelValues(status).Inc()
+					if !sessions.ProcessTLSHandshake(ev) {
+						m.TLSUnmatchedTotal.Inc()
+					}
 				}
 				continue
 			}

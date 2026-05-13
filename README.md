@@ -26,11 +26,11 @@ It is a flow/session metadata ledger. It is not an IDS, alerting system, machine
 - No machine learning model yet.
 - No TLS decryption.
 - No payload storage.
-- TLS ClientHello inspection is limited to the first 1024 bytes of the first egress TLS handshake record per flow. FlowLedger extracts JA4, TLS version, ALPN, and a hash of SNI only.
+- TLS ClientHello and ServerHello inspection are limited to 1024 bytes for the first matching handshake record per flow. FlowLedger extracts JA4, JA4S, offered/chosen TLS version, offered/chosen ALPN, and a hash of SNI only.
 - No TLS decryption.
 - No plaintext SNI storage.
 - No certificate capture.
-- No fragmented ClientHello reassembly.
+- No fragmented ClientHello or ServerHello reassembly.
 - No HTTP path, HTTP header, or HTTP body capture in the current implementation.
 - No ML inference or Slow Path reviewer verdicts yet; model/review fields are placeholders with simple reason codes.
 - No production retention, compression, or upload pipeline for ledger files.
@@ -138,7 +138,7 @@ curl http://localhost:9090/metrics
 
 ## Experimental eBPF Collector
 
-The eBPF collector is Linux-only and experimental. It attaches to the `sock/inet_sock_set_state` tracepoint for lifecycle events, `tcp_sendmsg` / `tcp_recvmsg` kprobe hooks for lightweight traffic accounting, and optional `cgroup_skb/ingress` plus `cgroup_skb/egress` hooks for packet-level histograms and first-ClientHello inspection.
+The eBPF collector is Linux-only and experimental. It attaches to the `sock/inet_sock_set_state` tracepoint for lifecycle events, `tcp_sendmsg` / `tcp_recvmsg` kprobe hooks for lightweight traffic accounting, and optional `cgroup_skb/ingress` plus `cgroup_skb/egress` hooks for packet-level histograms, first-ClientHello inspection, and first-ServerHello inspection.
 
 Current capture behavior:
 
@@ -151,9 +151,9 @@ Current capture behavior:
 - `STATS` summary events are emitted at a fixed interval instead of per packet/message.
 - Packet counters are approximate syscall/message counters, not exact wire packet counts.
 - Histogram-derived percentiles are estimates; raw packet length and raw IAT sequences are not stored.
-- The first egress TLS ClientHello can be copied to a separate ring buffer for userspace parsing. The capture limit is 1024 bytes and the flow is marked inspected after one attempt.
+- The first egress TLS ClientHello and first ingress TLS ServerHello can be copied to a separate ring buffer for userspace parsing. The capture limit is 1024 bytes per handshake direction and the flow is marked inspected after one attempt per direction.
 - SNI plaintext is never written to JSONL; only the first 16 hex characters of SHA-256 over the lowercased SNI are recorded.
-- No payload is written to the ledger; bounded ClientHello bytes are transiently copied to userspace only for metadata extraction.
+- No payload is written to the ledger; bounded ClientHello and ServerHello bytes are transiently copied to userspace only for metadata extraction.
 - TLS is not decrypted.
 
 Traffic accounting flags:
@@ -168,7 +168,7 @@ Traffic accounting flags:
 --ebpf-enable-tls-handshake-inspect=true
 ```
 
-`--ebpf-flow-map-max-entries` is applied to the eBPF LRU flow map before load. The current STATS interval is mirrored by a BPF compile-time constant; change `EBPF_EMIT_INTERVAL_NS` in `bpf/flow_events.bpf.c` and run `go generate ./...` if you need a different kernel-side interval. Packet timing, packet histogram, and TLS ClientHello inspection attach `cgroup_skb` programs on cgroup v2 systems. Experimental deployments default them on; production operators can opt out with `--ebpf-enable-packet-timing=false --ebpf-enable-packet-histogram=false --ebpf-enable-tls-handshake-inspect=false`.
+`--ebpf-flow-map-max-entries` is applied to the eBPF LRU flow map before load. The current STATS interval is mirrored by a BPF compile-time constant; change `EBPF_EMIT_INTERVAL_NS` in `bpf/flow_events.bpf.c` and run `go generate ./...` if you need a different kernel-side interval. Packet timing, packet histogram, and TLS ClientHello/ServerHello inspection attach `cgroup_skb` programs on cgroup v2 systems. Experimental deployments default them on; production operators can opt out with `--ebpf-enable-packet-timing=false --ebpf-enable-packet-histogram=false --ebpf-enable-tls-handshake-inspect=false`.
 
 Local Linux test, usually requiring root or equivalent BPF permissions:
 
@@ -208,7 +208,7 @@ Each line is a `session_summary` or `window_summary` using schema `v1alpha2`. Se
 - Record metadata: `schema_version`, `cluster_id`, `node_name`, `agent_id`, `collection_mode`, `hook_source`, experiment labels.
 - Flow lifecycle: `flow_id`, `window_id`, 5-tuple, direction, IP family, connection timing, TCP state, close reason, long-lived flag.
 - Traffic statistics: bytes, packets, totals, ratios, rates, packet size histogram, IAT estimates, TCP counters, and availability flags.
-- TLS/protocol metadata: `protocol_guess`, `is_tls_like`, ClientHello-derived `tls_version`, `sni_hash`, `alpn`, `ja4`, `tls_parse_status`, and visibility flags; no TLS plaintext or payload is stored.
+- TLS/protocol metadata: `protocol_guess`, `is_tls_like`, ClientHello-derived `tls_version`, `sni_hash`, `alpn`, `ja4`, `tls_parse_status`, ServerHello-derived `tls_version_negotiated`, `alpn_negotiated`, `ja4s`, `tls_server_parse_status`, and visibility flags; no TLS plaintext or payload is stored.
 - Kubernetes identity: source and destination Pod, node, workload, ReplicaSet, service account, container metadata when available, image digest when available, cgroup ID, and mapping confidence.
 - Service/topology/policy context: destination service fields, namespace/workload relation flags, external destination flag, and reserved policy/baseline fields.
 - Data quality and sampling metadata: `sampling_applied=false`, `sampling_rate=1.0`, `sampling_reason=none`, `histogram_truncated=false`, `iat_overflow=false`, and `tls_parse_status`.
@@ -244,6 +244,9 @@ Mapping confidence values are `high`, `medium`, `low`, and `unknown`. Mapping me
 - `flowledger_tls_handshakes_parsed_total`
 - `flowledger_tls_unmatched_total`
 - `flowledger_tls_buffer_reserve_failed_total`
+- `flowledger_tls_server_hellos_parsed_total`
+- `flowledger_tls_server_hello_unmatched_total`
+- `flowledger_tls_server_hello_parse_errors_total`
 - `flowledger_cgroup_resolutions_total`
 - `flowledger_cgroup_map_size`
 
@@ -252,7 +255,7 @@ Mapping confidence values are `high`, `medium`, `low`, and `unknown`. Mapping me
 - The default Kubernetes deployment validates lifecycle and metadata plumbing only, not real traffic collection.
 - The experimental eBPF collector captures TCP IPv4 lifecycle, lightweight send/receive counters, and cgroup_skb histogram-based packet features on cgroup v2 systems.
 - Histogram-based packet/IAT percentiles are estimates with bucket-width-bounded error; FlowLedger does not retain raw packet length or raw IAT sequences.
-- ClientHello inspection is best-effort and bounded to the first 1024 bytes of the first egress TLS handshake record. Fragmented ClientHellos are marked `fragmented` and are not reassembled.
+- ClientHello and ServerHello inspection are best-effort and bounded to the first 1024 bytes of the first matching TLS handshake record. Fragmented handshakes are marked `fragmented` and are not reassembled.
 - Session byte and packet counters treat event counters as cumulative and keep the maximum seen value.
 - Owner resolution depends on informer cache freshness and may temporarily emit `BarePod`, `ReplicaSet`, or `unknown` during startup or cache churn.
 - Local source attribution prefers cgroup ID to Pod UID mapping when Kubernetes cgroup paths are visible. Missing cgroup v2/kubepods paths degrade gracefully to Pod IP mapping.
