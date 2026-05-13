@@ -85,6 +85,11 @@ type Record struct {
 	TLSParseStatus           string            `json:"tls_parse_status"`
 	TLSRecordSizeHistogram   map[string]uint64 `json:"tls_record_size_histogram"`
 	HandshakeSeen            bool              `json:"handshake_seen"`
+	ServerHelloSeen          bool              `json:"server_hello_seen"`
+	TLSVersionNegotiated     string            `json:"tls_version_negotiated"`
+	ALPNNegotiated           string            `json:"alpn_negotiated"`
+	JA4S                     string            `json:"ja4s"`
+	TLSServerParseStatus     string            `json:"tls_server_parse_status"`
 	SNIVisibility            string            `json:"sni_visibility"`
 	VisibilityDegraded       bool              `json:"visibility_degraded"`
 	VisibilityDegradedReason string            `json:"visibility_degraded_reason"`
@@ -391,6 +396,11 @@ func BuildRecordWithContext(session sessionizer.FlowSession, resolved identity.R
 		TLSParseStatus:           firstNonEmpty(session.TLSParseStatus, "not_inspected"),
 		TLSRecordSizeHistogram:   features.EmptyPacketSizeHistogram(),
 		HandshakeSeen:            session.HandshakeSeen,
+		ServerHelloSeen:          session.ServerHelloSeen,
+		TLSVersionNegotiated:     session.TLSVersionNegotiated,
+		ALPNNegotiated:           session.ALPNNegotiated,
+		JA4S:                     session.JA4S,
+		TLSServerParseStatus:     firstNonEmpty(session.TLSServerParseStatus, "not_inspected"),
 		SNIVisibility:            features.Unknown,
 		VisibilityDegraded:       visibilityDegraded,
 		VisibilityDegradedReason: visibilityReason,

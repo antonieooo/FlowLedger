@@ -102,6 +102,53 @@ func TestSessionizerTLSHandshakeUpdatesExistingSessionOnly(t *testing.T) {
 	}
 }
 
+func TestSessionizerTLSClientAndServerHandshakeAnyOrder(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		first collector.FlowEvent
+		next  collector.FlowEvent
+	}{
+		{
+			name:  "client_then_server",
+			first: clientTLSFlowEvent(),
+			next:  serverTLSFlowEvent(),
+		},
+		{
+			name:  "server_then_client",
+			first: serverTLSFlowEvent(),
+			next:  clientTLSFlowEvent(),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			base := time.Unix(100, 0).UTC()
+			s := New("node-a", 60*time.Second, 30*time.Second)
+			common := collector.FlowEvent{
+				TimestampNS: uint64(base.UnixNano()),
+				EventType:   "CONNECT",
+				SrcIP:       "10.1.1.10",
+				SrcPort:     40000,
+				DstIP:       "10.1.1.20",
+				DstPort:     443,
+				Protocol:    "tcp",
+			}
+			s.Process(common)
+			if !s.ProcessTLSHandshake(tc.first) || !s.ProcessTLSHandshake(tc.next) {
+				t.Fatal("TLS handshake did not match active session")
+			}
+			common.TimestampNS = uint64(base.Add(time.Second).UnixNano())
+			common.EventType = "CLOSE"
+			out := s.Process(common)
+			if len(out) != 1 {
+				t.Fatalf("CLOSE emitted %d sessions, want 1", len(out))
+			}
+			got := out[0]
+			if !got.HandshakeSeen || got.JA4 != clientTLSFlowEvent().JA4 || !got.ServerHelloSeen || got.JA4S != serverTLSFlowEvent().JA4S {
+				t.Fatalf("TLS client/server fields were not retained: %#v", got)
+			}
+		})
+	}
+}
+
 func TestSessionizerWindowIDAndLongLived(t *testing.T) {
 	base := time.Unix(100, 0).UTC()
 	s := NewWithLongLivedThreshold("node-a", time.Minute, time.Second, 2*time.Second)
@@ -137,6 +184,41 @@ func TestSessionizerWindowIDAndLongLived(t *testing.T) {
 	out = s.Process(ev)
 	if len(out) != 1 || out[0].WindowID != 0 || out[0].CloseReason != "fin" || !out[0].FeatureSnapshot.IsLongLived {
 		t.Fatalf("unexpected final session: %#v", out)
+	}
+}
+
+func clientTLSFlowEvent() collector.FlowEvent {
+	return collector.FlowEvent{
+		TimestampNS:    uint64(time.Unix(100, 100).UTC().UnixNano()),
+		EventType:      "TLS_HANDSHAKE",
+		SrcIP:          "10.1.1.10",
+		SrcPort:        40000,
+		DstIP:          "10.1.1.20",
+		DstPort:        443,
+		Protocol:       "tcp",
+		HandshakeSeen:  true,
+		TLSVersion:     "1.3",
+		SNIHash:        "a379a6f6eeafb9a5",
+		ALPN:           "h2",
+		JA4:            "t13d0000h2_000000000000_000000000000",
+		TLSParseStatus: "parsed",
+	}
+}
+
+func serverTLSFlowEvent() collector.FlowEvent {
+	return collector.FlowEvent{
+		TimestampNS:          uint64(time.Unix(100, 200).UTC().UnixNano()),
+		EventType:            "TLS_HANDSHAKE",
+		SrcIP:                "10.1.1.10",
+		SrcPort:              40000,
+		DstIP:                "10.1.1.20",
+		DstPort:              443,
+		Protocol:             "tcp",
+		ServerHelloSeen:      true,
+		TLSVersionNegotiated: "1.2",
+		ALPNNegotiated:       "h2",
+		JA4S:                 "t1201h2_c02f_0b08e3dcc50f",
+		TLSServerParseStatus: "parsed",
 	}
 }
 
