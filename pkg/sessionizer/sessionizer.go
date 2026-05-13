@@ -12,43 +12,48 @@ import (
 )
 
 type FlowSession struct {
-	RecordType         string
-	FlowID             string
-	WindowID           uint64
-	NodeName           string
-	StartTime          time.Time
-	EndTime            time.Time
-	DurationMS         int64
-	SrcIP              string
-	SrcPort            uint16
-	DstIP              string
-	DstPort            uint16
-	Protocol           string
-	CgroupID           uint64
-	NetnsIno           uint64
-	Direction          string
-	IPFamily           string
-	TCPState           string
-	BytesOut           uint64
-	BytesIn            uint64
-	PacketsOut         uint64
-	PacketsIn          uint64
-	EventCount         uint64
-	CloseReason        string
-	HandshakeSeen      bool
-	TLSVersion         string
-	SNIHash            string
-	ALPN               string
-	JA4                string
-	TLSParseStatus     string
-	SamplingApplied    bool
-	SamplingRate       float64
-	SamplingReason     string
-	HistogramTruncated bool
-	IATOverflow        bool
-	LastUpdated        time.Time
-	LastEmitted        time.Time
-	FeatureSnapshot    features.Snapshot
+	RecordType           string
+	FlowID               string
+	WindowID             uint64
+	NodeName             string
+	StartTime            time.Time
+	EndTime              time.Time
+	DurationMS           int64
+	SrcIP                string
+	SrcPort              uint16
+	DstIP                string
+	DstPort              uint16
+	Protocol             string
+	CgroupID             uint64
+	NetnsIno             uint64
+	Direction            string
+	IPFamily             string
+	TCPState             string
+	BytesOut             uint64
+	BytesIn              uint64
+	PacketsOut           uint64
+	PacketsIn            uint64
+	EventCount           uint64
+	CloseReason          string
+	HandshakeSeen        bool
+	TLSVersion           string
+	SNIHash              string
+	ALPN                 string
+	JA4                  string
+	TLSParseStatus       string
+	ServerHelloSeen      bool
+	TLSVersionNegotiated string
+	ALPNNegotiated       string
+	JA4S                 string
+	TLSServerParseStatus string
+	SamplingApplied      bool
+	SamplingRate         float64
+	SamplingReason       string
+	HistogramTruncated   bool
+	IATOverflow          bool
+	LastUpdated          time.Time
+	LastEmitted          time.Time
+	FeatureSnapshot      features.Snapshot
 
 	windowSeq   uint64
 	accumulator features.Accumulator
@@ -170,12 +175,21 @@ func (s *Sessionizer) ProcessTLSHandshake(ev collector.FlowEvent) bool {
 	if session == nil {
 		return false
 	}
-	session.HandshakeSeen = ev.HandshakeSeen
-	session.TLSVersion = ev.TLSVersion
-	session.SNIHash = ev.SNIHash
-	session.ALPN = ev.ALPN
-	session.JA4 = ev.JA4
-	session.TLSParseStatus = ev.TLSParseStatus
+	if ev.JA4 != "" || ev.HandshakeSeen {
+		session.HandshakeSeen = ev.HandshakeSeen
+		session.TLSVersion = ev.TLSVersion
+		session.SNIHash = ev.SNIHash
+		session.ALPN = ev.ALPN
+		session.JA4 = ev.JA4
+		session.TLSParseStatus = ev.TLSParseStatus
+	}
+	if ev.JA4S != "" || ev.ServerHelloSeen {
+		session.ServerHelloSeen = ev.ServerHelloSeen
+		session.TLSVersionNegotiated = ev.TLSVersionNegotiated
+		session.ALPNNegotiated = ev.ALPNNegotiated
+		session.JA4S = ev.JA4S
+		session.TLSServerParseStatus = ev.TLSServerParseStatus
+	}
 	session.LastUpdated = eventTime(ev)
 	return true
 }

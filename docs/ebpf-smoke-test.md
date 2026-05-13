@@ -8,7 +8,7 @@ This smoke test verifies the local Linux eBPF collector path for real TCP lifecy
 - The eBPF program can attach to `sock/inet_sock_set_state`.
 - The eBPF program can attach to `tcp_sendmsg` / `tcp_recvmsg` accounting hooks when enabled.
 - On cgroup v2 hosts, the eBPF program can attach to `cgroup_skb/ingress` and `cgroup_skb/egress` packet histogram hooks when enabled.
-- The TLS ClientHello inspection ring buffer can deliver bounded first-handshake metadata to userspace.
+- The TLS ClientHello and ServerHello inspection ring buffer can deliver bounded first-handshake metadata to userspace.
 - The ring buffer can deliver kernel events to Go userspace.
 - `CONNECT`, `STATS`, and `CLOSE` events can be converted into `collector.FlowEvent`.
 - The sessionizer can emit `session_summary` records.
@@ -24,7 +24,7 @@ This smoke test does not verify:
 - TLS metadata.
 - Malicious traffic detection.
 - ML or alerting.
-- TLS decryption, certificate capture, or fragmented ClientHello reassembly.
+- TLS decryption, certificate capture, or fragmented ClientHello/ServerHello reassembly.
 
 ## Prerequisites
 
@@ -161,6 +161,7 @@ Expected records should include at least one:
 - On cgroup v2 with packet hooks attached, `pkt_size_histogram` should have non-zero buckets.
 - With packet timing enabled and at least two packets in the same direction, `iat_p50` / `iat_p95` should be non-null. They are estimates from fixed histogram buckets.
 - For HTTPS flows with a complete first ClientHello in the captured 1024 bytes, `handshake_seen=true`, `tls_parse_status=parsed`, and `ja4`, `sni_hash`, and `alpn` should be populated.
+- For HTTPS flows with a complete first ServerHello in the captured 1024 bytes, `server_hello_seen=true`, `tls_server_parse_status=parsed`, and `ja4s`, `tls_version_negotiated`, and `alpn_negotiated` should be populated.
 - Plaintext SNI such as `example.com` should not appear in the JSONL.
 
 ## Verify Metrics
@@ -185,6 +186,9 @@ Focus on:
 - `flowledger_tls_handshakes_parsed_total`
 - `flowledger_tls_unmatched_total`
 - `flowledger_tls_buffer_reserve_failed_total`
+- `flowledger_tls_server_hellos_parsed_total`
+- `flowledger_tls_server_hello_unmatched_total`
+- `flowledger_tls_server_hello_parse_errors_total`
 - `flowledger_sessions_emitted_total`
 
 Expected behavior:
@@ -196,7 +200,7 @@ Expected behavior:
 - Ring buffer reserve failures and map full drops should not continuously increase.
 - Read errors should not continuously increase.
 - Attach errors should be `0`.
-- TLS parsed status should increase for HTTPS flows.
+- ClientHello and ServerHello parsed counters should increase for HTTPS flows.
 - Sessions emitted should increase as connections close.
 
 ## Troubleshooting
@@ -247,14 +251,15 @@ Check:
 - `--ebpf-enable-packet-histogram=true` or `--ebpf-enable-packet-timing=true` was set.
 - The connection lived long enough for packet hooks to observe traffic before the flow closed.
 
-### H. ja4 / sni_hash remain empty
+### H. ja4 / ja4s / sni_hash remain empty
 
 Check:
 
 - The agent was started with `--ebpf-enable-tls-handshake-inspect=true`.
 - The host uses cgroup v2 and cgroup_skb packet hooks attached.
-- The test traffic is HTTPS with a ClientHello visible in the first egress payload.
+- The test traffic is HTTPS with a ClientHello visible in the first egress payload and a ServerHello visible in the first ingress payload.
 - `flowledger_tls_handshakes_parsed_total{status="fragmented"}` did not increase instead; fragmented ClientHellos are not reassembled in this version.
+- `flowledger_tls_server_hello_parse_errors_total` did not increase instead; fragmented ServerHellos are not reassembled in this version.
 
 ## Pass Criteria
 
@@ -267,7 +272,7 @@ The smoke test passes when:
 - `flows.jsonl` contains at least one `session_summary` from a real connection.
 - With traffic accounting enabled, at least one `STATS` or `CLOSE` record has `traffic_accounting_available=true` and non-zero byte counters.
 - On cgroup v2 with packet hooks enabled, at least one record has non-empty `pkt_size_histogram`; for multi-packet flows, `iat_p50` should be non-null.
-- For HTTPS traffic, at least one record has `handshake_seen=true`, `tls_parse_status=parsed`, non-empty `ja4`, and non-empty `sni_hash`.
+- For HTTPS traffic, at least one record has `handshake_seen=true`, `tls_parse_status=parsed`, non-empty `ja4`, non-empty `sni_hash`, `server_hello_seen=true`, `tls_server_parse_status=parsed`, and non-empty `ja4s`.
 - `grep -i 'example.com' flows.jsonl` returns no plaintext SNI matches.
 - The JSONL output can be parsed by `jq`.
 - Ring buffer or read errors do not continuously increase.
@@ -283,7 +288,7 @@ The smoke test passes when:
 - Does not decrypt TLS.
 - Does not store plaintext SNI.
 - Does not capture certificates.
-- Does not reassemble fragmented ClientHellos.
+- Does not reassemble fragmented ClientHellos or ServerHellos.
 - `packets_out` / `packets_in` are approximate syscall/message counters; cgroup_skb histogram features are packet-level but do not rename those fields.
 - Packet and IAT percentiles are estimated from histograms, not raw sequences.
 - IPv4 TCP only.

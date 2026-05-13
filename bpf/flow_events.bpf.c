@@ -180,11 +180,12 @@ struct flow_stats {
 	__u32 fin_count;
 	__u32 rst_count;
 	__u8 close_seen;
-	__u8 handshake_inspected;
+	__u8 client_hello_inspected;
+	__u8 server_hello_inspected;
 	__u8 traffic_accounting_available;
 	__u8 packet_timing_available;
 	__u8 tcp_metrics_available;
-	__u8 _pad1[3];
+	__u8 _pad1[2];
 };
 
 struct flow_event {
@@ -570,6 +571,8 @@ static int key_from_skb(struct __sk_buff *skb, struct flow_key *key, int ingress
 
 	__builtin_memset(key, 0, sizeof(*key));
 	if (ingress) {
+		// Ingress packets are normalized back to the same client-to-server
+		// orientation used by egress, so both handshake directions share one flow_stats entry.
 		key->src_ip = ip.daddr;
 		key->dst_ip = ip.saddr;
 		key->src_port = bpf_ntohs(ports.dest);
@@ -635,15 +638,24 @@ static void capture_tls_payload(struct __sk_buff *skb, struct tls_handshake_even
 	}
 }
 
-static void maybe_emit_tls_client_hello(struct __sk_buff *skb, struct flow_key *key, struct flow_stats *stats)
+static void maybe_emit_tls_handshake(struct __sk_buff *skb, struct flow_key *key, struct flow_stats *stats, __u8 direction, __u8 expected_type)
 {
 	struct tls_handshake_event *event;
+	__u8 *inspected;
 	__u32 payload_offset = 0;
 	__u32 payload_len = 0;
 	__u8 first = 0;
 	__u8 handshake_type = 0;
 
-	if (!stats || stats->handshake_inspected || !tls_inspect_enabled())
+	if (!stats || !tls_inspect_enabled())
+		return;
+	if (direction == DIRECTION_SEND)
+		inspected = &stats->client_hello_inspected;
+	else if (direction == DIRECTION_RECV)
+		inspected = &stats->server_hello_inspected;
+	else
+		return;
+	if (*inspected)
 		return;
 	if (tcp_payload_meta(skb, &payload_offset, &payload_len) != 0)
 		return;
@@ -653,27 +665,28 @@ static void maybe_emit_tls_client_hello(struct __sk_buff *skb, struct flow_key *
 	if (bpf_skb_load_bytes(skb, payload_offset, &first, sizeof(first)) != 0)
 		return;
 	if (first != 0x16) {
-		stats->handshake_inspected = 1;
+		*inspected = 1;
 		return;
 	}
 
 	if (payload_len >= 6) {
 		if (bpf_skb_load_bytes(skb, payload_offset + 5, &handshake_type, sizeof(handshake_type)) != 0)
 			return;
-		if (handshake_type != 0x01) {
-			stats->handshake_inspected = 1;
+		if (handshake_type != expected_type) {
+			*inspected = 1;
 			return;
 		}
 	}
 
 	event = bpf_ringbuf_reserve(&tls_handshake_events, sizeof(*event), 0);
-	stats->handshake_inspected = 1;
+	*inspected = 1;
 	if (!event) {
 		increment_drop(DROP_TLS_BUFFER_RESERVE_FAILED);
 		return;
 	}
 
 	event->key = *key;
+	event->key.direction = direction;
 	event->timestamp_ns = bpf_ktime_get_ns();
 	event->payload_len = payload_len;
 	event->captured_len = 0;
@@ -838,9 +851,13 @@ SEC("cgroup_skb/ingress")
 int handle_cgroup_skb_ingress(struct __sk_buff *skb)
 {
 	struct flow_key key;
+	struct flow_stats *stats;
 
-	if (key_from_skb(skb, &key, 1) == 0)
+	if (key_from_skb(skb, &key, 1) == 0) {
 		update_packet_stats(skb, &key, skb->len, 1, bpf_ktime_get_ns());
+		stats = bpf_map_lookup_elem(&flow_stats_map, &key);
+		maybe_emit_tls_handshake(skb, &key, stats, DIRECTION_RECV, 0x02);
+	}
 	return CGROUP_SKB_PASS;
 }
 
@@ -853,7 +870,7 @@ int handle_cgroup_skb_egress(struct __sk_buff *skb)
 	if (key_from_skb(skb, &key, 0) == 0) {
 		update_packet_stats(skb, &key, skb->len, 0, bpf_ktime_get_ns());
 		stats = bpf_map_lookup_elem(&flow_stats_map, &key);
-		maybe_emit_tls_client_hello(skb, &key, stats);
+		maybe_emit_tls_handshake(skb, &key, stats, DIRECTION_SEND, 0x01);
 	}
 	return CGROUP_SKB_PASS;
 }
