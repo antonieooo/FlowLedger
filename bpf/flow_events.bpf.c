@@ -36,7 +36,8 @@ typedef unsigned long long __u64;
 #define DROP_UNSUPPORTED_FAMILY 2
 #define DROP_RECV_ARG_MISSED 3
 #define DROP_TLS_BUFFER_RESERVE_FAILED 4
-#define DROP_COUNTERS_LEN 5
+#define DROP_TLS_SERVER_HELLO_NO_STATS 5
+#define DROP_COUNTERS_LEN 6
 
 #define FLOW_STATS_MAX_ENTRIES 65536
 #define RECV_ARGS_MAX_ENTRIES 16384
@@ -647,8 +648,13 @@ static void maybe_emit_tls_handshake(struct __sk_buff *skb, struct flow_key *key
 	__u8 first = 0;
 	__u8 handshake_type = 0;
 
-	if (!stats || !tls_inspect_enabled())
+	if (!tls_inspect_enabled())
 		return;
+	if (!stats) {
+		if (direction == DIRECTION_RECV)
+			increment_drop(DROP_TLS_SERVER_HELLO_NO_STATS);
+		return;
+	}
 	if (direction == DIRECTION_SEND)
 		inspected = &stats->client_hello_inspected;
 	else if (direction == DIRECTION_RECV)

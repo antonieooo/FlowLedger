@@ -378,6 +378,8 @@ func applyEBPFDropMetric(m *flmetrics.Metrics, ev collector.FlowEvent) {
 		m.EBPFRingbufReserveFailures.Add(float64(count))
 	case "tls_buffer_reserve_failed":
 		m.TLSBufferReserveFailedTotal.Add(float64(count))
+	case "tls_server_hello_no_stats":
+		m.TLSServerHelloNoStatsTotal.Add(float64(count))
 	case "unsupported_family", "recv_arg_missed":
 		return
 	default:

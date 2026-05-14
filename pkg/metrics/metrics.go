@@ -36,6 +36,7 @@ type Metrics struct {
 	TLSHandshakesParsed          *prometheus.CounterVec
 	TLSUnmatchedTotal            prometheus.Counter
 	TLSBufferReserveFailedTotal  prometheus.Counter
+	TLSServerHelloNoStatsTotal   prometheus.Counter
 	TLSServerHellosParsedTotal   prometheus.Counter
 	TLSServerHelloUnmatchedTotal prometheus.Counter
 	TLSServerHelloParseErrors    prometheus.Counter
@@ -145,23 +146,27 @@ func New() *Metrics {
 			Name: "flowledger_tls_unmatched_total",
 			Help: "Total TLS handshake events that could not be joined to an active flow session.",
 		}),
-			TLSBufferReserveFailedTotal: prometheus.NewCounter(prometheus.CounterOpts{
-				Name: "flowledger_tls_buffer_reserve_failed_total",
-				Help: "Total TLS handshake ring buffer reserve failures reported by the kernel program.",
-			}),
-			TLSServerHellosParsedTotal: prometheus.NewCounter(prometheus.CounterOpts{
-				Name: "flowledger_tls_server_hellos_parsed_total",
-				Help: "Total TLS ServerHello inspection events parsed successfully.",
-			}),
-			TLSServerHelloUnmatchedTotal: prometheus.NewCounter(prometheus.CounterOpts{
-				Name: "flowledger_tls_server_hello_unmatched_total",
-				Help: "Total TLS ServerHello events that could not be joined to an active flow session.",
-			}),
-			TLSServerHelloParseErrors: prometheus.NewCounter(prometheus.CounterOpts{
-				Name: "flowledger_tls_server_hello_parse_errors_total",
-				Help: "Total TLS ServerHello inspection events that did not parse successfully.",
-			}),
-			CgroupResolutionsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+		TLSBufferReserveFailedTotal: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "flowledger_tls_buffer_reserve_failed_total",
+			Help: "Total TLS handshake ring buffer reserve failures reported by the kernel program.",
+		}),
+		TLSServerHelloNoStatsTotal: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "flowledger_tls_server_hello_no_stats_total",
+			Help: "Total TLS ServerHello ingress packets seen without a matching eBPF flow_stats entry.",
+		}),
+		TLSServerHellosParsedTotal: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "flowledger_tls_server_hellos_parsed_total",
+			Help: "Total TLS ServerHello inspection events parsed successfully.",
+		}),
+		TLSServerHelloUnmatchedTotal: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "flowledger_tls_server_hello_unmatched_total",
+			Help: "Total TLS ServerHello events that could not be joined to an active flow session.",
+		}),
+		TLSServerHelloParseErrors: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "flowledger_tls_server_hello_parse_errors_total",
+			Help: "Total TLS ServerHello inspection events that did not parse successfully.",
+		}),
+		CgroupResolutionsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "flowledger_cgroup_resolutions_total",
 			Help: "Total cgroup_id to pod identity resolution attempts by result.",
 		}, []string{"result"}),
@@ -194,13 +199,14 @@ func New() *Metrics {
 		m.EBPFConnectEventsTotal,
 		m.EBPFCloseEventsTotal,
 		m.EBPFTrafficAccountingEnabled,
-			m.TLSHandshakesParsed,
-			m.TLSUnmatchedTotal,
-			m.TLSBufferReserveFailedTotal,
-			m.TLSServerHellosParsedTotal,
-			m.TLSServerHelloUnmatchedTotal,
-			m.TLSServerHelloParseErrors,
-			m.CgroupResolutionsTotal,
+		m.TLSHandshakesParsed,
+		m.TLSUnmatchedTotal,
+		m.TLSBufferReserveFailedTotal,
+		m.TLSServerHelloNoStatsTotal,
+		m.TLSServerHellosParsedTotal,
+		m.TLSServerHelloUnmatchedTotal,
+		m.TLSServerHelloParseErrors,
+		m.CgroupResolutionsTotal,
 		m.CgroupMapSize,
 	)
 	return m
