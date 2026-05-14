@@ -40,6 +40,8 @@ type Metrics struct {
 	TLSServerHellosParsedTotal   prometheus.Counter
 	TLSServerHelloUnmatchedTotal prometheus.Counter
 	TLSServerHelloParseErrors    prometheus.Counter
+	TLSServerHelloNATAliasHits   prometheus.Counter
+	TLSServerHelloNATAliasMisses prometheus.Counter
 	CgroupResolutionsTotal       *prometheus.CounterVec
 	CgroupMapSize                prometheus.Gauge
 }
@@ -166,6 +168,14 @@ func New() *Metrics {
 			Name: "flowledger_tls_server_hello_parse_errors_total",
 			Help: "Total TLS ServerHello inspection events that did not parse successfully.",
 		}),
+		TLSServerHelloNATAliasHits: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "flowledger_tls_server_hello_nat_alias_hits_total",
+			Help: "Total TLS ServerHello events joined to an active session through EndpointSlice Service aliasing.",
+		}),
+		TLSServerHelloNATAliasMisses: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "flowledger_tls_server_hello_nat_alias_misses_total",
+			Help: "Total TLS ServerHello alias fallback attempts that did not find an active Service session.",
+		}),
 		CgroupResolutionsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "flowledger_cgroup_resolutions_total",
 			Help: "Total cgroup_id to pod identity resolution attempts by result.",
@@ -206,10 +216,20 @@ func New() *Metrics {
 		m.TLSServerHellosParsedTotal,
 		m.TLSServerHelloUnmatchedTotal,
 		m.TLSServerHelloParseErrors,
+		m.TLSServerHelloNATAliasHits,
+		m.TLSServerHelloNATAliasMisses,
 		m.CgroupResolutionsTotal,
 		m.CgroupMapSize,
 	)
 	return m
+}
+
+func (m *Metrics) IncTLSServerHelloNATAliasHit() {
+	m.TLSServerHelloNATAliasHits.Inc()
+}
+
+func (m *Metrics) IncTLSServerHelloNATAliasMiss() {
+	m.TLSServerHelloNATAliasMisses.Inc()
 }
 
 func (m *Metrics) Handler() http.Handler {

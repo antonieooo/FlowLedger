@@ -135,6 +135,8 @@ func main() {
 
 	events, errs := flowCollector.Run(ctx)
 	sessions := sessionizer.NewWithLongLivedThreshold(cfg.nodeName, cfg.sessionTimeout, cfg.windowSize, cfg.longLivedThreshold)
+	sessions.SetK8sMeta(metaCache)
+	sessions.SetNATAliasMetrics(m)
 	resolver := identity.NewResolverWithCgroups(metaCache, cgroupResolver)
 	recordContext := ledger.BuildContext{
 		ClusterID:      cfg.clusterID,

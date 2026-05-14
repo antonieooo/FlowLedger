@@ -7,6 +7,7 @@ import (
 	discoveryv1 "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
 )
 
 func TestEndpointSliceUpsertDoesNotDeleteSiblingSlice(t *testing.T) {
@@ -71,6 +72,35 @@ func TestEndpointSliceDeleteWithoutCachedServiceRemovesEndpoints(t *testing.T) {
 	}
 	if got := cache.EndpointSliceCount(); got != 0 {
 		t.Fatalf("EndpointSliceCount() = %d, want 0", got)
+	}
+}
+
+func TestResolveServiceForEndpointUsesEndpointSliceAlias(t *testing.T) {
+	cache := NewCache()
+	cache.UpsertEndpointSlice(endpointSlice("api-a", "slice-a-uid", "api", []string{"10.1.1.10"}, 8443))
+	cache.UpsertService(&corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "api",
+			Namespace: "default",
+			UID:       types.UID("api-uid"),
+		},
+		Spec: corev1.ServiceSpec{
+			ClusterIP: "10.96.0.10",
+			Ports: []corev1.ServicePort{{
+				Name:       "https",
+				Port:       443,
+				TargetPort: intstr.FromInt32(8443),
+				Protocol:   corev1.ProtocolTCP,
+			}},
+		},
+	})
+
+	clusterIP, servicePort, ok := cache.ResolveServiceForEndpoint("10.1.1.10", 8443, "tcp")
+	if !ok {
+		t.Fatal("ResolveServiceForEndpoint did not resolve endpoint")
+	}
+	if clusterIP != "10.96.0.10" || servicePort != 443 {
+		t.Fatalf("ResolveServiceForEndpoint = %s:%d, want 10.96.0.10:443", clusterIP, servicePort)
 	}
 }
 
