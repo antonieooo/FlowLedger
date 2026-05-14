@@ -9,6 +9,7 @@ import (
 
 	"FlowLedger/pkg/collector"
 	"FlowLedger/pkg/features"
+	"FlowLedger/pkg/k8smeta"
 )
 
 type FlowSession struct {
@@ -65,10 +66,25 @@ type Sessionizer struct {
 	windowSize         time.Duration
 	longLivedThreshold time.Duration
 	sessions           map[string]*FlowSession
+	k8sMeta            k8smeta.Resolver
+	natAliasMetrics    NATAliasMetrics
+}
+
+type NATAliasMetrics interface {
+	IncTLSServerHelloNATAliasHit()
+	IncTLSServerHelloNATAliasMiss()
 }
 
 func New(nodeName string, timeout, windowSize time.Duration) *Sessionizer {
 	return NewWithLongLivedThreshold(nodeName, timeout, windowSize, features.DefaultLongLivedThreshold)
+}
+
+func (s *Sessionizer) SetK8sMeta(resolver k8smeta.Resolver) {
+	s.k8sMeta = resolver
+}
+
+func (s *Sessionizer) SetNATAliasMetrics(metrics NATAliasMetrics) {
+	s.natAliasMetrics = metrics
 }
 
 func NewWithLongLivedThreshold(nodeName string, timeout, windowSize, longLivedThreshold time.Duration) *Sessionizer {
@@ -172,6 +188,18 @@ func (s *Sessionizer) Process(ev collector.FlowEvent) []FlowSession {
 func (s *Sessionizer) ProcessTLSHandshake(ev collector.FlowEvent) bool {
 	key := flowKey(ev)
 	session := s.sessions[key]
+	if session == nil && (ev.ServerHelloSeen || ev.JA4S != "") {
+		if altKey, ok := s.serviceAliasKey(ev); ok {
+			session = s.sessions[altKey]
+			if session != nil {
+				s.incrementNATAliasHit()
+			} else {
+				s.incrementNATAliasMiss()
+			}
+		} else {
+			s.incrementNATAliasMiss()
+		}
+	}
 	if session == nil {
 		return false
 	}
@@ -192,6 +220,32 @@ func (s *Sessionizer) ProcessTLSHandshake(ev collector.FlowEvent) bool {
 	}
 	session.LastUpdated = eventTime(ev)
 	return true
+}
+
+func (s *Sessionizer) serviceAliasKey(ev collector.FlowEvent) (string, bool) {
+	if s.k8sMeta == nil {
+		return "", false
+	}
+	clusterIP, servicePort, ok := s.k8sMeta.ResolveServiceForEndpoint(ev.DstIP, int(ev.DstPort), ev.Protocol)
+	if !ok {
+		return "", false
+	}
+	aliased := ev
+	aliased.DstIP = clusterIP
+	aliased.DstPort = uint16(servicePort)
+	return flowKey(aliased), true
+}
+
+func (s *Sessionizer) incrementNATAliasHit() {
+	if s.natAliasMetrics != nil {
+		s.natAliasMetrics.IncTLSServerHelloNATAliasHit()
+	}
+}
+
+func (s *Sessionizer) incrementNATAliasMiss() {
+	if s.natAliasMetrics != nil {
+		s.natAliasMetrics.IncTLSServerHelloNATAliasMiss()
+	}
 }
 
 func (s *Sessionizer) Sweep(now time.Time) []FlowSession {

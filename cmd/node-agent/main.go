@@ -135,6 +135,8 @@ func main() {
 
 	events, errs := flowCollector.Run(ctx)
 	sessions := sessionizer.NewWithLongLivedThreshold(cfg.nodeName, cfg.sessionTimeout, cfg.windowSize, cfg.longLivedThreshold)
+	sessions.SetK8sMeta(metaCache)
+	sessions.SetNATAliasMetrics(m)
 	resolver := identity.NewResolverWithCgroups(metaCache, cgroupResolver)
 	recordContext := ledger.BuildContext{
 		ClusterID:      cfg.clusterID,
@@ -378,6 +380,8 @@ func applyEBPFDropMetric(m *flmetrics.Metrics, ev collector.FlowEvent) {
 		m.EBPFRingbufReserveFailures.Add(float64(count))
 	case "tls_buffer_reserve_failed":
 		m.TLSBufferReserveFailedTotal.Add(float64(count))
+	case "tls_server_hello_no_stats":
+		m.TLSServerHelloNoStatsTotal.Add(float64(count))
 	case "unsupported_family", "recv_arg_missed":
 		return
 	default:

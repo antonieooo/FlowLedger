@@ -32,6 +32,8 @@ type ServiceInfo struct {
 	ClusterIP   string
 	ClusterIPs  []string
 	Port        int32
+	TargetPort  int32
+	TargetName  string
 	PortName    string
 	AppProtocol string
 	Protocol    string
@@ -53,4 +55,8 @@ type WorkloadInfo struct {
 	PodTemplateHash string
 	Image           string
 	ImageID         string
+}
+
+type Resolver interface {
+	ResolveServiceForEndpoint(endpointIP string, endpointPort int, protocol string) (serviceClusterIP string, servicePort int, ok bool)
 }
