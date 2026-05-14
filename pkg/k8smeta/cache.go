@@ -2,6 +2,9 @@ package k8smeta
 
 import (
 	"fmt"
+	"log"
+	"net/netip"
+	"strings"
 	"sync"
 	"time"
 
@@ -23,11 +26,12 @@ type Cache struct {
 	podTombstones  map[types.UID]tombstone
 	podIPTombstone map[string]tombstone
 
-	serviceByClusterIPPort map[string]*ServiceInfo
-	endpointByIPPort       map[string]*EndpointInfo
-	endpointOwnerByIPPort  map[string]string
-	endpointKeysBySlice    map[string][]string
-	endpointSlicesByKey    map[string]struct{}
+	serviceByClusterIPPort  map[string]*ServiceInfo
+	endpointByIPPort        map[string]*EndpointInfo
+	endpointAliasesByIPPort map[string][]endpointServiceAlias
+	endpointOwnerByIPPort   map[string]string
+	endpointKeysBySlice     map[string][]string
+	endpointSlicesByKey     map[string]struct{}
 
 	workloads           map[types.UID]*WorkloadInfo
 	replicaSetToDeploy  map[types.UID]*WorkloadInfo
@@ -44,22 +48,33 @@ type tombstone struct {
 	expiresAt time.Time
 }
 
+type endpointServiceAlias struct {
+	owner            string
+	namespace        string
+	serviceName      string
+	endpointPort     int32
+	endpointPortName string
+	service          *ServiceInfo
+	protocol         string
+}
+
 func NewCache() *Cache {
 	return &Cache{
-		podByIP:                map[string]*PodInfo{},
-		podByUID:               map[types.UID]*PodInfo{},
-		podTombstones:          map[types.UID]tombstone{},
-		podIPTombstone:         map[string]tombstone{},
-		serviceByClusterIPPort: map[string]*ServiceInfo{},
-		endpointByIPPort:       map[string]*EndpointInfo{},
-		endpointOwnerByIPPort:  map[string]string{},
-		endpointKeysBySlice:    map[string][]string{},
-		endpointSlicesByKey:    map[string]struct{}{},
-		workloads:              map[types.UID]*WorkloadInfo{},
-		replicaSetToDeploy:     map[types.UID]*WorkloadInfo{},
-		replicaSetDeployUID:    map[types.UID]types.UID{},
-		replicaSets:            map[types.UID]*WorkloadInfo{},
-		jobsToCronJobs:         map[types.UID]*WorkloadInfo{},
+		podByIP:                 map[string]*PodInfo{},
+		podByUID:                map[types.UID]*PodInfo{},
+		podTombstones:           map[types.UID]tombstone{},
+		podIPTombstone:          map[string]tombstone{},
+		serviceByClusterIPPort:  map[string]*ServiceInfo{},
+		endpointByIPPort:        map[string]*EndpointInfo{},
+		endpointAliasesByIPPort: map[string][]endpointServiceAlias{},
+		endpointOwnerByIPPort:   map[string]string{},
+		endpointKeysBySlice:     map[string][]string{},
+		endpointSlicesByKey:     map[string]struct{}{},
+		workloads:               map[types.UID]*WorkloadInfo{},
+		replicaSetToDeploy:      map[types.UID]*WorkloadInfo{},
+		replicaSetDeployUID:     map[types.UID]types.UID{},
+		replicaSets:             map[types.UID]*WorkloadInfo{},
+		jobsToCronJobs:          map[types.UID]*WorkloadInfo{},
 	}
 }
 
@@ -124,6 +139,8 @@ func (c *Cache) UpsertService(svc *corev1.Service) {
 				ClusterIP:   ip,
 				ClusterIPs:  append([]string{}, ips...),
 				Port:        p.Port,
+				TargetPort:  p.TargetPort.IntVal,
+				TargetName:  p.TargetPort.StrVal,
 				PortName:    p.Name,
 				AppProtocol: serviceAppProtocol(p.AppProtocol, p.Name),
 				Protocol:    string(p.Protocol),
@@ -162,14 +179,24 @@ func (c *Cache) UpsertEndpointSlice(slice *discoveryv1.EndpointSlice) {
 				if port.Port == nil {
 					continue
 				}
+				svc := c.findServiceForEndpointSlicePortLocked(slice.Namespace, serviceName, addr, port)
 				info := &EndpointInfo{
-					Service: c.findServiceByNamePortLocked(slice.Namespace, serviceName, *port.Port),
+					Service: svc,
 					Backend: backend,
 					IP:      addr,
 					Port:    *port.Port,
 				}
 				key := ServiceKey(addr, *port.Port)
 				c.endpointByIPPort[key] = info
+				c.endpointAliasesByIPPort[key] = append(c.endpointAliasesByIPPort[key], endpointServiceAlias{
+					owner:            sKey,
+					namespace:        slice.Namespace,
+					serviceName:      serviceName,
+					endpointPort:     *port.Port,
+					endpointPortName: endpointSlicePortName(port),
+					service:          svc,
+					protocol:         endpointSlicePortProtocol(port),
+				})
 				c.endpointOwnerByIPPort[key] = sKey
 				keys = append(keys, key)
 			}
@@ -303,6 +330,39 @@ func (c *Cache) EndpointByIPPort(ip string, port uint16) (*EndpointInfo, bool) {
 	cp.Service = cloneService(ep.Service)
 	cp.Backend = clonePod(ep.Backend)
 	return &cp, ok
+}
+
+func (c *Cache) ResolveServiceForEndpoint(endpointIP string, endpointPort int, protocol string) (string, int, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	aliases := c.endpointAliasesByIPPort[ServiceKey(endpointIP, int32(endpointPort))]
+	if len(aliases) == 0 {
+		return "", 0, false
+	}
+	protocol = normalizeProtocol(protocol)
+	matches := make([]*ServiceInfo, 0, len(aliases))
+	for _, alias := range aliases {
+		if normalizeProtocol(alias.protocol) != protocol {
+			continue
+		}
+		svc := c.findServiceForAliasLocked(endpointIP, alias)
+		if svc == nil {
+			svc = alias.service
+		}
+		if svc == nil {
+			continue
+		}
+		matches = append(matches, svc)
+	}
+	if len(matches) == 0 {
+		return "", 0, false
+	}
+	if len(matches) > 1 {
+		log.Printf("debug: endpoint %s:%d/%s is backed by %d Services; using %s/%s",
+			endpointIP, endpointPort, protocol, len(matches), matches[0].Namespace, matches[0].Name)
+	}
+	svc := matches[0]
+	return svc.ClusterIP, int(svc.Port), true
 }
 
 func (c *Cache) Stats() (pods, services int) {
@@ -440,14 +500,109 @@ func (c *Cache) findServiceByNamePortLocked(namespace, name string, port int32) 
 	return nil
 }
 
+func (c *Cache) findServiceForEndpointSlicePortLocked(namespace, name, endpointIP string, port discoveryv1.EndpointPort) *ServiceInfo {
+	endpointPort := int32(0)
+	if port.Port != nil {
+		endpointPort = *port.Port
+	}
+	return c.findServiceForAliasLocked(endpointIP, endpointServiceAlias{
+		namespace:        namespace,
+		serviceName:      name,
+		endpointPort:     endpointPort,
+		endpointPortName: endpointSlicePortName(port),
+		protocol:         endpointSlicePortProtocol(port),
+	})
+}
+
+func (c *Cache) findServiceForAliasLocked(endpointIP string, alias endpointServiceAlias) *ServiceInfo {
+	var first *ServiceInfo
+	for _, svc := range c.serviceByClusterIPPort {
+		if svc.Namespace != alias.namespace || svc.Name != alias.serviceName || normalizeProtocol(svc.Protocol) != normalizeProtocol(alias.protocol) {
+			continue
+		}
+		if !clusterIPFamilyMatches(endpointIP, svc.ClusterIP) {
+			continue
+		}
+		if servicePortMatchesEndpoint(svc, alias.endpointPortName, alias.endpointPort) {
+			if first == nil || svc.ClusterIP < first.ClusterIP {
+				first = svc
+			}
+		}
+	}
+	return first
+}
+
+func servicePortMatchesEndpoint(svc *ServiceInfo, endpointPortName string, endpointPort int32) bool {
+	if endpointPortName != "" && (svc.PortName == endpointPortName || svc.TargetName == endpointPortName) {
+		return true
+	}
+	if endpointPort == 0 {
+		return false
+	}
+	if svc.TargetPort != 0 {
+		return svc.TargetPort == endpointPort
+	}
+	if svc.TargetName == "" {
+		return svc.Port == endpointPort
+	}
+	return false
+}
+
+func endpointSlicePortProtocol(port discoveryv1.EndpointPort) string {
+	if port.Protocol == nil {
+		return "tcp"
+	}
+	return string(*port.Protocol)
+}
+
+func endpointSlicePortName(port discoveryv1.EndpointPort) string {
+	if port.Name == nil {
+		return ""
+	}
+	return *port.Name
+}
+
+func normalizeProtocol(protocol string) string {
+	if protocol == "" {
+		return "tcp"
+	}
+	return strings.ToLower(protocol)
+}
+
+func clusterIPFamilyMatches(endpointIP, clusterIP string) bool {
+	endpointAddr, err := netip.ParseAddr(endpointIP)
+	if err != nil {
+		return true
+	}
+	clusterAddr, err := netip.ParseAddr(clusterIP)
+	if err != nil {
+		return true
+	}
+	return endpointAddr.Is4() == clusterAddr.Is4()
+}
+
 func (c *Cache) deleteEndpointSliceEndpointsLocked(sliceKey string) {
 	for _, key := range c.endpointKeysBySlice[sliceKey] {
+		c.endpointAliasesByIPPort[key] = removeEndpointAliasesForOwner(c.endpointAliasesByIPPort[key], sliceKey)
+		if len(c.endpointAliasesByIPPort[key]) == 0 {
+			delete(c.endpointAliasesByIPPort, key)
+		}
 		if c.endpointOwnerByIPPort[key] == sliceKey {
 			delete(c.endpointByIPPort, key)
 			delete(c.endpointOwnerByIPPort, key)
 		}
 	}
 	delete(c.endpointKeysBySlice, sliceKey)
+}
+
+func removeEndpointAliasesForOwner(aliases []endpointServiceAlias, owner string) []endpointServiceAlias {
+	out := aliases[:0]
+	for _, alias := range aliases {
+		if alias.owner != owner {
+			out = append(out, alias)
+		}
+	}
+	return out
 }
 
 func endpointSliceKey(slice *discoveryv1.EndpointSlice) string {

@@ -315,6 +315,7 @@ func readDropCounterDeltas(dropCounters *ebpf.Map, previous map[uint32]uint64) [
 		2: "unsupported_family",
 		3: "recv_arg_missed",
 		4: "tls_buffer_reserve_failed",
+		5: "tls_server_hello_no_stats",
 	} {
 		var total uint64
 		if err := dropCounters.Lookup(idx, &total); err != nil {

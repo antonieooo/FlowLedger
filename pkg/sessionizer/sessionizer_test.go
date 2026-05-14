@@ -7,6 +7,32 @@ import (
 	"FlowLedger/pkg/collector"
 )
 
+type fakeK8sResolver struct {
+	clusterIP   string
+	servicePort int
+	ok          bool
+}
+
+func (r fakeK8sResolver) ResolveServiceForEndpoint(endpointIP string, endpointPort int, protocol string) (string, int, bool) {
+	if !r.ok || endpointIP != "10.1.1.20" || endpointPort != 443 || protocol != "tcp" {
+		return "", 0, false
+	}
+	return r.clusterIP, r.servicePort, true
+}
+
+type fakeNATAliasMetrics struct {
+	hits   int
+	misses int
+}
+
+func (m *fakeNATAliasMetrics) IncTLSServerHelloNATAliasHit() {
+	m.hits++
+}
+
+func (m *fakeNATAliasMetrics) IncTLSServerHelloNATAliasMiss() {
+	m.misses++
+}
+
 func TestSessionizerClose(t *testing.T) {
 	base := time.Unix(100, 0).UTC()
 	s := New("node-a", 60*time.Second, 30*time.Second)
@@ -146,6 +172,69 @@ func TestSessionizerTLSClientAndServerHandshakeAnyOrder(t *testing.T) {
 				t.Fatalf("TLS client/server fields were not retained: %#v", got)
 			}
 		})
+	}
+}
+
+func TestSessionizerServerHelloNATAliasMatchesServiceSession(t *testing.T) {
+	base := time.Unix(100, 0).UTC()
+	s := New("node-a", 60*time.Second, 30*time.Second)
+	aliasMetrics := &fakeNATAliasMetrics{}
+	s.SetK8sMeta(fakeK8sResolver{clusterIP: "10.96.0.10", servicePort: 443, ok: true})
+	s.SetNATAliasMetrics(aliasMetrics)
+
+	connect := collector.FlowEvent{
+		TimestampNS: uint64(base.UnixNano()),
+		EventType:   "CONNECT",
+		SrcIP:       "10.1.1.10",
+		SrcPort:     40000,
+		DstIP:       "10.96.0.10",
+		DstPort:     443,
+		Protocol:    "tcp",
+	}
+	s.Process(connect)
+
+	clientHello := clientTLSFlowEvent()
+	clientHello.DstIP = "10.1.1.20"
+	if s.ProcessTLSHandshake(clientHello) {
+		t.Fatal("ClientHello unexpectedly used NAT alias fallback")
+	}
+	if aliasMetrics.hits != 0 || aliasMetrics.misses != 0 {
+		t.Fatalf("ClientHello changed NAT alias metrics: %#v", aliasMetrics)
+	}
+
+	serverHello := serverTLSFlowEvent()
+	serverHello.DstIP = "10.1.1.20"
+	if !s.ProcessTLSHandshake(serverHello) {
+		t.Fatal("ServerHello did not match through NAT alias")
+	}
+	if aliasMetrics.hits != 1 || aliasMetrics.misses != 0 {
+		t.Fatalf("unexpected NAT alias metrics: %#v", aliasMetrics)
+	}
+
+	connect.TimestampNS = uint64(base.Add(time.Second).UnixNano())
+	connect.EventType = "CLOSE"
+	out := s.Process(connect)
+	if len(out) != 1 {
+		t.Fatalf("CLOSE emitted %d sessions, want 1", len(out))
+	}
+	if !out[0].ServerHelloSeen || out[0].JA4S != serverHello.JA4S {
+		t.Fatalf("ServerHello fields were not retained after alias join: %#v", out[0])
+	}
+}
+
+func TestSessionizerServerHelloNATAliasMiss(t *testing.T) {
+	s := New("node-a", 60*time.Second, 30*time.Second)
+	aliasMetrics := &fakeNATAliasMetrics{}
+	s.SetK8sMeta(fakeK8sResolver{})
+	s.SetNATAliasMetrics(aliasMetrics)
+
+	serverHello := serverTLSFlowEvent()
+	serverHello.DstIP = "10.1.1.20"
+	if s.ProcessTLSHandshake(serverHello) {
+		t.Fatal("ServerHello unexpectedly matched without alias")
+	}
+	if aliasMetrics.hits != 0 || aliasMetrics.misses != 1 {
+		t.Fatalf("unexpected NAT alias metrics: %#v", aliasMetrics)
 	}
 }
 

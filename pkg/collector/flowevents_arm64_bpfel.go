@@ -113,12 +113,13 @@ type flowEventsProgramSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type flowEventsMapSpecs struct {
-	ConfigMap          *ebpf.MapSpec `ebpf:"config_map"`
-	DropCounters       *ebpf.MapSpec `ebpf:"drop_counters"`
-	Events             *ebpf.MapSpec `ebpf:"events"`
-	FlowStatsMap       *ebpf.MapSpec `ebpf:"flow_stats_map"`
-	RecvArgsMap        *ebpf.MapSpec `ebpf:"recv_args_map"`
-	TlsHandshakeEvents *ebpf.MapSpec `ebpf:"tls_handshake_events"`
+	ConfigMap             *ebpf.MapSpec `ebpf:"config_map"`
+	DropCounters          *ebpf.MapSpec `ebpf:"drop_counters"`
+	Events                *ebpf.MapSpec `ebpf:"events"`
+	FlowStatsMap          *ebpf.MapSpec `ebpf:"flow_stats_map"`
+	RecvArgsMap           *ebpf.MapSpec `ebpf:"recv_args_map"`
+	TlsHandshakeEvents    *ebpf.MapSpec `ebpf:"tls_handshake_events"`
+	TlsServerHelloSeenMap *ebpf.MapSpec `ebpf:"tls_server_hello_seen_map"`
 }
 
 // flowEventsObjects contains all objects after they have been loaded into the kernel.
@@ -140,12 +141,13 @@ func (o *flowEventsObjects) Close() error {
 //
 // It can be passed to loadFlowEventsObjects or ebpf.CollectionSpec.LoadAndAssign.
 type flowEventsMaps struct {
-	ConfigMap          *ebpf.Map `ebpf:"config_map"`
-	DropCounters       *ebpf.Map `ebpf:"drop_counters"`
-	Events             *ebpf.Map `ebpf:"events"`
-	FlowStatsMap       *ebpf.Map `ebpf:"flow_stats_map"`
-	RecvArgsMap        *ebpf.Map `ebpf:"recv_args_map"`
-	TlsHandshakeEvents *ebpf.Map `ebpf:"tls_handshake_events"`
+	ConfigMap             *ebpf.Map `ebpf:"config_map"`
+	DropCounters          *ebpf.Map `ebpf:"drop_counters"`
+	Events                *ebpf.Map `ebpf:"events"`
+	FlowStatsMap          *ebpf.Map `ebpf:"flow_stats_map"`
+	RecvArgsMap           *ebpf.Map `ebpf:"recv_args_map"`
+	TlsHandshakeEvents    *ebpf.Map `ebpf:"tls_handshake_events"`
+	TlsServerHelloSeenMap *ebpf.Map `ebpf:"tls_server_hello_seen_map"`
 }
 
 func (m *flowEventsMaps) Close() error {
@@ -156,6 +158,7 @@ func (m *flowEventsMaps) Close() error {
 		m.FlowStatsMap,
 		m.RecvArgsMap,
 		m.TlsHandshakeEvents,
+		m.TlsServerHelloSeenMap,
 	)
 }
 
