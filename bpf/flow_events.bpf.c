@@ -279,6 +279,18 @@ struct {
 	__type(value, struct flow_stats);
 } flow_stats_map SEC(".maps");
 
+// Dedicated ingress ServerHello dedup keyed by the post-NAT flow tuple.
+// flow_stats_map is intentionally not reused because egress accounting may be
+// keyed by the Service ClusterIP while ingress ServerHello is keyed by the
+// backend Pod IP. LRU eviction can allow a duplicate ServerHello on very
+// long-lived flows, which is acceptable for rare renegotiation/reused 5-tuples.
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 65536);
+	__type(key, struct flow_key);
+	__type(value, __u8);
+} tls_server_hello_seen_map SEC(".maps");
+
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, RECV_ARGS_MAX_ENTRIES);
@@ -642,7 +654,9 @@ static void capture_tls_payload(struct __sk_buff *skb, struct tls_handshake_even
 static void maybe_emit_tls_handshake(struct __sk_buff *skb, struct flow_key *key, struct flow_stats *stats, __u8 direction, __u8 expected_type)
 {
 	struct tls_handshake_event *event;
-	__u8 *inspected;
+	__u8 *client_inspected = 0;
+	__u8 *server_seen = 0;
+	__u8 one = 1;
 	__u32 payload_offset = 0;
 	__u32 payload_len = 0;
 	__u8 first = 0;
@@ -650,19 +664,21 @@ static void maybe_emit_tls_handshake(struct __sk_buff *skb, struct flow_key *key
 
 	if (!tls_inspect_enabled())
 		return;
-	if (!stats) {
-		if (direction == DIRECTION_RECV)
+	if (direction == DIRECTION_SEND) {
+		if (!stats)
+			return;
+		client_inspected = &stats->client_hello_inspected;
+		if (*client_inspected)
+			return;
+	} else if (direction == DIRECTION_RECV) {
+		if (!stats)
 			increment_drop(DROP_TLS_SERVER_HELLO_NO_STATS);
+		server_seen = bpf_map_lookup_elem(&tls_server_hello_seen_map, key);
+		if (server_seen && *server_seen)
+			return;
+	} else {
 		return;
 	}
-	if (direction == DIRECTION_SEND)
-		inspected = &stats->client_hello_inspected;
-	else if (direction == DIRECTION_RECV)
-		inspected = &stats->server_hello_inspected;
-	else
-		return;
-	if (*inspected)
-		return;
 	if (tcp_payload_meta(skb, &payload_offset, &payload_len) != 0)
 		return;
 	if (payload_len == 0)
@@ -671,7 +687,10 @@ static void maybe_emit_tls_handshake(struct __sk_buff *skb, struct flow_key *key
 	if (bpf_skb_load_bytes(skb, payload_offset, &first, sizeof(first)) != 0)
 		return;
 	if (first != 0x16) {
-		*inspected = 1;
+		if (direction == DIRECTION_SEND)
+			*client_inspected = 1;
+		else if (bpf_map_update_elem(&tls_server_hello_seen_map, key, &one, BPF_ANY) != 0)
+			increment_drop(DROP_MAP_UPDATE_FAILED);
 		return;
 	}
 
@@ -679,13 +698,17 @@ static void maybe_emit_tls_handshake(struct __sk_buff *skb, struct flow_key *key
 		if (bpf_skb_load_bytes(skb, payload_offset + 5, &handshake_type, sizeof(handshake_type)) != 0)
 			return;
 		if (handshake_type != expected_type) {
-			*inspected = 1;
+			if (direction == DIRECTION_SEND)
+				*client_inspected = 1;
+			else if (bpf_map_update_elem(&tls_server_hello_seen_map, key, &one, BPF_ANY) != 0)
+				increment_drop(DROP_MAP_UPDATE_FAILED);
 			return;
 		}
 	}
 
 	event = bpf_ringbuf_reserve(&tls_handshake_events, sizeof(*event), 0);
-	*inspected = 1;
+	if (direction == DIRECTION_SEND)
+		*client_inspected = 1;
 	if (!event) {
 		increment_drop(DROP_TLS_BUFFER_RESERVE_FAILED);
 		return;
@@ -697,6 +720,10 @@ static void maybe_emit_tls_handshake(struct __sk_buff *skb, struct flow_key *key
 	event->payload_len = payload_len;
 	event->captured_len = 0;
 	capture_tls_payload(skb, event, payload_offset, payload_len);
+	if (direction == DIRECTION_RECV) {
+		if (bpf_map_update_elem(&tls_server_hello_seen_map, key, &one, BPF_ANY) != 0)
+			increment_drop(DROP_MAP_UPDATE_FAILED);
+	}
 	bpf_ringbuf_submit(event, 0);
 }
 
