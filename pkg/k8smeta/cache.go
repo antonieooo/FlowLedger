@@ -301,6 +301,39 @@ func (c *Cache) PodByIP(ip string) (*PodInfo, bool) {
 	return cp, ok
 }
 
+// ContainerNameByID returns the container name within the given Pod whose
+// container ID matches. Returns ("", false) if the Pod is unknown, the
+// container ID is empty, or no matching container exists.
+//
+// The container ID may arrive in raw form (e.g., "abc123...") or with a
+// runtime prefix (e.g., "containerd://abc123..."). The lookup matches either
+// form against either form.
+func (c *Cache) ContainerNameByID(podUID, containerID string) (string, bool) {
+	if containerID == "" {
+		return "", false
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	pod, ok := c.podByUID[types.UID(podUID)]
+	if !ok || pod == nil {
+		return "", false
+	}
+	want := normalizeContainerID(containerID)
+	for storedID, name := range pod.Containers {
+		if normalizeContainerID(storedID) == want {
+			return name, true
+		}
+	}
+	return "", false
+}
+
+func normalizeContainerID(id string) string {
+	if i := strings.Index(id, "://"); i >= 0 {
+		return id[i+3:]
+	}
+	return id
+}
+
 func (c *Cache) PodByUID(uid string) (*PodInfo, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -393,6 +426,13 @@ func podInfoFromPod(pod *corev1.Pod) PodInfo {
 		containerID = pod.Status.ContainerStatuses[0].ContainerID
 		imageDigest = imageDigestFromImageID(pod.Status.ContainerStatuses[0].ImageID)
 	}
+	containers := map[string]string{}
+	for _, cs := range pod.Status.ContainerStatuses {
+		if cs.ContainerID == "" {
+			continue
+		}
+		containers[cs.ContainerID] = cs.Name
+	}
 	return PodInfo{
 		Namespace:         pod.Namespace,
 		Name:              pod.Name,
@@ -401,6 +441,7 @@ func podInfoFromPod(pod *corev1.Pod) PodInfo {
 		NodeName:          pod.Spec.NodeName,
 		ContainerName:     containerName,
 		ContainerID:       containerID,
+		Containers:        containers,
 		ImageDigest:       imageDigest,
 		ServiceAccount:    pod.Spec.ServiceAccountName,
 		OwnerReferences:   append([]metav1.OwnerReference{}, pod.OwnerReferences...),
@@ -466,6 +507,7 @@ func clonePod(p *PodInfo) *PodInfo {
 	}
 	cp := *p
 	cp.Labels = copyStringMap(p.Labels)
+	cp.Containers = copyStringMap(p.Containers)
 	cp.OwnerReferences = append([]metav1.OwnerReference{}, p.OwnerReferences...)
 	if p.Workload != nil {
 		w := *p.Workload

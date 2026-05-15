@@ -15,6 +15,7 @@ type PodInfo struct {
 	NodeName          string
 	ContainerName     string
 	ContainerID       string
+	Containers        map[string]string
 	ImageDigest       string
 	ServiceAccount    string
 	OwnerReferences   []metav1.OwnerReference
