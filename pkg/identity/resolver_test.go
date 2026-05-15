@@ -194,6 +194,73 @@ func TestIdentityResolverEndpointSliceBackendAndDeploymentOwner(t *testing.T) {
 	}
 }
 
+func TestIdentityResolverCgroupIDResolvesSidecarContainerName(t *testing.T) {
+	cache := k8smeta.NewCache()
+	cache.UpsertPod(&corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "multi", Namespace: "default", UID: types.UID("pod-uid")},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{
+			{Name: "web-frontend"},
+			{Name: "c2-sim-sidecar"},
+		}},
+		Status: corev1.PodStatus{
+			PodIP: "10.1.1.10",
+			ContainerStatuses: []corev1.ContainerStatus{
+				{Name: "web-frontend", ContainerID: "containerd://primary-id"},
+				{Name: "c2-sim-sidecar", ContainerID: "containerd://sidecar-id"},
+			},
+		},
+	})
+	resolver := NewResolverWithCgroups(cache, fakeCgroupLookup{
+		42: {podUID: "pod-uid", containerID: "containerd://sidecar-id"},
+	})
+
+	resolved := resolver.Resolve(sessionizer.FlowSession{
+		StartTime: time.Unix(100, 0).UTC(),
+		CgroupID:  42,
+		SrcIP:     "10.1.1.10", SrcPort: 40000,
+		DstIP: "10.1.1.20", DstPort: 443,
+		Protocol: "tcp",
+	})
+	if resolved.Src.ContainerName != "c2-sim-sidecar" {
+		t.Fatalf("ContainerName = %q, want %q", resolved.Src.ContainerName, "c2-sim-sidecar")
+	}
+	if resolved.Src.ContainerID != "containerd://sidecar-id" {
+		t.Fatalf("ContainerID = %q, want %q", resolved.Src.ContainerID, "containerd://sidecar-id")
+	}
+}
+
+func TestIdentityResolverCgroupIDEmptyContainerIDFallsBackToPrimary(t *testing.T) {
+	cache := k8smeta.NewCache()
+	cache.UpsertPod(&corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "multi", Namespace: "default", UID: types.UID("pod-uid")},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{
+			{Name: "web-frontend"},
+			{Name: "c2-sim-sidecar"},
+		}},
+		Status: corev1.PodStatus{
+			PodIP: "10.1.1.10",
+			ContainerStatuses: []corev1.ContainerStatus{
+				{Name: "web-frontend", ContainerID: "containerd://primary-id"},
+				{Name: "c2-sim-sidecar", ContainerID: "containerd://sidecar-id"},
+			},
+		},
+	})
+	resolver := NewResolverWithCgroups(cache, fakeCgroupLookup{
+		42: {podUID: "pod-uid", containerID: ""},
+	})
+
+	resolved := resolver.Resolve(sessionizer.FlowSession{
+		StartTime: time.Unix(100, 0).UTC(),
+		CgroupID:  42,
+		SrcIP:     "10.1.1.10", SrcPort: 40000,
+		DstIP: "10.1.1.20", DstPort: 443,
+		Protocol: "tcp",
+	})
+	if resolved.Src.ContainerName != "web-frontend" {
+		t.Fatalf("ContainerName = %q, want primary fallback %q", resolved.Src.ContainerName, "web-frontend")
+	}
+}
+
 func TestIdentityResolverUnknown(t *testing.T) {
 	resolved := NewResolver(k8smeta.NewCache()).Resolve(sessionizer.FlowSession{
 		StartTime: time.Unix(100, 0).UTC(),
