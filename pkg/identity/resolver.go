@@ -85,6 +85,9 @@ func (r *Resolver) resolveSource(session sessionizer.FlowSession) EndpointIdenti
 				id.CgroupID = session.CgroupID
 				if containerID != "" {
 					id.ContainerID = containerID
+					if name, nameOK := r.cache.ContainerNameByID(podUID, containerID); nameOK {
+						id.ContainerName = name
+					}
 				}
 				return id
 			}
