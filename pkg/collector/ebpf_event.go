@@ -86,7 +86,7 @@ type rawTLSHandshakeEvent struct {
 	TimestampNS uint64
 	PayloadLen  uint32
 	CapturedLen uint32
-	Data        [1024]byte
+	Data        [2048]byte
 }
 
 func convertRawEBPFEventToFlowEvent(raw rawEBPFEvent) (FlowEvent, error) {

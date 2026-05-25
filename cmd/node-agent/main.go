@@ -20,6 +20,8 @@ import (
 	flmetrics "FlowLedger/pkg/metrics"
 	"FlowLedger/pkg/sessionizer"
 
+	"github.com/prometheus/client_golang/prometheus"
+	promdto "github.com/prometheus/client_model/go"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 )
@@ -42,6 +44,9 @@ type config struct {
 	allowUnsyncedMeta             bool
 	ledgerMaxBytes                int64
 	ledgerMaxAge                  time.Duration
+	ledgerRetentionAge            time.Duration
+	ledgerRetentionBytes          int64
+	ledgerRetentionInterval       time.Duration
 	ebpfFlowMapMaxEntries         uint
 	ebpfStatsEmitInterval         time.Duration
 	ebpfEnableTrafficAccounting   bool
@@ -76,6 +81,10 @@ func main() {
 
 	metaCache := k8smeta.NewCache()
 	cgroupResolver := k8smeta.NewCgroupResolver()
+	// C10: wire the metrics sink so {hit, miss, retry_hit, retry_miss} are tracked
+	// in flowledger_cgroup_resolutions_total{result=...}. This is the headline
+	// diagnostic for the identity resolution race condition.
+	cgroupResolver.SetMetrics(m)
 	go cgroupResolver.Start(ctx)
 	kubeClient := maybeKubernetesClient()
 	if kubeClient != nil {
@@ -102,9 +111,12 @@ func main() {
 	}
 
 	writer, err := ledger.NewWriterWithOptions(ledger.WriterOptions{
-		Path:     cfg.ledgerPath,
-		MaxBytes: cfg.ledgerMaxBytes,
-		MaxAge:   cfg.ledgerMaxAge,
+		Path:              cfg.ledgerPath,
+		MaxBytes:          cfg.ledgerMaxBytes,
+		MaxAge:            cfg.ledgerMaxAge,
+		RetentionAge:      cfg.ledgerRetentionAge,
+		RetentionBytes:    cfg.ledgerRetentionBytes,
+		RetentionInterval: cfg.ledgerRetentionInterval,
 	})
 	if err != nil {
 		log.Fatalf("open ledger writer: %v", err)
@@ -148,8 +160,18 @@ func main() {
 	defer ticker.Stop()
 	labelTicker := time.NewTicker(30 * time.Second)
 	defer labelTicker.Stop()
+	// C1: dump TLS handshake + cgroup resolution metrics to stderr every 30s so
+	// the user can diagnose ServerHello / JA4S coverage from kubectl logs alone,
+	// without deploying Prometheus. This is the primary diagnostic channel for
+	// the "ja4s 100% missing" problem documented in PROBLEMS.md.
+	diagTicker := time.NewTicker(30 * time.Second)
+	defer diagTicker.Stop()
 
 	log.Printf("flow-ledger node-agent started mode=%s node=%s ledger=%s metrics=%s", cfg.mode, cfg.nodeName, cfg.ledgerPath, cfg.metricsAddr)
+	log.Printf("ebpf flags: traffic_accounting=%t tcp_metrics=%t packet_timing=%t packet_histogram=%t tls_handshake_inspect=%t",
+		cfg.ebpfEnableTrafficAccounting, cfg.ebpfEnableTCPBasicMetrics,
+		cfg.ebpfEnablePacketTiming, cfg.ebpfEnablePacketHistogram,
+		cfg.ebpfEnableTLSHandshakeInspect)
 
 	eventsClosed := false
 	var lastCgroupErrors uint64
@@ -242,8 +264,85 @@ func main() {
 				m.ExperimentLabelReadErrors.Inc()
 				log.Printf("read experiment labels: %v; using last known labels", err)
 			}
+		case <-diagTicker.C:
+			// C1: dump key diagnostic metrics so problems are visible from logs.
+			// Read counter values via Prometheus dto.
+			logTLSDiagnostics(m)
+			logIdentityDiagnostics(m)
 		}
 	}
+}
+
+// logTLSDiagnostics prints ServerHello / JA4S coverage so the user can
+// diagnose the "ja4s 100% missing" problem from kubectl logs.
+func logTLSDiagnostics(m *flmetrics.Metrics) {
+	parsed := counterValue(m.TLSServerHellosParsedTotal)
+	errs := counterValue(m.TLSServerHelloParseErrors)
+	unmatched := counterValue(m.TLSServerHelloUnmatchedTotal)
+	noStats := counterValue(m.TLSServerHelloNoStatsTotal)
+	natHits := counterValue(m.TLSServerHelloNATAliasHits)
+	natMisses := counterValue(m.TLSServerHelloNATAliasMisses)
+	clientParsed := counterVecValue(m.TLSHandshakesParsed, "parsed")
+	clientFrag := counterVecValue(m.TLSHandshakesParsed, "fragmented")
+	clientErr := counterVecValue(m.TLSHandshakesParsed, "parse_error")
+	clientUnmatched := counterValue(m.TLSUnmatchedTotal)
+	log.Printf("tls-diag client_hello: parsed=%d fragmented=%d errors=%d unmatched=%d | server_hello: parsed=%d errors=%d unmatched=%d no_stats=%d nat_alias_hits=%d nat_alias_misses=%d",
+		clientParsed, clientFrag, clientErr, clientUnmatched,
+		parsed, errs, unmatched, noStats, natHits, natMisses)
+	if parsed == 0 && natMisses == 0 && unmatched == 0 && noStats == 0 {
+		log.Printf("tls-diag WARNING: no server_hello signal at all (bpf hook not firing, cgroup v2 missing, or no inbound TLS to local pods)")
+	} else if parsed == 0 && (unmatched > 0 || natMisses > 0) {
+		log.Printf("tls-diag WARNING: server_hello events seen (%d unmatched, %d nat_alias_misses) but 0 parsed; check tls_server_parse_status in records",
+			unmatched, natMisses)
+	}
+}
+
+// logIdentityDiagnostics prints cgroup -> pod identity resolution outcomes.
+func logIdentityDiagnostics(m *flmetrics.Metrics) {
+	hit := counterVecValue(m.CgroupResolutionsTotal, "hit")
+	miss := counterVecValue(m.CgroupResolutionsTotal, "miss")
+	retryHit := counterVecValue(m.CgroupResolutionsTotal, "retry_hit")
+	retryMiss := counterVecValue(m.CgroupResolutionsTotal, "retry_miss")
+	errs := counterVecValue(m.CgroupResolutionsTotal, "error")
+	total := hit + miss + retryHit + retryMiss
+	rate := 0.0
+	if total > 0 {
+		rate = float64(hit+retryHit) / float64(total)
+	}
+	log.Printf("identity-diag cgroup_resolutions: hit=%d miss=%d retry_hit=%d retry_miss=%d scan_errors=%d hit_rate=%.3f",
+		hit, miss, retryHit, retryMiss, errs, rate)
+}
+
+func counterValue(c prometheus.Counter) uint64 {
+	if c == nil {
+		return 0
+	}
+	var dto promdto.Metric
+	if err := c.Write(&dto); err != nil {
+		return 0
+	}
+	if dto.Counter == nil || dto.Counter.Value == nil {
+		return 0
+	}
+	return uint64(*dto.Counter.Value)
+}
+
+func counterVecValue(c *prometheus.CounterVec, label string) uint64 {
+	if c == nil {
+		return 0
+	}
+	m, err := c.GetMetricWithLabelValues(label)
+	if err != nil {
+		return 0
+	}
+	var dto promdto.Metric
+	if err := m.Write(&dto); err != nil {
+		return 0
+	}
+	if dto.Counter == nil || dto.Counter.Value == nil {
+		return 0
+	}
+	return uint64(*dto.Counter.Value)
 }
 
 func parseFlags() config {
@@ -265,6 +364,9 @@ func parseFlags() config {
 	flag.BoolVar(&cfg.allowUnsyncedMeta, "allow-unsynced-metadata", false, "continue if Kubernetes metadata cache sync fails or times out")
 	flag.Int64Var(&cfg.ledgerMaxBytes, "ledger-max-bytes", 100*1024*1024, "rotate ledger when current file reaches this many bytes; 0 disables size rotation")
 	flag.DurationVar(&cfg.ledgerMaxAge, "ledger-max-age", 0, "rotate ledger after this duration; 0 disables age rotation")
+	flag.DurationVar(&cfg.ledgerRetentionAge, "ledger-retention-age", 24*time.Hour, "delete rotated ledger files older than this; 0 disables age-based retention")
+	flag.Int64Var(&cfg.ledgerRetentionBytes, "ledger-retention-bytes", 2*1024*1024*1024, "delete oldest rotated ledger files until total rotated bytes are below this; 0 disables byte-based retention")
+	flag.DurationVar(&cfg.ledgerRetentionInterval, "ledger-retention-interval", 5*time.Minute, "how often the retention sweep runs")
 	flag.UintVar(&cfg.ebpfFlowMapMaxEntries, "ebpf-flow-map-max-entries", 65536, "maximum entries for the eBPF flow stats map")
 	flag.DurationVar(&cfg.ebpfStatsEmitInterval, "ebpf-stats-emit-interval", 5*time.Second, "target eBPF STATS summary emit interval; currently mirrored by a BPF compile-time constant")
 	flag.BoolVar(&cfg.ebpfEnableTrafficAccounting, "ebpf-enable-traffic-accounting", true, "attach eBPF tcp_sendmsg/tcp_recvmsg accounting hooks")

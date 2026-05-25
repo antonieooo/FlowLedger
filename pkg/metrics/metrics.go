@@ -232,6 +232,15 @@ func (m *Metrics) IncTLSServerHelloNATAliasMiss() {
 	m.TLSServerHelloNATAliasMisses.Inc()
 }
 
+// IncCgroupResolution implements the k8smeta.CgroupMetrics interface for C10
+// diagnostics. Labels: hit | miss | retry_hit | retry_miss.
+func (m *Metrics) IncCgroupResolution(result string) {
+	if m == nil || m.CgroupResolutionsTotal == nil {
+		return
+	}
+	m.CgroupResolutionsTotal.WithLabelValues(result).Inc()
+}
+
 func (m *Metrics) Handler() http.Handler {
 	return promhttp.Handler()
 }

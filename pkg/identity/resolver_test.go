@@ -62,6 +62,12 @@ func (f fakeCgroupLookup) Resolve(cgroupID uint64) (string, string, bool) {
 	return v.podUID, v.containerID, ok
 }
 
+// ResolveWithRetry satisfies the new CgroupLookup interface (C10). In tests the
+// fake is deterministic, so the retry behaviour collapses to a single Resolve.
+func (f fakeCgroupLookup) ResolveWithRetry(cgroupID uint64) (string, string, bool) {
+	return f.Resolve(cgroupID)
+}
+
 func TestIdentityResolverCgroupIDPreferredOverPodIP(t *testing.T) {
 	cache := k8smeta.NewCache()
 	cache.UpsertPod(&corev1.Pod{

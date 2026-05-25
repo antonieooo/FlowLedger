@@ -51,11 +51,14 @@ type Snapshot struct {
 	PktSizeMean      *float64
 	PktSizeP50       *float64
 	PktSizeP95       *float64
+	PktSizeStd       *float64 // L18/B: histogram-derived population stddev approximation
 	PktSizeHistogram map[string]uint64
 
+	IATMean      *float64 // L18/B: histogram-derived population mean approximation
 	IATP50       *float64
 	IATP95       *float64
-	IATStd       *float64
+	IATStd       *float64 // exact for raw samples; histogram-approximation when only histogram has data
+	IATHistogram map[string]uint64 // Node-model Phase0: raw IAT bucket counts so consumers can compute KL divergence / Wasserstein vs a baseline distribution
 	IdleGapCount uint64
 	BurstCount   uint64
 
@@ -170,6 +173,7 @@ func (a *Accumulator) Snapshot(bytesOut, bytesIn, packetsOut, packetsIn uint64, 
 	pktSizeP50 := percentileUint64(packetSizes, 50)
 	pktSizeP95 := percentileUint64(packetSizes, 95)
 	pktSizeMean := meanUint64(packetSizes)
+	pktSizeStd := stddevUint64(packetSizes)
 	if histogramHasData(a.packetSizeHistogram) {
 		// Percentiles from eBPF histograms are estimates; exact raw packet
 		// length sequences are deliberately not retained in eBPF mode.
@@ -179,19 +183,27 @@ func (a *Accumulator) Snapshot(bytesOut, bytesIn, packetsOut, packetsIn uint64, 
 		clampFloatPtr(pktSizeP95, pktSizeMin, pktSizeMax)
 		pktSizeMean = estimateHistogramMean(histogram, packetSizeBucketBounds())
 		clampFloatPtr(pktSizeMean, pktSizeMin, pktSizeMax)
+		// L18/B: previously pktSizeStd was left as the raw-sample value or nil
+		// when only histogram data existed, causing 100% missingness downstream.
+		// Use a midpoint-based approximation; bounded error, but enables jitter
+		// / beacon variance features in the model.
+		pktSizeStd = estimateHistogramStddev(histogram, packetSizeBucketBounds())
 	}
 
 	iatP50 := percentileUint64(iatMicros, 50)
 	iatP95 := percentileUint64(iatMicros, 95)
 	iatStd := stddevUint64(iatMicros)
+	iatMean := meanUint64(iatMicros)
 	if histogramHasData(a.iatHistogram) {
 		// IAT percentiles from cgroup_skb are histogram estimates. Standard
-		// deviation cannot be recovered from histogram buckets alone. Keep
-		// P50/P95/Std on the same histogram-derived distribution instead of
-		// mixing histogram percentiles with raw-sample standard deviation.
+		// deviation can be approximated from bucket midpoints; the error is
+		// bounded by ~half the widest bucket width and is acceptable for the
+		// jitter/beacon-period signals the central layer consumes (see
+		// estimateHistogramStddev docstring).
 		iatP50 = estimateHistogramPercentile(iatHistogram, iatBucketBounds(), 50)
 		iatP95 = estimateHistogramPercentile(iatHistogram, iatBucketBounds(), 95)
-		iatStd = nil
+		iatStd = estimateHistogramStddev(iatHistogram, iatBucketBounds())
+		iatMean = estimateHistogramMean(iatHistogram, iatBucketBounds())
 	}
 
 	return Snapshot{
@@ -207,11 +219,14 @@ func (a *Accumulator) Snapshot(bytesOut, bytesIn, packetsOut, packetsIn uint64, 
 		PktSizeMean:      pktSizeMean,
 		PktSizeP50:       pktSizeP50,
 		PktSizeP95:       pktSizeP95,
+		PktSizeStd:       pktSizeStd,
 		PktSizeHistogram: histogram,
 
+		IATMean:      iatMean,
 		IATP50:       iatP50,
 		IATP95:       iatP95,
 		IATStd:       iatStd,
+		IATHistogram: iatHistogram,
 		IdleGapCount: countAbove(iatMicros, 1_000_000) + a.idleGapCount,
 		BurstCount:   countBelow(iatMicros, 10_000) + a.burstCount,
 
@@ -604,6 +619,42 @@ func estimateHistogramMean(histogram map[string]uint64, bounds []histogramBucket
 	}
 	mean := weighted / float64(total)
 	return &mean
+}
+
+// estimateHistogramStddev computes an approximate population standard deviation
+// from a bucket histogram by assigning the bucket midpoint to every sample in
+// the bucket and applying the standard E[X²] − E[X]² formula. The error is
+// bounded by roughly half the widest bucket width — for our packet-size buckets
+// (max width 487 at 512-1023) and IAT buckets (max width 900_000 at the
+// 100k-1M bucket) the result is good enough for "is this flow's IAT
+// dispersion roughly constant or highly variable" questions, which is what
+// jitter/beacon detection needs. It is NOT exact and should not be relied on
+// for tail analysis. Returns math.NaN-free non-negative *float64, or nil if
+// the histogram is empty.
+func estimateHistogramStddev(histogram map[string]uint64, bounds []histogramBucketBound) *float64 {
+	var total uint64
+	var sumW float64
+	var sumW2 float64
+	for _, bucket := range bounds {
+		count := histogram[bucket.label]
+		if count == 0 {
+			continue
+		}
+		midpoint := bucket.min + (bucket.max-bucket.min)/2
+		sumW += midpoint * float64(count)
+		sumW2 += midpoint * midpoint * float64(count)
+		total += count
+	}
+	if total == 0 {
+		return nil
+	}
+	mean := sumW / float64(total)
+	variance := sumW2/float64(total) - mean*mean
+	if variance < 0 { // floating-point round-off guard
+		variance = 0
+	}
+	std := math.Sqrt(variance)
+	return &std
 }
 
 func clampFloatPtr(value *float64, minValue, maxValue *uint64) {

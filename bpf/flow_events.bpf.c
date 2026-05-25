@@ -43,7 +43,7 @@ typedef unsigned long long __u64;
 #define RECV_ARGS_MAX_ENTRIES 16384
 #define EBPF_EMIT_INTERVAL_NS 5000000000ULL
 #define CGROUP_SKB_PASS 1
-#define TLS_CAPTURE_MAX_BYTES 1024
+#define TLS_CAPTURE_MAX_BYTES 2048
 
 #if defined(__TARGET_ARCH_x86)
 struct pt_regs {

@@ -11,6 +11,31 @@ import (
 	"FlowLedger/pkg/sessionizer"
 )
 
+// Resolution status (C11) — separates "we know who this is" from the various
+// reasons identity lookup failed. Previously the resolver returned the same
+// empty EndpointIdentity for host-network pods, kube-system traffic, informer
+// cache misses, and unknown external endpoints, making the downstream
+// dataset builder unable to tell apart "broken resolution" from "by design
+// no identity" (etcd loopback, kubelet host network, etc.).
+const (
+	ResolutionStatusResolved     = "resolved"      // full pod identity known
+	ResolutionStatusServiceOnly  = "service_only"  // service context known, backend pod unknown
+	ResolutionStatusHostNetwork  = "host_network"  // pod runs in host network, no cgroup namespace
+	ResolutionStatusKubeSystem   = "kube_system"   // control-plane / system namespace
+	ResolutionStatusInformerMiss = "informer_miss" // cgroup_id resolved but pod not in informer cache (race)
+	ResolutionStatusExternal     = "external"      // off-cluster endpoint
+	ResolutionStatusUnknown      = "unknown"       // cannot determine
+)
+
+// SystemNamespaces are control-plane namespaces whose flows are not
+// considered business workload. Mirrors the cluster-side L15 filter.
+var SystemNamespaces = map[string]bool{
+	"kube-system":        true,
+	"kube-node-lease":    true,
+	"kube-public":        true,
+	"local-path-storage": true,
+}
+
 type EndpointIdentity struct {
 	Namespace        string
 	PodName          string
@@ -36,6 +61,29 @@ type EndpointIdentity struct {
 	Confidence       string
 	Method           string
 	Reason           string
+	// ResolutionStatus (C11) categorises why this identity was or was not
+	// populated, so downstream consumers can distinguish host-network/system
+	// flows from genuine informer race conditions or unknown external endpoints.
+	ResolutionStatus string
+}
+
+func classifyResolutionStatus(id EndpointIdentity, hostNetwork bool) string {
+	if hostNetwork {
+		return ResolutionStatusHostNetwork
+	}
+	if id.Namespace != "" && SystemNamespaces[id.Namespace] {
+		return ResolutionStatusKubeSystem
+	}
+	if id.PodUID != "" {
+		return ResolutionStatusResolved
+	}
+	if id.ServiceName != "" || id.ServiceUID != "" {
+		return ResolutionStatusServiceOnly
+	}
+	if id.External {
+		return ResolutionStatusExternal
+	}
+	return ResolutionStatusUnknown
 }
 
 type ResolvedFlow struct {
@@ -53,6 +101,11 @@ type Resolver struct {
 
 type CgroupLookup interface {
 	Resolve(cgroupID uint64) (podUID string, containerID string, ok bool)
+	// ResolveWithRetry (C10) is called by the resolver at session emission
+	// time. Implementations should trigger an on-demand cgroup tree rescan
+	// and retry the lookup briefly so that flows whose pods appeared after
+	// the eBPF tracepoint fired still resolve before the record is written.
+	ResolveWithRetry(cgroupID uint64) (podUID string, containerID string, ok bool)
 }
 
 func NewResolver(cache *k8smeta.Cache) *Resolver {
@@ -76,10 +129,16 @@ func (r *Resolver) Resolve(session sessionizer.FlowSession) ResolvedFlow {
 
 func (r *Resolver) resolveSource(session sessionizer.FlowSession) EndpointIdentity {
 	if r.cache == nil {
-		return unknown("unknown")
+		id := unknown("unknown")
+		id.ResolutionStatus = ResolutionStatusUnknown
+		return id
 	}
+	// Path 1: cgroup_id -> pod_uid -> pod
+	// C10: use ResolveWithRetry so a Pod created just before its first network
+	// event still has a chance to be picked up by an on-demand cgroup rescan
+	// before we declare the identity unresolved.
 	if session.CgroupID != 0 && r.cgroups != nil {
-		if podUID, containerID, ok := r.cgroups.Resolve(session.CgroupID); ok {
+		if podUID, containerID, ok := r.cgroups.ResolveWithRetry(session.CgroupID); ok {
 			if pod, podOK := r.cache.PodByUID(podUID); podOK {
 				id := identityFromPod(pod, session.StartTime, "cgroup_id")
 				id.CgroupID = session.CgroupID
@@ -89,10 +148,19 @@ func (r *Resolver) resolveSource(session sessionizer.FlowSession) EndpointIdenti
 						id.ContainerName = name
 					}
 				}
+				id.ResolutionStatus = classifyResolutionStatus(id, pod.HostNetwork)
 				return id
 			}
+			// C10/C11: cgroup resolved to a pod_uid but informer cache has no
+			// pod entry yet (eBPF triggered before pod cache populated).
+			id := unknown("informer_miss")
+			id.CgroupID = session.CgroupID
+			id.ResolutionStatus = ResolutionStatusInformerMiss
+			id.Reason = "cgroup_resolved_but_pod_uncached"
+			return id
 		}
 	}
+	// Path 2: source IP -> pod via informer cache (works for host-network too)
 	if pod, ok := r.cache.PodByIP(session.SrcIP); ok {
 		id := identityFromPod(pod, session.StartTime, "pod_ip")
 		id.CgroupID = 0
@@ -104,15 +172,32 @@ func (r *Resolver) resolveSource(session sessionizer.FlowSession) EndpointIdenti
 			id.Method = "pod_ip"
 			id.Reason = "hostNetwork"
 		}
+		id.ResolutionStatus = classifyResolutionStatus(id, pod.HostNetwork)
+		return id
+	}
+	// C11: host-loopback / host-netns flows without a backing pod entry
+	if session.NetnsIno != 0 && r.hostNetnsIno != 0 && session.NetnsIno == r.hostNetnsIno {
+		id := unknown("host_netns")
+		id.Reason = "host_netns_no_pod"
+		id.ResolutionStatus = ResolutionStatusHostNetwork
+		return id
+	}
+	if isLoopback(session.SrcIP) {
+		id := unknown("host_netns")
+		id.Reason = "loopback_src"
+		id.ResolutionStatus = ResolutionStatusHostNetwork
 		return id
 	}
 	if isProbablyExternal(session.SrcIP) {
 		id := unknown("external")
 		id.External = true
 		id.Confidence = "low"
+		id.ResolutionStatus = ResolutionStatusExternal
 		return id
 	}
-	return unknown("unknown")
+	id := unknown("unknown")
+	id.ResolutionStatus = ResolutionStatusUnknown
+	return id
 }
 
 var netnsLinkRE = regexp.MustCompile(`net:\[(\d+)\]`)
@@ -135,7 +220,9 @@ func HostNetnsIno() uint64 {
 
 func (r *Resolver) resolveDestination(session sessionizer.FlowSession) EndpointIdentity {
 	if r.cache == nil {
-		return unknown("unknown")
+		id := unknown("unknown")
+		id.ResolutionStatus = ResolutionStatusUnknown
+		return id
 	}
 	if pod, ok := r.cache.PodByIP(session.DstIP); ok {
 		id := identityFromPod(pod, session.StartTime, "pod_ip")
@@ -143,10 +230,11 @@ func (r *Resolver) resolveDestination(session sessionizer.FlowSession) EndpointI
 			applyServiceContext(&id, ep.Service)
 			id.Method = "endpoint_slice"
 		}
+		id.ResolutionStatus = classifyResolutionStatus(id, pod.HostNetwork)
 		return id
 	}
 	if svc, ok := r.cache.ServiceByClusterIPPort(session.DstIP, session.DstPort); ok {
-		return EndpointIdentity{
+		id := EndpointIdentity{
 			Namespace:        svc.Namespace,
 			ServiceName:      svc.Name,
 			ServiceUID:       string(svc.UID),
@@ -156,6 +244,8 @@ func (r *Resolver) resolveDestination(session sessionizer.FlowSession) EndpointI
 			Confidence:       "medium",
 			Method:           "service_cluster_ip",
 		}
+		id.ResolutionStatus = classifyResolutionStatus(id, false)
+		return id
 	}
 	if ep, ok := r.cache.EndpointByIPPort(session.DstIP, session.DstPort); ok {
 		id := EndpointIdentity{Confidence: "medium", Method: "endpoint_slice"}
@@ -169,15 +259,37 @@ func (r *Resolver) resolveDestination(session sessionizer.FlowSession) EndpointI
 				applyServiceContext(&id, ep.Service)
 			}
 		}
+		hostNet := false
+		if ep.Backend != nil {
+			hostNet = ep.Backend.HostNetwork
+		}
+		id.ResolutionStatus = classifyResolutionStatus(id, hostNet)
+		return id
+	}
+	if isLoopback(session.DstIP) {
+		id := unknown("host_netns")
+		id.Reason = "loopback_dst"
+		id.ResolutionStatus = ResolutionStatusHostNetwork
 		return id
 	}
 	if isProbablyExternal(session.DstIP) {
 		id := unknown("external")
 		id.External = true
 		id.Confidence = "low"
+		id.ResolutionStatus = ResolutionStatusExternal
 		return id
 	}
-	return unknown("unknown")
+	id := unknown("unknown")
+	id.ResolutionStatus = ResolutionStatusUnknown
+	return id
+}
+
+func isLoopback(ip string) bool {
+	addr, err := netip.ParseAddr(ip)
+	if err != nil {
+		return false
+	}
+	return addr.IsLoopback()
 }
 
 func identityFromPod(pod *k8smeta.PodInfo, flowStart time.Time, method string) EndpointIdentity {

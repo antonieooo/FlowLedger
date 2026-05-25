@@ -18,16 +18,26 @@ import (
 var podUIDInCgroupPath = regexp.MustCompile(`pod([0-9a-fA-F_-]{32,36})\.slice`)
 
 type CgroupResolver struct {
-	roots    []string
-	period   time.Duration
-	mu       sync.RWMutex
-	entries  map[uint64]cgroupEntry
-	lastErrs uint64
+	roots      []string
+	period     time.Duration
+	mu         sync.RWMutex
+	entries    map[uint64]cgroupEntry
+	lastErrs   uint64
+	lastScan   time.Time
+	minRescan  time.Duration // C10: minimum interval between on-demand rescans
+	rescanCh   chan struct{} // C10: signal channel for on-demand rescan
+	metrics    CgroupMetrics // C10: optional sink for resolution result metrics
 }
 
 type cgroupEntry struct {
 	podUID      string
 	containerID string
+}
+
+// CgroupMetrics is an optional sink for cgroup resolution outcomes.
+// Result label values: "hit", "miss", "retry_hit", "retry_miss".
+type CgroupMetrics interface {
+	IncCgroupResolution(result string)
 }
 
 func NewCgroupResolver() *CgroupResolver {
@@ -36,8 +46,54 @@ func NewCgroupResolver() *CgroupResolver {
 			"/sys/fs/cgroup/kubepods.slice",
 			"/sys/fs/cgroup/kubelet.slice/kubelet-kubepods.slice",
 		},
-		period:  10 * time.Second,
-		entries: map[uint64]cgroupEntry{},
+		// C10: was 10s. Tighten to 2s so the race window between pod creation
+		// (and its first network event) and the next cgroup scan is small enough
+		// that most flows resolve on the first emit attempt.
+		period:    2 * time.Second,
+		// C10: debounce on-demand rescans triggered by Resolve misses.
+		minRescan: 200 * time.Millisecond,
+		entries:   map[uint64]cgroupEntry{},
+		rescanCh:  make(chan struct{}, 1),
+	}
+}
+
+// SetMetrics attaches an optional metrics sink. Call before Start().
+func (r *CgroupResolver) SetMetrics(m CgroupMetrics) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	r.metrics = m
+	r.mu.Unlock()
+}
+
+// triggerRescan signals the background goroutine to scan now. Non-blocking and
+// debounced via the channel's capacity-1 buffer.
+func (r *CgroupResolver) triggerRescan() {
+	if r == nil {
+		return
+	}
+	select {
+	case r.rescanCh <- struct{}{}:
+	default:
+	}
+}
+
+func (r *CgroupResolver) sinceLastScan() time.Duration {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if r.lastScan.IsZero() {
+		return time.Hour
+	}
+	return time.Since(r.lastScan)
+}
+
+func (r *CgroupResolver) emitResolution(result string) {
+	r.mu.RLock()
+	m := r.metrics
+	r.mu.RUnlock()
+	if m != nil {
+		m.IncCgroupResolution(result)
 	}
 }
 
@@ -61,6 +117,19 @@ func (r *CgroupResolver) Start(ctx context.Context) {
 				r.mu.Unlock()
 				log.Printf("cgroup resolver scan skipped: %v", err)
 			}
+		case <-r.rescanCh:
+			// C10: on-demand rescan triggered by a Resolve miss. Debounced via
+			// minRescan to avoid pathological loops when a flow has a stale
+			// cgroup_id that will never be in the slice tree.
+			if r.sinceLastScan() < r.minRescan {
+				continue
+			}
+			if err := r.scan(); err != nil {
+				r.mu.Lock()
+				r.lastErrs++
+				r.mu.Unlock()
+				log.Printf("cgroup resolver on-demand scan skipped: %v", err)
+			}
 		}
 	}
 }
@@ -70,9 +139,44 @@ func (r *CgroupResolver) Resolve(cgroupID uint64) (podUID string, containerID st
 		return "", "", false
 	}
 	r.mu.RLock()
-	defer r.mu.RUnlock()
 	entry, ok := r.entries[cgroupID]
-	return entry.podUID, entry.containerID, ok
+	r.mu.RUnlock()
+	if ok {
+		r.emitResolution("hit")
+		return entry.podUID, entry.containerID, true
+	}
+	r.emitResolution("miss")
+	return "", "", false
+}
+
+// ResolveWithRetry (C10) is the preferred entry point at session_summary
+// emission time. If the initial lookup misses, it asynchronously triggers an
+// on-demand cgroup rescan so that the next emission cycle (typically 1s later)
+// has a fresh chance to resolve. This is NON-BLOCKING: it never sleeps.
+//
+// Earlier versions polled for up to 500ms after a miss, but in practice with
+// 100s of session emissions per tick that turned the emit loop into a >1s
+// stall every tick, starving the events channel and dropping TLS handshake
+// events from the BPF ring buffer. The empirical retry_hit rate was 0%
+// anyway (cgroup IDs that miss tend to stay missing — host_network, deleted
+// pods, kube-system, etc.). The on-demand rescan still helps subsequent
+// emissions; the metric labels are kept the same for backwards compat.
+func (r *CgroupResolver) ResolveWithRetry(cgroupID uint64) (podUID string, containerID string, ok bool) {
+	if r == nil || cgroupID == 0 {
+		return "", "", false
+	}
+	r.mu.RLock()
+	entry, ok := r.entries[cgroupID]
+	r.mu.RUnlock()
+	if ok {
+		r.emitResolution("hit")
+		return entry.podUID, entry.containerID, true
+	}
+	// Async: signal background scanner, return immediately. The next session
+	// emission tick (typically 1s later) will see the refreshed cache.
+	r.triggerRescan()
+	r.emitResolution("retry_miss")
+	return "", "", false
 }
 
 func (r *CgroupResolver) Size() int {
@@ -129,6 +233,7 @@ func (r *CgroupResolver) scan() error {
 	}
 	r.mu.Lock()
 	r.entries = next
+	r.lastScan = time.Now()
 	r.mu.Unlock()
 	return nil
 }
