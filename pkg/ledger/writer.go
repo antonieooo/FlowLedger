@@ -2,9 +2,12 @@ package ledger
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
+	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -59,10 +62,13 @@ type Record struct {
 	PktSizeMean                *float64          `json:"pkt_size_mean"`
 	PktSizeP50                 *float64          `json:"pkt_size_p50"`
 	PktSizeP95                 *float64          `json:"pkt_size_p95"`
+	PktSizeStd                 *float64          `json:"pkt_size_std"`
 	PktSizeHistogram           map[string]uint64 `json:"pkt_size_histogram"`
+	IATMean                    *float64          `json:"iat_mean"`
 	IATP50                     *float64          `json:"iat_p50"`
 	IATP95                     *float64          `json:"iat_p95"`
 	IATStd                     *float64          `json:"iat_std"`
+	IATHistogram               map[string]uint64 `json:"iat_histogram"`
 	IdleGapCount               uint64            `json:"idle_gap_count"`
 	BurstCount                 uint64            `json:"burst_count"`
 	ByteRate                   *float64          `json:"byte_rate"`
@@ -136,6 +142,13 @@ type Record struct {
 	DstMappingConfidence string `json:"dst_mapping_confidence"`
 	MappingMethod        string `json:"mapping_method"`
 
+	// C11: explicit resolution status enums (resolved / service_only /
+	// host_network / kube_system / informer_miss / external / unknown) so
+	// downstream tooling can distinguish "by-design no pod identity" (etcd
+	// loopback, kubelet host-network) from genuine cgroup/informer failures.
+	SrcIdentityResolutionStatus string `json:"src_identity_resolution_status"`
+	DstIdentityResolutionStatus string `json:"dst_identity_resolution_status"`
+
 	DstServiceName         string `json:"dst_service_name"`
 	DstServiceUID          string `json:"dst_service_uid"`
 	DstServiceNamespace    string `json:"dst_service_namespace"`
@@ -173,20 +186,34 @@ type Record struct {
 }
 
 type Writer struct {
-	mu          sync.Mutex
-	path        string
-	maxBytes    int64
-	maxAge      time.Duration
-	openedAt    time.Time
-	currentSize int64
-	f           *os.File
-	w           *bufio.Writer
+	mu               sync.Mutex
+	path             string
+	maxBytes         int64
+	maxAge           time.Duration
+	retentionAge     time.Duration
+	retentionBytes   int64
+	retentionStop    chan struct{}
+	retentionStopped chan struct{}
+	openedAt         time.Time
+	currentSize      int64
+	f                *os.File
+	w                *bufio.Writer
 }
 
 type WriterOptions struct {
 	Path     string
 	MaxBytes int64
 	MaxAge   time.Duration
+
+	// C14 retention controls. Both bound the *rotated* ledger files; the live
+	// `flows.jsonl` is never touched. RetentionInterval is how often the sweep
+	// goroutine runs; if zero, defaults to 5 minutes (set to a small value for
+	// tests). If RetentionAge and RetentionBytes are both zero, no sweep
+	// goroutine is started — preserves the prior unbounded-accumulation
+	// behaviour for callers that haven't opted in.
+	RetentionAge      time.Duration
+	RetentionBytes    int64
+	RetentionInterval time.Duration
 }
 
 func NewWriter(path string) (*Writer, error) {
@@ -195,12 +222,23 @@ func NewWriter(path string) (*Writer, error) {
 
 func NewWriterWithOptions(opts WriterOptions) (*Writer, error) {
 	w := &Writer{
-		path:     opts.Path,
-		maxBytes: opts.MaxBytes,
-		maxAge:   opts.MaxAge,
+		path:           opts.Path,
+		maxBytes:       opts.MaxBytes,
+		maxAge:         opts.MaxAge,
+		retentionAge:   opts.RetentionAge,
+		retentionBytes: opts.RetentionBytes,
 	}
 	if err := w.open(); err != nil {
 		return nil, err
+	}
+	if w.retentionAge > 0 || w.retentionBytes > 0 {
+		interval := opts.RetentionInterval
+		if interval <= 0 {
+			interval = 5 * time.Minute
+		}
+		w.retentionStop = make(chan struct{})
+		w.retentionStopped = make(chan struct{})
+		go w.retentionLoop(interval)
 	}
 	return w, nil
 }
@@ -227,6 +265,13 @@ func (w *Writer) Write(record Record) error {
 }
 
 func (w *Writer) Close() error {
+	if w.retentionStop != nil {
+		close(w.retentionStop)
+		// Wait for the sweep goroutine to acknowledge so we don't race the
+		// file handle. The goroutine signals retentionStopped on exit.
+		<-w.retentionStopped
+		w.retentionStop = nil
+	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if err := w.w.Flush(); err != nil {
@@ -234,6 +279,138 @@ func (w *Writer) Close() error {
 		return err
 	}
 	return w.f.Close()
+}
+
+// retentionLoop periodically deletes rotated ledger files that exceed the
+// retention bounds. Runs until Close() signals stop. The live `flows.jsonl`
+// file is never touched here — that's exclusively managed by rotateIfNeeded.
+//
+// C14: previously rotated files accumulated indefinitely, filling the host
+// disk in ~1 day and indirectly triggering etcd I/O cascades (cluster ENV-2/-3).
+func (w *Writer) retentionLoop(interval time.Duration) {
+	defer close(w.retentionStopped)
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	// Run once at startup so an agent that's just been redeployed onto a node
+	// with existing accumulated ledger files cleans up immediately.
+	w.sweepRetention()
+	for {
+		select {
+		case <-w.retentionStop:
+			return
+		case <-ticker.C:
+			w.sweepRetention()
+		}
+	}
+}
+
+func (w *Writer) sweepRetention() {
+	ctx := context.Background()
+	deleted, freedBytes, err := sweepLedgerDir(ctx, filepath.Dir(w.path), filepath.Base(w.path), w.retentionAge, w.retentionBytes, time.Now())
+	if err != nil {
+		log.Printf("ledger retention sweep: %v", err)
+		return
+	}
+	if deleted > 0 {
+		log.Printf("ledger retention sweep: deleted %d rotated file(s), freed %d bytes", deleted, freedBytes)
+	}
+}
+
+// sweepLedgerDir is the pure function backing the sweep so it can be unit-tested
+// without touching real time or a real Writer. It scans `dir` for rotated
+// ledger siblings of `liveBase` (e.g. liveBase="flows.jsonl" → matches
+// "flows-*.jsonl") and deletes the oldest first until both bounds are met.
+//
+//   - retentionAge   > 0: delete files whose mtime is older than now-retentionAge
+//   - retentionBytes > 0: delete oldest files until total rotated bytes ≤ this
+//
+// Returns the number of files deleted and the bytes freed. The live `liveBase`
+// itself is always preserved.
+func sweepLedgerDir(_ context.Context, dir, liveBase string, retentionAge time.Duration, retentionBytes int64, now time.Time) (int, int64, error) {
+	ext := filepath.Ext(liveBase)
+	stem := strings.TrimSuffix(liveBase, ext)
+	prefix := stem + "-" // rotated files are stem-<timestamp>.ext
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, 0, nil
+		}
+		return 0, 0, err
+	}
+
+	type rotated struct {
+		path  string
+		mtime time.Time
+		size  int64
+	}
+	var files []rotated
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if name == liveBase {
+			continue // never touch the live file
+		}
+		if !strings.HasPrefix(name, prefix) || !strings.HasSuffix(name, ext) {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		files = append(files, rotated{
+			path:  filepath.Join(dir, name),
+			mtime: info.ModTime(),
+			size:  info.Size(),
+		})
+	}
+	if len(files) == 0 {
+		return 0, 0, nil
+	}
+	sort.Slice(files, func(i, j int) bool { return files[i].mtime.Before(files[j].mtime) })
+
+	deleted := 0
+	freed := int64(0)
+	remaining := make([]rotated, 0, len(files))
+
+	// Age-based pass first: anything older than retentionAge is unconditionally
+	// gone. Files inside the window are candidates for the byte-budget pass.
+	if retentionAge > 0 {
+		cutoff := now.Add(-retentionAge)
+		for _, f := range files {
+			if f.mtime.Before(cutoff) {
+				if err := os.Remove(f.path); err == nil {
+					deleted++
+					freed += f.size
+				}
+				continue
+			}
+			remaining = append(remaining, f)
+		}
+	} else {
+		remaining = files
+	}
+
+	// Byte-budget pass: oldest first until total ≤ retentionBytes.
+	if retentionBytes > 0 {
+		var total int64
+		for _, f := range remaining {
+			total += f.size
+		}
+		i := 0
+		for total > retentionBytes && i < len(remaining) {
+			if err := os.Remove(remaining[i].path); err == nil {
+				deleted++
+				freed += remaining[i].size
+				total -= remaining[i].size
+			}
+			i++
+		}
+	}
+
+	return deleted, freed, nil
 }
 
 func (w *Writer) open() error {
@@ -304,6 +481,9 @@ func BuildRecordWithContext(session sessionizer.FlowSession, resolved identity.R
 	if snapshot.PktSizeHistogram == nil {
 		snapshot.PktSizeHistogram = features.EmptyPacketSizeHistogram()
 	}
+	if snapshot.IATHistogram == nil {
+		snapshot.IATHistogram = features.EmptyIATHistogram()
+	}
 	protocolGuess := features.ProtocolGuess(session.Protocol, session.DstPort)
 	isTLSLike := features.IsTLSLike(protocolGuess, session.DstPort)
 	sameNamespace := nonEmptyEqual(resolved.Src.Namespace, resolved.Dst.Namespace)
@@ -370,10 +550,13 @@ func BuildRecordWithContext(session sessionizer.FlowSession, resolved identity.R
 		PktSizeMean:                snapshot.PktSizeMean,
 		PktSizeP50:                 snapshot.PktSizeP50,
 		PktSizeP95:                 snapshot.PktSizeP95,
+		PktSizeStd:                 snapshot.PktSizeStd,
 		PktSizeHistogram:           snapshot.PktSizeHistogram,
+		IATMean:                    snapshot.IATMean,
 		IATP50:                     snapshot.IATP50,
 		IATP95:                     snapshot.IATP95,
 		IATStd:                     snapshot.IATStd,
+		IATHistogram:               snapshot.IATHistogram,
 		IdleGapCount:               snapshot.IdleGapCount,
 		BurstCount:                 snapshot.BurstCount,
 		ByteRate:                   snapshot.ByteRate,
@@ -446,6 +629,9 @@ func BuildRecordWithContext(session sessionizer.FlowSession, resolved identity.R
 		SrcMappingConfidence: resolved.Src.Confidence,
 		DstMappingConfidence: resolved.Dst.Confidence,
 		MappingMethod:        resolved.MappingMethod,
+
+		SrcIdentityResolutionStatus: firstNonEmpty(resolved.Src.ResolutionStatus, identity.ResolutionStatusUnknown),
+		DstIdentityResolutionStatus: firstNonEmpty(resolved.Dst.ResolutionStatus, identity.ResolutionStatusUnknown),
 
 		DstServiceName:         resolved.Dst.ServiceName,
 		DstServiceUID:          resolved.Dst.ServiceUID,

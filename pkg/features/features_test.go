@@ -76,8 +76,17 @@ func TestAccumulatorHistogramEstimatedPercentiles(t *testing.T) {
 	if s.IATP50 == nil || *s.IATP50 < 2499 || *s.IATP50 > 2501 {
 		t.Fatalf("histogram iat p50 = %#v, want estimate near 2500", s.IATP50)
 	}
-	if s.IATStd != nil {
-		t.Fatalf("histogram-only IATStd = %#v, want nil", s.IATStd)
+	// L18/B: histogram-derived IATStd is now populated using bucket-midpoint
+	// approximation. Histogram has 4 samples at midpoint 550 + 6 at midpoint
+	// 5500: mean = 3520, stddev ≈ 2425.
+	if s.IATStd == nil {
+		t.Fatalf("histogram-only IATStd = nil, want approximate value")
+	}
+	if *s.IATStd < 2420 || *s.IATStd > 2430 {
+		t.Fatalf("histogram-only IATStd = %f, want ~2425", *s.IATStd)
+	}
+	if s.IATMean == nil || *s.IATMean < 3515 || *s.IATMean > 3525 {
+		t.Fatalf("histogram-only IATMean = %#v, want ~3520", s.IATMean)
 	}
 	if s.PktSizeMin == nil || *s.PktSizeMin != 64 || s.PktSizeMax == nil || *s.PktSizeMax != 255 {
 		t.Fatalf("unexpected min/max: %#v %#v", s.PktSizeMin, s.PktSizeMax)
@@ -99,11 +108,45 @@ func TestAccumulatorIATStatsUseHistogramPathWhenMixed(t *testing.T) {
 	})
 
 	s := acc.Snapshot(0, 0, 0, 0, time.Second, 5*time.Minute)
-	if s.IATStd != nil {
-		t.Fatalf("mixed raw+histogram IATStd = %#v, want nil", s.IATStd)
+	// L18/B: when histogram has data, IATStd uses the histogram-derived
+	// approximation on the MERGED histogram (input histogram + raw-sample
+	// bucketing). Raw samples [1,2,3] map to bucket "<100" (midpoint 49.5),
+	// input histogram contributes "1000-10000":10 (midpoint 5500). Merged:
+	// 3 samples at 49.5 + 10 at 5500 → mean ≈ 4242, stddev ≈ 2296.
+	if s.IATStd == nil {
+		t.Fatalf("mixed raw+histogram IATStd = nil, want approximate value")
+	}
+	if *s.IATStd < 2290 || *s.IATStd > 2300 {
+		t.Fatalf("mixed raw+histogram IATStd = %f, want ~2296", *s.IATStd)
 	}
 	if s.IATP50 == nil || *s.IATP50 < 4149 || *s.IATP50 > 4151 {
 		t.Fatalf("mixed raw+histogram IATP50 = %#v, want histogram estimate near 4150", s.IATP50)
+	}
+}
+
+// TestEstimateHistogramStddev_KnownDistribution verifies the bucket-midpoint
+// approximation against a hand-computed reference. With buckets [0-63]=50%
+// and [128-255]=50%, midpoints are 31.5 and 191.5; the population stddev
+// of those two equal-weight samples is |191.5-31.5|/2 = 80.
+func TestEstimateHistogramStddev_KnownDistribution(t *testing.T) {
+	hist := map[string]uint64{
+		"0-63":    100,
+		"128-255": 100,
+	}
+	std := estimateHistogramStddev(hist, packetSizeBucketBounds())
+	if std == nil {
+		t.Fatalf("got nil std, want ~80")
+	}
+	if *std < 79.5 || *std > 80.5 {
+		t.Fatalf("std = %f, want approximately 80", *std)
+	}
+}
+
+// TestEstimateHistogramStddev_Empty returns nil for an empty histogram.
+func TestEstimateHistogramStddev_Empty(t *testing.T) {
+	std := estimateHistogramStddev(map[string]uint64{}, packetSizeBucketBounds())
+	if std != nil {
+		t.Fatalf("empty histogram std = %v, want nil", std)
 	}
 }
 
