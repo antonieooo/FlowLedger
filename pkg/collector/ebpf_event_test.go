@@ -7,7 +7,7 @@ import (
 )
 
 func TestRawTLSHandshakeEventBinarySize(t *testing.T) {
-	const want = uintptr(1056)
+	const want = uintptr(2080)
 	if got := unsafe.Sizeof(rawTLSHandshakeEvent{}); got != want {
 		t.Fatalf("rawTLSHandshakeEvent size = %d, want %d", got, want)
 	}
@@ -165,7 +165,7 @@ func TestConvertRawTLSHandshakeEvent(t *testing.T) {
 		ciphers:           []uint16{0x1301, 0x1302},
 		extensions:        []uint16{0x0000, 0x0010, 0x002b},
 	})
-	var data [1024]byte
+	var data [2048]byte
 	copy(data[:], hello)
 	ev := convertRawTLSHandshakeEventToFlowEvent(rawTLSHandshakeEvent{
 		SrcIPv4:     ipv4Raw(10, 244, 1, 10),
@@ -188,7 +188,7 @@ func TestConvertRawTLSHandshakeEvent(t *testing.T) {
 
 func TestConvertRawTLSServerHelloEvent(t *testing.T) {
 	hello := mustDecodeHex(t, "160303005b020000570303000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f130100000f002b00020304001000050003026832")
-	var data [1024]byte
+	var data [2048]byte
 	copy(data[:], hello)
 	ev := convertRawTLSHandshakeEventToFlowEvent(rawTLSHandshakeEvent{
 		SrcIPv4:     ipv4Raw(10, 244, 1, 10),
