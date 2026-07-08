@@ -60,6 +60,12 @@ type flowEventsFlowStats struct {
 	_                          [4]byte
 }
 
+type flowEventsLocalEp struct {
+	Ip   uint32
+	Port uint16
+	Pad  uint16
+}
+
 // loadFlowEvents returns the embedded CollectionSpec for flowEvents.
 func loadFlowEvents() (*ebpf.CollectionSpec, error) {
 	reader := bytes.NewReader(_FlowEventsBytes)
@@ -117,6 +123,7 @@ type flowEventsMapSpecs struct {
 	DropCounters          *ebpf.MapSpec `ebpf:"drop_counters"`
 	Events                *ebpf.MapSpec `ebpf:"events"`
 	FlowStatsMap          *ebpf.MapSpec `ebpf:"flow_stats_map"`
+	LocalEpToKey          *ebpf.MapSpec `ebpf:"local_ep_to_key"`
 	RecvArgsMap           *ebpf.MapSpec `ebpf:"recv_args_map"`
 	TlsHandshakeEvents    *ebpf.MapSpec `ebpf:"tls_handshake_events"`
 	TlsServerHelloSeenMap *ebpf.MapSpec `ebpf:"tls_server_hello_seen_map"`
@@ -145,6 +152,7 @@ type flowEventsMaps struct {
 	DropCounters          *ebpf.Map `ebpf:"drop_counters"`
 	Events                *ebpf.Map `ebpf:"events"`
 	FlowStatsMap          *ebpf.Map `ebpf:"flow_stats_map"`
+	LocalEpToKey          *ebpf.Map `ebpf:"local_ep_to_key"`
 	RecvArgsMap           *ebpf.Map `ebpf:"recv_args_map"`
 	TlsHandshakeEvents    *ebpf.Map `ebpf:"tls_handshake_events"`
 	TlsServerHelloSeenMap *ebpf.Map `ebpf:"tls_server_hello_seen_map"`
@@ -156,6 +164,7 @@ func (m *flowEventsMaps) Close() error {
 		m.DropCounters,
 		m.Events,
 		m.FlowStatsMap,
+		m.LocalEpToKey,
 		m.RecvArgsMap,
 		m.TlsHandshakeEvents,
 		m.TlsServerHelloSeenMap,
