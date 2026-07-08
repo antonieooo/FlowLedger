@@ -17,6 +17,7 @@ typedef unsigned long long __u64;
 #define BPF_ANY 0
 
 #define AF_INET 2
+#define AF_INET6 10
 #define IPPROTO_TCP 6
 
 #define TCP_ESTABLISHED 1
@@ -37,7 +38,8 @@ typedef unsigned long long __u64;
 #define DROP_RECV_ARG_MISSED 3
 #define DROP_TLS_BUFFER_RESERVE_FAILED 4
 #define DROP_TLS_SERVER_HELLO_NO_STATS 5
-#define DROP_COUNTERS_LEN 6
+#define DROP_UNSUPPORTED_V6 6
+#define DROP_COUNTERS_LEN 7
 
 #define FLOW_STATS_MAX_ENTRIES 65536
 #define RECV_ARGS_MAX_ENTRIES 16384
@@ -86,6 +88,10 @@ struct pt_regs {
 #error "unsupported target arch"
 #endif
 
+struct in6_addr {
+	__u8 s6_addr[16];
+};
+
 struct sock_common {
 	union {
 		struct {
@@ -107,6 +113,10 @@ struct sock_common {
 	struct {
 		struct net *net;
 	} skc_net;
+	// v6 address fields; CO-RE resolves their real offsets by name from BTF,
+	// so their position in this local struct copy does not matter.
+	struct in6_addr skc_v6_daddr;
+	struct in6_addr skc_v6_rcv_saddr;
 } __attribute__((preserve_access_index));
 
 struct sock {
@@ -322,6 +332,19 @@ static __u16 bpf_ntohs(__u16 v)
 	return __builtin_bswap16(v);
 }
 
+// Extract the embedded IPv4 from an IPv4-mapped IPv6 address (::ffff:a.b.c.d).
+// Dual-stack sockets (Python/grpcio, JVM, Node, ...) carry IPv4 traffic over an
+// AF_INET6 socket using this mapping while the wire packets remain IPv4. On
+// success writes the network-order IPv4 into *out_ip and returns 0; returns -1
+// for a genuine (non-mapped) IPv6 address.
+static int v4_from_mapped(const __u8 addr[16], __u32 *out_ip)
+{
+	if (addr[10] != 0xff || addr[11] != 0xff)
+		return -1;
+	__builtin_memcpy(out_ip, &addr[12], 4);
+	return 0;
+}
+
 static void increment_drop(__u32 idx)
 {
 	__u64 *counter;
@@ -349,14 +372,26 @@ static int key_from_sock(struct sock *sk, struct flow_key *key, __u8 direction)
 		return -1;
 
 	bpf_probe_read_kernel(&family, sizeof(family), &sk->__sk_common.skc_family);
-	if (family != AF_INET) {
+
+	__builtin_memset(key, 0, sizeof(*key));
+	if (family == AF_INET) {
+		bpf_probe_read_kernel(&key->src_ip, sizeof(key->src_ip), &sk->__sk_common.skc_rcv_saddr);
+		bpf_probe_read_kernel(&key->dst_ip, sizeof(key->dst_ip), &sk->__sk_common.skc_daddr);
+	} else if (family == AF_INET6) {
+		__u8 saddr6[16] = {};
+		__u8 daddr6[16] = {};
+
+		bpf_probe_read_kernel(&saddr6, sizeof(saddr6), &sk->__sk_common.skc_v6_rcv_saddr);
+		bpf_probe_read_kernel(&daddr6, sizeof(daddr6), &sk->__sk_common.skc_v6_daddr);
+		if (v4_from_mapped(saddr6, &key->src_ip) != 0 ||
+		    v4_from_mapped(daddr6, &key->dst_ip) != 0) {
+			increment_drop(DROP_UNSUPPORTED_V6);
+			return -1;
+		}
+	} else {
 		increment_drop(DROP_UNSUPPORTED_FAMILY);
 		return -1;
 	}
-
-	__builtin_memset(key, 0, sizeof(*key));
-	bpf_probe_read_kernel(&key->src_ip, sizeof(key->src_ip), &sk->__sk_common.skc_rcv_saddr);
-	bpf_probe_read_kernel(&key->dst_ip, sizeof(key->dst_ip), &sk->__sk_common.skc_daddr);
 	bpf_probe_read_kernel(&key->src_port, sizeof(key->src_port), &sk->__sk_common.skc_num);
 	bpf_probe_read_kernel(&dport, sizeof(dport), &sk->__sk_common.skc_dport);
 	key->dst_port = bpf_ntohs(dport);
@@ -791,13 +826,28 @@ int handle_inet_sock_set_state(struct trace_event_raw_inet_sock_set_state *ctx)
 	__u64 now = bpf_ktime_get_ns();
 	__u64 netns_ino = netns_ino_from_sock((struct sock *)ctx->skaddr);
 
-	if (ctx->family != AF_INET || ctx->protocol != IPPROTO_TCP) {
+	if (ctx->protocol != IPPROTO_TCP) {
 		increment_drop(DROP_UNSUPPORTED_FAMILY);
 		return 0;
 	}
+	if (ctx->family == AF_INET) {
+		key.src_ip = ctx->saddr;
+		key.dst_ip = ctx->daddr;
+	} else if (ctx->family == AF_INET6) {
+		__u8 saddr6[16] = {};
+		__u8 daddr6[16] = {};
 
-	key.src_ip = ctx->saddr;
-	key.dst_ip = ctx->daddr;
+		__builtin_memcpy(saddr6, ctx->saddr_v6, sizeof(saddr6));
+		__builtin_memcpy(daddr6, ctx->daddr_v6, sizeof(daddr6));
+		if (v4_from_mapped(saddr6, &key.src_ip) != 0 ||
+		    v4_from_mapped(daddr6, &key.dst_ip) != 0) {
+			increment_drop(DROP_UNSUPPORTED_V6);
+			return 0;
+		}
+	} else {
+		increment_drop(DROP_UNSUPPORTED_FAMILY);
+		return 0;
+	}
 	key.src_port = ctx->sport;
 	key.dst_port = ctx->dport;
 	key.protocol = IPPROTO_TCP;
