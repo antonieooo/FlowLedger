@@ -39,7 +39,8 @@ typedef unsigned long long __u64;
 #define DROP_TLS_BUFFER_RESERVE_FAILED 4
 #define DROP_TLS_SERVER_HELLO_NO_STATS 5
 #define DROP_UNSUPPORTED_V6 6
-#define DROP_COUNTERS_LEN 7
+#define DROP_PACKET_EP_MISS 7
+#define DROP_COUNTERS_LEN 8
 
 #define FLOW_STATS_MAX_ENTRIES 65536
 #define RECV_ARGS_MAX_ENTRIES 16384
@@ -289,6 +290,30 @@ struct {
 	__type(value, struct flow_stats);
 } flow_stats_map SEC(".maps");
 
+// DNAT-invariant local-endpoint index: maps a connection's local endpoint
+// (local IP + local port) to the canonical socket-side flow_key stored in
+// flow_stats_map. The socket paths (kprobe/tracepoint) key by the pre-DNAT
+// tuple (e.g. Service ClusterIP as dst), but cgroup_skb egress sees the
+// post-kube-proxy-DNAT tuple (backend Pod IP as dst), so a direct tuple match
+// misses and packet-size/IAT stats never merge (only ~25% of flows populated).
+// kube-proxy DNAT rewrites only the destination, so the local endpoint is
+// identical in both views; key_from_skb already normalizes the local side into
+// key.src for both directions. The cgroup_skb hooks resolve their local
+// endpoint to the canonical key through this map, so packet stats land on the
+// same flow_stats entry the accounting hooks created.
+struct local_ep {
+	__u32 ip;
+	__u16 port;
+	__u16 _pad;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, FLOW_STATS_MAX_ENTRIES);
+	__type(key, struct local_ep);
+	__type(value, struct flow_key);
+} local_ep_to_key SEC(".maps");
+
 // Dedicated ingress ServerHello dedup keyed by the post-NAT flow tuple.
 // flow_stats_map is intentionally not reused because egress accounting may be
 // keyed by the Service ClusterIP while ingress ServerHello is keyed by the
@@ -494,6 +519,19 @@ static int emit_flow_event_no_pid(struct flow_key *key, struct flow_stats *stats
 	return 0;
 }
 
+// Record the connection's local endpoint -> canonical flow_key mapping so the
+// cgroup_skb packet hooks can find this entry despite kube-proxy DNAT rewriting
+// the destination on the wire. Idempotent; safe to call on every create.
+static void index_local_ep(struct flow_key *key)
+{
+	struct local_ep ep = {};
+
+	ep.ip = key->src_ip;
+	ep.port = key->src_port;
+	if (bpf_map_update_elem(&local_ep_to_key, &ep, key, BPF_ANY) != 0)
+		increment_drop(DROP_MAP_UPDATE_FAILED);
+}
+
 static struct flow_stats *ensure_stats(struct flow_key *key, __u64 now)
 {
 	struct flow_stats init = {};
@@ -511,6 +549,7 @@ static struct flow_stats *ensure_stats(struct flow_key *key, __u64 now)
 		increment_drop(DROP_MAP_UPDATE_FAILED);
 		return 0;
 	}
+	index_local_ep(key);
 	return bpf_map_lookup_elem(&flow_stats_map, key);
 }
 
@@ -865,12 +904,15 @@ int handle_inet_sock_set_state(struct trace_event_raw_inet_sock_set_state *ctx)
 			increment_drop(DROP_MAP_UPDATE_FAILED);
 			return 0;
 		}
+		index_local_ep(&key);
 		stats = bpf_map_lookup_elem(&flow_stats_map, &key);
 		emit_flow_event(&key, stats, EVENT_CONNECT, now, netns_ino);
 		return 0;
 	}
 
 	if (ctx->newstate == TCP_CLOSE) {
+		struct local_ep ep = {};
+
 		stats = bpf_map_lookup_elem(&flow_stats_map, &key);
 		if (stats) {
 			stats->close_seen = 1;
@@ -879,6 +921,9 @@ int handle_inet_sock_set_state(struct trace_event_raw_inet_sock_set_state *ctx)
 		}
 		emit_flow_event(&key, stats, EVENT_CLOSE, now, netns_ino);
 		bpf_map_delete_elem(&flow_stats_map, &key);
+		ep.ip = key.src_ip;
+		ep.port = key.src_port;
+		bpf_map_delete_elem(&local_ep_to_key, &ep);
 		return 0;
 	}
 
@@ -930,14 +975,35 @@ int handle_tcp_recvmsg_return(struct pt_regs *ctx)
 	return 0;
 }
 
+// Resolve the wire packet's local endpoint to the canonical socket-side key so
+// packet-size/IAT stats merge into the flow_stats entry the accounting hooks
+// created, despite kube-proxy DNAT. Returns 0 and counts a drop when the local
+// endpoint is not (yet) indexed (e.g. forwarded packets with no local socket).
+static struct flow_key *canonical_key_from_skb(struct flow_key *skbkey)
+{
+	struct local_ep ep = {};
+	struct flow_key *canon;
+
+	ep.ip = skbkey->src_ip;
+	ep.port = skbkey->src_port;
+	canon = bpf_map_lookup_elem(&local_ep_to_key, &ep);
+	if (!canon)
+		increment_drop(DROP_PACKET_EP_MISS);
+	return canon;
+}
+
 SEC("cgroup_skb/ingress")
 int handle_cgroup_skb_ingress(struct __sk_buff *skb)
 {
 	struct flow_key key;
+	struct flow_key *canon;
 	struct flow_stats *stats;
 
 	if (key_from_skb(skb, &key, 1) == 0) {
-		update_packet_stats(skb, &key, skb->len, 1, bpf_ktime_get_ns());
+		canon = canonical_key_from_skb(&key);
+		if (canon)
+			update_packet_stats(skb, canon, skb->len, 1, bpf_ktime_get_ns());
+		// TLS handshake dedup/emit deliberately keeps the post-NAT tuple key.
 		stats = bpf_map_lookup_elem(&flow_stats_map, &key);
 		maybe_emit_tls_handshake(skb, &key, stats, DIRECTION_RECV, 0x02);
 	}
@@ -948,10 +1014,14 @@ SEC("cgroup_skb/egress")
 int handle_cgroup_skb_egress(struct __sk_buff *skb)
 {
 	struct flow_key key;
+	struct flow_key *canon;
 	struct flow_stats *stats;
 
 	if (key_from_skb(skb, &key, 0) == 0) {
-		update_packet_stats(skb, &key, skb->len, 0, bpf_ktime_get_ns());
+		canon = canonical_key_from_skb(&key);
+		if (canon)
+			update_packet_stats(skb, canon, skb->len, 0, bpf_ktime_get_ns());
+		// TLS handshake dedup/emit deliberately keeps the post-NAT tuple key.
 		stats = bpf_map_lookup_elem(&flow_stats_map, &key);
 		maybe_emit_tls_handshake(skb, &key, stats, DIRECTION_SEND, 0x01);
 	}
