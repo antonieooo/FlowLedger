@@ -179,13 +179,13 @@ func main() {
 	for {
 		select {
 		case <-ctx.Done():
-			emitSessions(writer, resolver, labels, sessions.CloseAll("timeout", time.Now().UTC()), m, recordContext, cfg.dropNonLocalSrc)
+			emitSessions(writer, resolver, labels, sessions.CloseAll("timeout", time.Now().UTC()), m, recordContext, cfg.dropNonLocalSrc, metaCache)
 			return
 		case ev, ok := <-events:
 			if !ok {
 				if !eventsClosed {
 					eventsClosed = true
-					emitSessions(writer, resolver, labels, sessions.CloseAll("timeout", time.Now().UTC()), m, recordContext, cfg.dropNonLocalSrc)
+					emitSessions(writer, resolver, labels, sessions.CloseAll("timeout", time.Now().UTC()), m, recordContext, cfg.dropNonLocalSrc, metaCache)
 					log.Print("collector finished; node-agent remains up for metrics until interrupted")
 				}
 				events = nil
@@ -234,7 +234,7 @@ func main() {
 				}
 				continue
 			}
-			emitSessions(writer, resolver, labels, sessions.Process(ev), m, recordContext, cfg.dropNonLocalSrc)
+			emitSessions(writer, resolver, labels, sessions.Process(ev), m, recordContext, cfg.dropNonLocalSrc, metaCache)
 			m.SessionsActive.Set(float64(sessions.ActiveCount()))
 		case err, ok := <-errs:
 			if ok && err != nil && err != context.Canceled {
@@ -248,7 +248,7 @@ func main() {
 				log.Printf("collector error: %v", err)
 			}
 		case <-ticker.C:
-			emitSessions(writer, resolver, labels, sessions.Sweep(time.Now().UTC()), m, recordContext, cfg.dropNonLocalSrc)
+			emitSessions(writer, resolver, labels, sessions.Sweep(time.Now().UTC()), m, recordContext, cfg.dropNonLocalSrc, metaCache)
 			m.SessionsActive.Set(float64(sessions.ActiveCount()))
 			pods, services := metaCache.Stats()
 			m.K8sCachePods.Set(float64(pods))
@@ -424,7 +424,7 @@ func maybeKubernetesClient() kubernetes.Interface {
 	return client
 }
 
-func emitSessions(w *ledger.Writer, resolver *identity.Resolver, labels experiment.Labels, sessions []sessionizer.FlowSession, m *flmetrics.Metrics, recordContext ledger.BuildContext, dropNonLocalSrc bool) {
+func emitSessions(w *ledger.Writer, resolver *identity.Resolver, labels experiment.Labels, sessions []sessionizer.FlowSession, m *flmetrics.Metrics, recordContext ledger.BuildContext, dropNonLocalSrc bool, cache *k8smeta.Cache) {
 	for _, session := range sessions {
 		resolved := resolver.Resolve(session)
 		// Phantom filter: under kind, all "nodes" share one host kernel, so this
@@ -433,11 +433,23 @@ func emitSessions(w *ledger.Writer, resolver *identity.Resolver, labels experime
 		// cgroup_skb packet data, so non-local records are packet-less duplicates.
 		// Keep only flows whose source pod is on this node. On a real
 		// independent-kernel node the kprobe never fires for non-local flows, so
-		// resolved.Src.NodeName always equals session.NodeName and this is a no-op.
-		// Unknown/unresolved source node ("") is kept, to avoid dropping real flows.
-		if dropNonLocalSrc && resolved.Src.NodeName != "" && resolved.Src.NodeName != session.NodeName {
-			m.PhantomSrcFilteredTotal.Inc()
-			continue
+		// the source node always equals session.NodeName and this is a no-op.
+		if dropNonLocalSrc {
+			srcNode := resolved.Src.NodeName
+			// resolveSource can return "" for a resolvable pod (e.g. cgroup_id ->
+			// pod_uid hit but informer cache miss); fall back to the authoritative
+			// cluster-wide pod-by-IP index so a remote reverse-leg phantom is still
+			// recognized as non-local. Genuinely unknown source (external,
+			// host-network, IP not in cache) stays "" and is kept.
+			if srcNode == "" {
+				if pod, ok := cache.PodByIP(session.SrcIP); ok {
+					srcNode = pod.NodeName
+				}
+			}
+			if srcNode != "" && srcNode != session.NodeName {
+				m.PhantomSrcFilteredTotal.Inc()
+				continue
+			}
 		}
 		if session.CgroupID != 0 {
 			if resolved.Src.Method == "cgroup_id" {
