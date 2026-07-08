@@ -13,6 +13,7 @@ type Metrics struct {
 	EventsTotal                  prometheus.Counter
 	SessionsActive               prometheus.Gauge
 	SessionsEmittedTotal         prometheus.Counter
+	PhantomSrcFilteredTotal      prometheus.Counter
 	UnknownSrcMappings           prometheus.Counter
 	UnknownDstMappings           prometheus.Counter
 	LedgerWriteErrors            prometheus.Counter
@@ -59,6 +60,10 @@ func New() *Metrics {
 		SessionsEmittedTotal: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "flowledger_sessions_emitted_total",
 			Help: "Total emitted flow sessions.",
+		}),
+		PhantomSrcFilteredTotal: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "flowledger_phantom_src_filtered_total",
+			Help: "Total flow sessions dropped because the source pod is not local to this node (kind shared-kernel phantom from global kprobes; a no-op on real independent-kernel nodes).",
 		}),
 		UnknownSrcMappings: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "flowledger_unknown_src_mapping_total",
@@ -189,6 +194,7 @@ func New() *Metrics {
 		m.EventsTotal,
 		m.SessionsActive,
 		m.SessionsEmittedTotal,
+		m.PhantomSrcFilteredTotal,
 		m.UnknownSrcMappings,
 		m.UnknownDstMappings,
 		m.LedgerWriteErrors,

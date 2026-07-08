@@ -42,6 +42,7 @@ type config struct {
 	logLevel                      string
 	metadataSyncTimeout           time.Duration
 	allowUnsyncedMeta             bool
+	dropNonLocalSrc               bool
 	ledgerMaxBytes                int64
 	ledgerMaxAge                  time.Duration
 	ledgerRetentionAge            time.Duration
@@ -178,13 +179,13 @@ func main() {
 	for {
 		select {
 		case <-ctx.Done():
-			emitSessions(writer, resolver, labels, sessions.CloseAll("timeout", time.Now().UTC()), m, recordContext)
+			emitSessions(writer, resolver, labels, sessions.CloseAll("timeout", time.Now().UTC()), m, recordContext, cfg.dropNonLocalSrc)
 			return
 		case ev, ok := <-events:
 			if !ok {
 				if !eventsClosed {
 					eventsClosed = true
-					emitSessions(writer, resolver, labels, sessions.CloseAll("timeout", time.Now().UTC()), m, recordContext)
+					emitSessions(writer, resolver, labels, sessions.CloseAll("timeout", time.Now().UTC()), m, recordContext, cfg.dropNonLocalSrc)
 					log.Print("collector finished; node-agent remains up for metrics until interrupted")
 				}
 				events = nil
@@ -233,7 +234,7 @@ func main() {
 				}
 				continue
 			}
-			emitSessions(writer, resolver, labels, sessions.Process(ev), m, recordContext)
+			emitSessions(writer, resolver, labels, sessions.Process(ev), m, recordContext, cfg.dropNonLocalSrc)
 			m.SessionsActive.Set(float64(sessions.ActiveCount()))
 		case err, ok := <-errs:
 			if ok && err != nil && err != context.Canceled {
@@ -247,7 +248,7 @@ func main() {
 				log.Printf("collector error: %v", err)
 			}
 		case <-ticker.C:
-			emitSessions(writer, resolver, labels, sessions.Sweep(time.Now().UTC()), m, recordContext)
+			emitSessions(writer, resolver, labels, sessions.Sweep(time.Now().UTC()), m, recordContext, cfg.dropNonLocalSrc)
 			m.SessionsActive.Set(float64(sessions.ActiveCount()))
 			pods, services := metaCache.Stats()
 			m.K8sCachePods.Set(float64(pods))
@@ -362,6 +363,7 @@ func parseFlags() config {
 	flag.StringVar(&cfg.logLevel, "log-level", "info", "log level")
 	flag.DurationVar(&cfg.metadataSyncTimeout, "metadata-sync-timeout", 30*time.Second, "maximum time to wait for Kubernetes metadata cache sync before processing events")
 	flag.BoolVar(&cfg.allowUnsyncedMeta, "allow-unsynced-metadata", false, "continue if Kubernetes metadata cache sync fails or times out")
+	flag.BoolVar(&cfg.dropNonLocalSrc, "drop-nonlocal-src", true, "drop flow sessions whose source pod is not on this node. Corrects kind's shared-kernel phantom duplication (global kprobes record every host flow on every node); a no-op on real independent-kernel nodes where the kprobe only sees local flows")
 	flag.Int64Var(&cfg.ledgerMaxBytes, "ledger-max-bytes", 100*1024*1024, "rotate ledger when current file reaches this many bytes; 0 disables size rotation")
 	flag.DurationVar(&cfg.ledgerMaxAge, "ledger-max-age", 0, "rotate ledger after this duration; 0 disables age rotation")
 	flag.DurationVar(&cfg.ledgerRetentionAge, "ledger-retention-age", 24*time.Hour, "delete rotated ledger files older than this; 0 disables age-based retention")
@@ -422,9 +424,21 @@ func maybeKubernetesClient() kubernetes.Interface {
 	return client
 }
 
-func emitSessions(w *ledger.Writer, resolver *identity.Resolver, labels experiment.Labels, sessions []sessionizer.FlowSession, m *flmetrics.Metrics, recordContext ledger.BuildContext) {
+func emitSessions(w *ledger.Writer, resolver *identity.Resolver, labels experiment.Labels, sessions []sessionizer.FlowSession, m *flmetrics.Metrics, recordContext ledger.BuildContext, dropNonLocalSrc bool) {
 	for _, session := range sessions {
 		resolved := resolver.Resolve(session)
+		// Phantom filter: under kind, all "nodes" share one host kernel, so this
+		// collector's global tcp_sendmsg/recvmsg kprobes record every host flow,
+		// not just this node's. Only the flow's home node also has node-scoped
+		// cgroup_skb packet data, so non-local records are packet-less duplicates.
+		// Keep only flows whose source pod is on this node. On a real
+		// independent-kernel node the kprobe never fires for non-local flows, so
+		// resolved.Src.NodeName always equals session.NodeName and this is a no-op.
+		// Unknown/unresolved source node ("") is kept, to avoid dropping real flows.
+		if dropNonLocalSrc && resolved.Src.NodeName != "" && resolved.Src.NodeName != session.NodeName {
+			m.PhantomSrcFilteredTotal.Inc()
+			continue
+		}
 		if session.CgroupID != 0 {
 			if resolved.Src.Method == "cgroup_id" {
 				m.CgroupResolutionsTotal.WithLabelValues("hit").Inc()
