@@ -120,8 +120,23 @@ struct sock_common {
 	struct in6_addr skc_v6_rcv_saddr;
 } __attribute__((preserve_access_index));
 
+// Socket-owned cgroup chain (CO-RE, field offsets resolved from kernel BTF by name):
+// sk->sk_cgrp_data.cgroup->kn->id == the cgroup v2 id of the socket's OWNING pod.
+struct kernfs_node {
+	__u64 id;
+} __attribute__((preserve_access_index));
+
+struct cgroup {
+	struct kernfs_node *kn;
+} __attribute__((preserve_access_index));
+
+struct sock_cgroup_data {
+	struct cgroup *cgroup;
+} __attribute__((preserve_access_index));
+
 struct sock {
 	struct sock_common __sk_common;
+	struct sock_cgroup_data sk_cgrp_data;
 } __attribute__((preserve_access_index));
 
 struct ns_common {
@@ -437,6 +452,27 @@ static __u64 netns_ino_from_sock(struct sock *sk)
 	if (net)
 		bpf_probe_read_kernel(&inum, sizeof(inum), &net->ns.inum);
 	return inum;
+}
+
+// Socket-owned cgroup id: correct even when the hook fires in softirq (e.g. TCP_ESTABLISHED on
+// SYN-ACK receipt for an active connector), where bpf_get_current_cgroup_id() would return an
+// arbitrary co-located task's cgroup. Returns 0 for host-network / unowned sockets (caller falls back).
+static __u64 sk_cgroup_id(struct sock *sk)
+{
+	struct cgroup *cgrp = 0;
+	struct kernfs_node *kn = 0;
+	__u64 id = 0;
+
+	if (!sk)
+		return 0;
+	bpf_probe_read_kernel(&cgrp, sizeof(cgrp), &sk->sk_cgrp_data.cgroup);
+	if (!cgrp)
+		return 0;
+	bpf_probe_read_kernel(&kn, sizeof(kn), &cgrp->kn);
+	if (!kn)
+		return 0;
+	bpf_probe_read_kernel(&id, sizeof(id), &kn->id);
+	return id;
 }
 
 static void fill_event_fields(struct flow_event *event, struct flow_key *key, struct flow_stats *stats, __u32 event_type, __u64 now)
@@ -896,7 +932,12 @@ int handle_inet_sock_set_state(struct trace_event_raw_inet_sock_set_state *ctx)
 		init.start_ns = now;
 		init.last_seen_ns = now;
 		init.last_emit_ns = now;
-		init.cgroup_id = bpf_get_current_cgroup_id();
+		// socket-owned cgroup: ESTABLISHED fires in softirq on SYN-ACK for the active connector,
+		// so bpf_get_current_cgroup_id() may be an arbitrary co-located task. Attribute to the
+		// socket owner; fall back to current only for unowned (host-network) sockets.
+		init.cgroup_id = sk_cgroup_id((struct sock *)ctx->skaddr);
+		if (init.cgroup_id == 0)
+			init.cgroup_id = bpf_get_current_cgroup_id();
 		init.netns_ino = netns_ino;
 		init.syn_count = 1;
 		init.tcp_metrics_available = 1;
