@@ -1,5 +1,11 @@
 # FlowLedger Schema v1alpha2
 
+> Superseded by [schema-v1alpha3.md](schema-v1alpha3.md), which fixes a
+> cumulative-snapshot double-counting bug and exports cgroup_skb-observed skb
+> packet counts. The semantics documented here describe v1alpha2 records as
+> they were actually written and remain the reference for interpreting
+> existing v1alpha2 data.
+
 FlowLedger is a Kubernetes-aware flow evidence ledger. It records aggregated flow/session evidence for later Fast Path feature checks and Slow Path review workflows.
 
 It is not an IDS, an ML inference service, a packet capture system, a TLS decryptor, or a payload recorder.

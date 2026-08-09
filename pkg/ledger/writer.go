@@ -15,6 +15,7 @@ import (
 	"FlowLedger/pkg/experiment"
 	"FlowLedger/pkg/features"
 	"FlowLedger/pkg/identity"
+	"FlowLedger/pkg/k8smeta"
 	"FlowLedger/pkg/sessionizer"
 )
 
@@ -31,8 +32,37 @@ type Record struct {
 	ExperimentID   string `json:"experiment_id"`
 	ScenarioLabel  string `json:"scenario_label"`
 
-	FlowID        string `json:"flow_id"`
-	WindowID      uint64 `json:"window_id"`
+	FlowID   string `json:"flow_id"`
+	WindowID uint64 `json:"window_id"`
+
+	// --- v1alpha4 window-delta contract ---
+	// CounterSemantics is the machine-readable discriminator of what the
+	// additive counters in THIS record mean: "window_delta" on window_summary
+	// records (current cumulative minus previous accepted baseline) and
+	// "lifetime_cumulative" on session_summary records (whole-connection
+	// totals, a diagnostic record that REPEATS everything already emitted in
+	// this flow's windows — it must never be counted as another window).
+	// A fixed-window dataset is exactly: record_type == "window_summary".
+	CounterSemantics string `json:"counter_semantics"`
+	// WindowValid: the delta counters of this window record are a
+	// trustworthy fixed-window increment. When false every additive counter
+	// and histogram is zeroed and WindowInvalidReason explains why
+	// ("unknown_baseline": first snapshot of a generation not proven to start
+	// from zero; "counter_reset": a cumulative counter/bucket regressed).
+	// Always false on session_summary records.
+	WindowValid         bool   `json:"window_valid"`
+	WindowInvalidReason string `json:"window_invalid_reason"`
+	// CounterEpoch groups windows differenced over one continuous kernel
+	// counter lineage; it increments after each counter_reset window.
+	CounterEpoch uint64 `json:"counter_epoch"`
+	// FinalWindow marks the partial window flushed exactly once when the
+	// connection ends (CLOSE, inactivity timeout, shutdown, or a new CONNECT
+	// generation superseding a lost CLOSE).
+	FinalWindow bool `json:"final_window"`
+	// WindowStartTime is the start of this window's delta interval (the
+	// previous baseline snapshot time); the interval ends at end_time.
+	// Empty on session_summary records.
+	WindowStartTime string `json:"window_start_time"`
 	SrcIP         string `json:"src_ip"`
 	SrcPort       uint16 `json:"src_port"`
 	DstIP         string `json:"dst_ip"`
@@ -81,6 +111,97 @@ type Record struct {
 	TrafficAccountingAvailable bool              `json:"traffic_accounting_available"`
 	PacketTimingAvailable      bool              `json:"packet_timing_available"`
 	TCPMetricsAvailable        bool              `json:"tcp_metrics_available"`
+
+	// v1alpha3: cgroup_skb-observed skb counts. skb granularity — one skb may
+	// be a GSO/GRO aggregate of many wire packets — so these are NOT exact
+	// wire packet counts and must not be compared 1:1 against PCAP. The
+	// legacy packets_out/in above keep their syscall/message semantics.
+	ObservedSKBPacketsOut       uint64 `json:"observed_skb_packets_out"`
+	ObservedSKBPacketsIn        uint64 `json:"observed_skb_packets_in"`
+	ObservedSKBPacketsTotal     uint64 `json:"observed_skb_packets_total"`
+	ObservedSKBPacketsAvailable bool   `json:"observed_skb_packets_available"`
+	ObservedSKBPacketsSource    string `json:"observed_skb_packets_source"` // "cgroup_skb" | "mock" | ""
+
+	// v1alpha3: a cumulative kernel counter regressed mid-session (map entry
+	// evicted/re-created or agent restart). Totals keep the pre-reset maxima
+	// and are a lower bound; pre- and post-reset values are never summed.
+	CounterResetDetected bool   `json:"counter_reset_detected"`
+	CounterResetCount    uint64 `json:"counter_reset_count"`
+
+	// --- v1alpha3 P1: TCP/IP header aggregates from cgroup_skb. "out" =
+	// local egress, "in" = local ingress; NOT client/server — only a
+	// downstream cohort that has established the local end as the active
+	// initiator may map out/in to client/server. Pointer fields are null when
+	// the signal was unavailable, never a fabricated 0.
+	IPTTLMin       *uint32 `json:"ip_ttl_min"` // both directions combined
+	IPTTLMax       *uint32 `json:"ip_ttl_max"`
+	IPTTLAvailable bool    `json:"ip_ttl_available"`
+
+	// Availability is driven by the kernel's per-direction header-observed
+	// witness (TCP bytes 12-15 read success), NOT by the values: a direction
+	// observed with an all-zero flag byte (TCP NULL scan) serializes as a
+	// genuine 0 with available=true; an unobserved direction is null.
+	// tcp_flags_all is available iff at least one direction was observed.
+	TCPFlagsAll       *uint32 `json:"tcp_flags_all"` // OR of out|in
+	TCPFlagsOut       *uint32 `json:"tcp_flags_out"`
+	TCPFlagsIn        *uint32 `json:"tcp_flags_in"`
+	TCPFlagsAvailable bool    `json:"tcp_flags_available"`
+
+	// Raw advertised window (ntohs of the TCP header field), per-direction
+	// max. NOT the effective scaled window: window scaling (RFC 7323) is
+	// negotiated in SYN options and is not implemented or verified here.
+	// Same observed-gating as tcp_flags: an observed direction whose every
+	// segment advertised window 0 serializes a genuine 0, not null. The max
+	// is a concurrent best-effort extremum (see schema doc), not exact.
+	TCPWindowMaxOut    *uint32 `json:"tcp_window_max_out"`
+	TCPWindowMaxIn     *uint32 `json:"tcp_window_max_in"`
+	TCPWindowAvailable bool    `json:"tcp_window_available"`
+
+	// Active span per direction (first-to-last observed skb). A direction
+	// with exactly one packet reports 0; a never-observed direction is null.
+	DirectionDurationOutMS     *uint64 `json:"direction_duration_out_ms"`
+	DirectionDurationInMS      *uint64 `json:"direction_duration_in_ms"`
+	DirectionDurationAvailable bool    `json:"direction_duration_available"`
+
+	// ntohs(ip.tot_len) envelope; pkt_size_min/max above keep their skb->len
+	// (flow_pkt_len) semantics. May reflect GSO/GRO aggregates.
+	IPPktLenMin       *uint32 `json:"ip_pkt_len_min"`
+	IPPktLenMax       *uint32 `json:"ip_pkt_len_max"`
+	IPPktLenAvailable bool    `json:"ip_pkt_len_available"`
+
+	// NetFlow-v2 edge histogram over ntohs(ip.tot_len), both directions.
+	// ">1514" is overflow (GSO/GRO) and must be reported separately — an
+	// Anomal-E adapter selects only the first five buckets.
+	NetFlowV2IPSizeHistogram          map[string]uint64 `json:"netflow_v2_ip_size_histogram"`
+	NetFlowV2IPSizeHistogramAvailable bool              `json:"netflow_v2_ip_size_histogram_available"`
+
+	// --- v1alpha3 P2: LOCAL egress retransmissions from tracepoint
+	// tcp/tcp_retransmit_skb, keyed by the pre-DNAT socket flow key (for a
+	// client to a Service this is the ClusterIP tuple — the same key as every
+	// other socket hook). skb granularity: one retransmitted skb may be a GSO
+	// aggregate of several wire segments, so these are NOT wire-packet
+	// counts. Null (not 0) when the tracepoint was unavailable; a present 0
+	// means the hook was attached and observed no retransmissions. The peer
+	// (dst->src) direction is NOT observable from this hook: peer fields are
+	// always null/false, and local values are never copied into them. Only a
+	// downstream cohort that knows the local end is the active initiator may
+	// read local retrans as an approximation of src->dst retransmissions.
+	LocalRetransSKBCount  *uint64 `json:"local_retrans_skb_count"`
+	LocalRetransSKBBytes  *uint64 `json:"local_retrans_skb_bytes"`
+	LocalRetransAvailable bool    `json:"local_retrans_available"`
+	LocalRetransSource    string  `json:"local_retrans_source"`   // "tcp_retransmit_skb" | "mock" | ""
+	PeerRetransSKBCount   *uint64 `json:"peer_retrans_skb_count"` // always null
+	PeerRetransSKBBytes   *uint64 `json:"peer_retrans_skb_bytes"` // always null
+	PeerRetransAvailable  bool    `json:"peer_retrans_available"` // always false
+
+	// Derived rates over the whole session duration from the syscall-level
+	// byte counters. bytes_per_second_* is BYTES/s; throughput_bps_* is
+	// BITS/s (×8). Null when duration <= 0 or traffic accounting is
+	// unavailable; a genuine 0 is possible for a zero-byte direction.
+	BytesPerSecondOut *float64 `json:"bytes_per_second_out"`
+	BytesPerSecondIn  *float64 `json:"bytes_per_second_in"`
+	ThroughputBpsOut  *float64 `json:"throughput_bps_out"`
+	ThroughputBpsIn   *float64 `json:"throughput_bps_in"`
 
 	ProtocolGuess            string            `json:"protocol_guess"`
 	IsTLSLike                bool              `json:"is_tls_like"`
@@ -141,6 +262,38 @@ type Record struct {
 	SrcMappingConfidence string `json:"src_mapping_confidence"`
 	DstMappingConfidence string `json:"dst_mapping_confidence"`
 	MappingMethod        string `json:"mapping_method"`
+
+	// --- v1alpha4 source-identity snapshot contract ---
+	// The source identity above is the connection generation's FROZEN
+	// snapshot (resolved near establishment), not an emission-time lookup.
+	// SrcIdentityFrozen: the snapshot is final for this generation (resolved,
+	// terminally missing, or retry budget spent). SrcIdentityObservedTime is
+	// when the resolution that produced these fields ran. A missing pod
+	// identity keeps an explicit SrcIdentityMissingReason and is NEVER
+	// substituted with IP or name. SrcRevisionSource says how src_revision
+	// was derived ("replicaset_revision" / "controller_revision_hash" /
+	// "pod_template_hash" / "not_applicable" / "unavailable") — src_revision
+	// is bound to the POD's own rollout, never the controller's latest.
+	// SrcIdentityResolutionMethod is the SOURCE-only resolution path
+	// ("cgroup_id" | "pod_ip" | "host_netns" | "external" | "informer_miss" |
+	// "unknown"). It must be read for source provenance instead of
+	// mapping_method: that field is record-level and reports the
+	// DESTINATION's method whenever the source did not resolve via cgroup_id.
+	SrcIdentityResolutionMethod string `json:"src_identity_resolution_method"`
+	SrcIdentityFrozen           bool   `json:"src_identity_frozen"`
+	SrcIdentityObservedTime  string `json:"src_identity_observed_time"`
+	SrcIdentityAttempts      uint64 `json:"src_identity_attempts"`
+	SrcIdentityMissingReason string `json:"src_identity_missing_reason"`
+	SrcRevisionSource        string `json:"src_revision_source"`
+	// Constructibility of the history-state keys from THIS record:
+	// G1 = src_ip (always present), G2 = pod UID, G3 = namespace + top-level
+	// controller kind + controller UID, G4 = G3 + rollout revision
+	// (revision_source "not_applicable" still counts as constructible: the
+	// workload kind has no rollout dimension and the G4 key degenerates to
+	// G3 deterministically).
+	SrcKeyG2Available bool `json:"src_key_g2_available"`
+	SrcKeyG3Available bool `json:"src_key_g3_available"`
+	SrcKeyG4Available bool `json:"src_key_g4_available"`
 
 	// C11: explicit resolution status enums (resolved / service_only /
 	// host_network / kube_system / informer_miss / external / unknown) so
@@ -505,6 +658,21 @@ func BuildRecordWithContext(session sessionizer.FlowSession, resolved identity.R
 	if srcCgroupID == 0 {
 		srcCgroupID = session.CgroupID
 	}
+	isWindow := recordType == "window_summary"
+	srcKeyG2 := resolved.Src.PodUID != ""
+	srcKeyG3 := resolved.Src.Namespace != "" && resolved.Src.WorkloadKind != "" && resolved.Src.WorkloadUID != ""
+	srcKeyG4 := srcKeyG3 && (resolved.Src.Revision != "" ||
+		session.SourceIdentity.RevisionSource == k8smeta.RevisionSourceNotApplicable)
+	counterSemantics := "lifetime_cumulative"
+	if isWindow {
+		counterSemantics = "window_delta"
+	}
+	// Rates on a window record cover the window's data span, not the whole
+	// connection; on lifetime records they keep the whole-session duration.
+	rateDurationMS := session.DurationMS
+	if isWindow && !session.WindowStartTime.IsZero() {
+		rateDurationMS = session.EndTime.Sub(session.WindowStartTime).Milliseconds()
+	}
 
 	return Record{
 		SchemaVersion:  features.SchemaVersion,
@@ -519,8 +687,15 @@ func BuildRecordWithContext(session sessionizer.FlowSession, resolved identity.R
 		ExperimentID:   labels.ExperimentID,
 		ScenarioLabel:  labels.ScenarioLabel,
 
-		FlowID:        session.FlowID,
-		WindowID:      session.WindowID,
+		FlowID:   session.FlowID,
+		WindowID: session.WindowID,
+
+		CounterSemantics:    counterSemantics,
+		WindowValid:         isWindow && session.WindowValid,
+		WindowInvalidReason: session.WindowInvalidReason,
+		CounterEpoch:        session.CounterEpoch,
+		FinalWindow:         isWindow && session.FinalWindow,
+		WindowStartTime:     formatTime(session.WindowStartTime),
 		SrcIP:         session.SrcIP,
 		SrcPort:       session.SrcPort,
 		DstIP:         session.DstIP,
@@ -569,6 +744,55 @@ func BuildRecordWithContext(session sessionizer.FlowSession, resolved identity.R
 		TrafficAccountingAvailable: snapshot.TrafficAccountingAvailable,
 		PacketTimingAvailable:      snapshot.PacketTimingAvailable,
 		TCPMetricsAvailable:        snapshot.TCPMetricsAvailable,
+
+		ObservedSKBPacketsOut:       session.ObservedSKBPacketsOut,
+		ObservedSKBPacketsIn:        session.ObservedSKBPacketsIn,
+		ObservedSKBPacketsTotal:     session.ObservedSKBPacketsOut + session.ObservedSKBPacketsIn,
+		ObservedSKBPacketsAvailable: session.ObservedSKBPacketsAvailable,
+		ObservedSKBPacketsSource:    session.ObservedSKBPacketsSource,
+
+		CounterResetDetected: session.CounterResetDetected || snapshot.CounterResetDetected,
+		CounterResetCount:    session.CounterResetCount + snapshot.CounterResetCount,
+
+		IPTTLMin:       session.IPTTLMin,
+		IPTTLMax:       session.IPTTLMax,
+		IPTTLAvailable: session.IPTTLMin != nil,
+
+		// Availability comes from the per-direction header-observed witness,
+		// never from the flag/window VALUES: an observed direction with
+		// flags==0 (TCP NULL scan) or window==0 serializes a genuine 0, an
+		// unobserved direction serializes null.
+		TCPFlagsAll:       flagsIfObserved(session.TCPFlagsOut|session.TCPFlagsIn, session.TCPHeaderObservedOut || session.TCPHeaderObservedIn),
+		TCPFlagsOut:       flagsIfObserved(session.TCPFlagsOut, session.TCPHeaderObservedOut),
+		TCPFlagsIn:        flagsIfObserved(session.TCPFlagsIn, session.TCPHeaderObservedIn),
+		TCPFlagsAvailable: session.TCPHeaderObservedOut || session.TCPHeaderObservedIn,
+
+		TCPWindowMaxOut:    session.TCPWindowMaxOut,
+		TCPWindowMaxIn:     session.TCPWindowMaxIn,
+		TCPWindowAvailable: session.TCPWindowMaxOut != nil || session.TCPWindowMaxIn != nil,
+
+		DirectionDurationOutMS:     durationMSIfObserved(session.DirectionDurationOutNS, session.DirectionDurationOutObserved),
+		DirectionDurationInMS:      durationMSIfObserved(session.DirectionDurationInNS, session.DirectionDurationInObserved),
+		DirectionDurationAvailable: session.DirectionDurationOutObserved || session.DirectionDurationInObserved,
+
+		IPPktLenMin:       session.IPPktLenMin,
+		IPPktLenMax:       session.IPPktLenMax,
+		IPPktLenAvailable: session.IPPktLenMin != nil,
+
+		NetFlowV2IPSizeHistogram:          snapshot.NetFlowV2IPSizeHistogram,
+		NetFlowV2IPSizeHistogramAvailable: snapshot.NetFlowV2IPSizeHistogramAvailable,
+
+		LocalRetransSKBCount:  counterIfAvailable(session.LocalRetransSKBCount, session.LocalRetransAvailable),
+		LocalRetransSKBBytes:  counterIfAvailable(session.LocalRetransSKBBytes, session.LocalRetransAvailable),
+		LocalRetransAvailable: session.LocalRetransAvailable,
+		LocalRetransSource:    session.LocalRetransSource,
+		// PeerRetrans* deliberately stay zero-valued (null/false): remote-side
+		// retransmissions are unobservable from local hooks.
+
+		BytesPerSecondOut: rateBytesPerSecond(session.BytesOut, rateDurationMS, snapshot.TrafficAccountingAvailable),
+		BytesPerSecondIn:  rateBytesPerSecond(session.BytesIn, rateDurationMS, snapshot.TrafficAccountingAvailable),
+		ThroughputBpsOut:  rateBitsPerSecond(session.BytesOut, rateDurationMS, snapshot.TrafficAccountingAvailable),
+		ThroughputBpsIn:   rateBitsPerSecond(session.BytesIn, rateDurationMS, snapshot.TrafficAccountingAvailable),
 
 		ProtocolGuess:            protocolGuess,
 		IsTLSLike:                isTLSLike,
@@ -630,6 +854,16 @@ func BuildRecordWithContext(session sessionizer.FlowSession, resolved identity.R
 		DstMappingConfidence: resolved.Dst.Confidence,
 		MappingMethod:        resolved.MappingMethod,
 
+		SrcIdentityResolutionMethod: resolved.Src.Method,
+		SrcIdentityFrozen:           session.SourceIdentity.Frozen,
+		SrcIdentityObservedTime:  formatTime(session.SourceIdentity.ObservedAt),
+		SrcIdentityAttempts:      session.SourceIdentity.Attempts,
+		SrcIdentityMissingReason: session.SourceIdentity.MissingReason,
+		SrcRevisionSource:        session.SourceIdentity.RevisionSource,
+		SrcKeyG2Available:        srcKeyG2,
+		SrcKeyG3Available:        srcKeyG3,
+		SrcKeyG4Available:        srcKeyG4,
+
 		SrcIdentityResolutionStatus: firstNonEmpty(resolved.Src.ResolutionStatus, identity.ResolutionStatusUnknown),
 		DstIdentityResolutionStatus: firstNonEmpty(resolved.Dst.ResolutionStatus, identity.ResolutionStatusUnknown),
 
@@ -668,6 +902,59 @@ func BuildRecordWithContext(session sessionizer.FlowSession, resolved identity.R
 		LoadLevel:        labels.LoadLevel,
 		PodRestartWindow: resolved.PodRestartWindow,
 	}
+}
+
+// counterIfAvailable serializes a cumulative counter whose validity depends on
+// a hook having been attached: null when unavailable (0 must never impersonate
+// "confirmed none"), a genuine value — possibly 0 — when available.
+func counterIfAvailable(v uint64, available bool) *uint64 {
+	if !available {
+		return nil
+	}
+	return &v
+}
+
+// flagsIfObserved serializes a TCP flag OR-mask gated on the header-observed
+// witness: null when no TCP header was ever read (observed=false), otherwise
+// the mask — including a genuine 0 for flows whose every observed segment
+// carried an all-zero flag byte (TCP NULL scan). Availability must never be
+// inferred from the mask value itself.
+func flagsIfObserved(flags uint32, observed bool) *uint32 {
+	if !observed {
+		return nil
+	}
+	return &flags
+}
+
+// durationMSIfObserved converts a per-direction active span to milliseconds.
+// One observed packet is a genuine 0 ms; a never-observed direction is null.
+func durationMSIfObserved(durationNS uint64, observed bool) *uint64 {
+	if !observed {
+		return nil
+	}
+	v := durationNS / 1_000_000
+	return &v
+}
+
+// rateBytesPerSecond is BYTES per second over the whole session duration;
+// rateBitsPerSecond is the same quantity in BITS per second (×8). Both are
+// null when the duration is not positive or traffic accounting is
+// unavailable — division by a zero duration is never performed.
+func rateBytesPerSecond(bytes uint64, durationMS int64, accountingAvailable bool) *float64 {
+	if durationMS <= 0 || !accountingAvailable {
+		return nil
+	}
+	v := float64(bytes) / (float64(durationMS) / 1000.0)
+	return &v
+}
+
+func rateBitsPerSecond(bytes uint64, durationMS int64, accountingAvailable bool) *float64 {
+	perSecond := rateBytesPerSecond(bytes, durationMS, accountingAvailable)
+	if perSecond == nil {
+		return nil
+	}
+	v := *perSecond * 8
+	return &v
 }
 
 func samplingRate(v float64) float64 {

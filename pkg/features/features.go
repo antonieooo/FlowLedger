@@ -11,8 +11,20 @@ import (
 )
 
 const (
-	SchemaVersion     = "v1alpha2"
-	FeatureSetVersion = "flowledger-fast-features-v0"
+	// v1alpha4: window_summary records carry PER-WINDOW DELTAS (current
+	// cumulative snapshot minus the previous accepted baseline) instead of
+	// lifetime cumulative copies; session_summary stays lifetime-cumulative as
+	// a diagnostic record. Records self-describe via counter_semantics /
+	// window_valid / window_invalid_reason / counter_epoch / final_window (see
+	// docs/schema-v1alpha4.md). v1alpha3 fixed the cumulative-snapshot
+	// double-counting present in v1alpha2 and exported cgroup_skb-observed skb
+	// packet counts (docs/schema-v1alpha3.md, "Migration from v1alpha2").
+	SchemaVersion = "v1alpha4"
+	// Bumped alongside the schema: window records' histogram/idle/burst/
+	// SYN/FIN/RST/byte features are now fixed-window increments, not
+	// lifetime-cumulative values, so their distributions are not comparable
+	// with v1 windows.
+	FeatureSetVersion = "flowledger-fast-features-v2"
 
 	Unknown = "unknown"
 
@@ -38,6 +50,51 @@ var IATHistogramBuckets = []string{
 	">1000000",
 }
 
+// NetFlowV2IPSizeBuckets are the NetFlow-v2 edge labels for the
+// ntohs(ip.tot_len) histogram counted at cgroup_skb over both directions.
+// ">1514" is the overflow bucket (mostly GSO/GRO aggregates); an Anomal-E
+// adapter selects only the first five buckets and must report overflow
+// separately, never folded into "1025-1514". Kept separate from
+// PacketSizeHistogramBuckets, whose 63/127/... edges do not line up.
+var NetFlowV2IPSizeBuckets = []string{
+	"<=128",
+	"129-256",
+	"257-512",
+	"513-1024",
+	"1025-1514",
+	">1514",
+}
+
+// NetFlowV2IPSizeBucket is the unit-tested Go mirror of the BPF
+// nf_ip_size_bucket() function (bpf/flow_events.bpf.c); the edges MUST stay
+// identical. Used by mock/delta paths and by the boundary tests.
+func NetFlowV2IPSizeBucket(totLen uint64) string {
+	switch {
+	case totLen <= 128:
+		return "<=128"
+	case totLen <= 256:
+		return "129-256"
+	case totLen <= 512:
+		return "257-512"
+	case totLen <= 1024:
+		return "513-1024"
+	case totLen <= 1514:
+		return "1025-1514"
+	default:
+		return ">1514"
+	}
+}
+
+// EmptyNetFlowV2IPSizeHistogram returns an all-zero histogram with every
+// NetFlow-v2 bucket present.
+func EmptyNetFlowV2IPSizeHistogram() map[string]uint64 {
+	out := make(map[string]uint64, len(NetFlowV2IPSizeBuckets))
+	for _, bucket := range NetFlowV2IPSizeBuckets {
+		out[bucket] = 0
+	}
+	return out
+}
+
 type Snapshot struct {
 	BytesTotal   uint64
 	PacketsTotal uint64
@@ -57,7 +114,7 @@ type Snapshot struct {
 	IATMean      *float64 // L18/B: histogram-derived population mean approximation
 	IATP50       *float64
 	IATP95       *float64
-	IATStd       *float64 // exact for raw samples; histogram-approximation when only histogram has data
+	IATStd       *float64          // exact for raw samples; histogram-approximation when only histogram has data
 	IATHistogram map[string]uint64 // Node-model Phase0: raw IAT bucket counts so consumers can compute KL divergence / Wasserstein vs a baseline distribution
 	IdleGapCount uint64
 	BurstCount   uint64
@@ -75,6 +132,17 @@ type Snapshot struct {
 	PacketTimingAvailable      bool
 	TCPMetricsAvailable        bool
 	IsLongLived                bool
+
+	// True when a cumulative counter regressed (kernel map entry evicted and
+	// re-created mid-flow, or agent restart). The pre-reset maxima are kept;
+	// pre- and post-reset values are never summed.
+	CounterResetDetected bool
+	CounterResetCount    uint64
+
+	// v1alpha3 P1: NetFlow-v2 edge histogram over ntohs(ip.tot_len). Nil (and
+	// Available=false) when no IP length was ever observed.
+	NetFlowV2IPSizeHistogram          map[string]uint64
+	NetFlowV2IPSizeHistogramAvailable bool
 }
 
 type Accumulator struct {
@@ -94,6 +162,27 @@ type Accumulator struct {
 	rstCount         uint64
 	retransCount     uint64
 	rttEstimateUS    *uint64
+
+	// Cumulative-snapshot state (events with CounterSemantics=="cumulative",
+	// i.e. eBPF mode). Each event carries the flow's counters since flow
+	// start: histograms are REPLACED by the latest complete snapshot and
+	// scalar counters keep the latest monotonic value. Summing repeated
+	// snapshots — the v1alpha2 behaviour — inflated histogram/idle/burst/SYN
+	// counts roughly quadratically with flow age.
+	cumPacketSizeHistogram map[string]uint64
+	cumIATHistogram        map[string]uint64
+	cumIdleGapCount        uint64
+	cumBurstCount          uint64
+	cumSYNCount            uint64
+	cumFINCount            uint64
+	cumRSTCount            uint64
+	counterResetCount      uint64
+
+	// NetFlow-v2 IP size histogram: delta events sum per bucket; cumulative
+	// events replace with the latest complete snapshot (same rules as the
+	// packet-size/IAT histograms).
+	netflowIPSizeHistogram    map[string]uint64
+	cumNetflowIPSizeHistogram map[string]uint64
 
 	trafficAccountingAvailable bool
 	packetTimingAvailable      bool
@@ -116,9 +205,28 @@ func (a *Accumulator) AddEvent(ev collector.FlowEvent) {
 
 	a.packetSizes = append(a.packetSizes, ev.PacketSizes...)
 	a.iatMicros = append(a.iatMicros, ev.IATMicros...)
+	// min/max are global envelopes; correct for both semantics.
+	a.updatePacketSizeMinMax(ev.PktSizeMin, ev.PktSizeMax)
+	if ev.RTTEstimateUS > 0 {
+		v := ev.RTTEstimateUS
+		a.rttEstimateUS = &v
+	}
+
+	if ev.CounterSemantics == collector.CounterSemanticsCumulative {
+		a.addCumulativeEvent(ev)
+		return
+	}
+
+	// Delta (mock) semantics: per-event increments are summed, exactly as in
+	// v1alpha2.
 	a.mergePacketSizeHistogram(ev.PacketSizeHistogram)
 	a.mergeIATHistogram(ev.IATHistogram)
-	a.updatePacketSizeMinMax(ev.PktSizeMin, ev.PktSizeMax)
+	if len(ev.NetFlowV2IPSizeHistogram) > 0 {
+		if a.netflowIPSizeHistogram == nil {
+			a.netflowIPSizeHistogram = EmptyNetFlowV2IPSizeHistogram()
+		}
+		mergeHistogram(a.netflowIPSizeHistogram, ev.NetFlowV2IPSizeHistogram)
+	}
 	a.idleGapCount += ev.IdleGapCount
 	a.burstCount += ev.BurstCount
 	a.directionChanges += ev.DirectionChanges
@@ -126,17 +234,70 @@ func (a *Accumulator) AddEvent(ev collector.FlowEvent) {
 	a.finCount += ev.FINCount
 	a.rstCount += ev.RSTCount
 	a.retransCount += ev.RetransCount
-	if ev.RTTEstimateUS > 0 {
-		v := ev.RTTEstimateUS
-		a.rttEstimateUS = &v
-	}
 
+	// Legacy mock semantics: lifecycle events imply one SYN / one FIN.
+	// Cumulative (eBPF) events never reach this: the BPF program already
+	// counts these transitions, and adding them again here was the v1alpha2
+	// SYN/FIN double count.
 	switch strings.ToUpper(ev.EventType) {
 	case "CONNECT", "ACCEPT":
 		a.synCount++
 	case "CLOSE":
 		a.finCount++
 	}
+}
+
+// addCumulativeEvent merges one cumulative snapshot: histograms are replaced
+// by the latest complete snapshot (never bucket-summed) and scalar counters
+// keep the latest monotonic value. A regression (new value below the stored
+// one) means the kernel-side accumulator was reset (LRU eviction + re-create,
+// agent restart); it is recorded in counterResetCount and the pre-reset value
+// is kept — pre- and post-reset values are never summed. A zero counter is
+// "not provided" (e.g. a CLOSE emitted after the map entry vanished), not a
+// reset.
+func (a *Accumulator) addCumulativeEvent(ev collector.FlowEvent) {
+	if len(ev.PacketSizeHistogram) > 0 {
+		a.cumPacketSizeHistogram = copyHistogram(ev.PacketSizeHistogram)
+	}
+	if len(ev.IATHistogram) > 0 {
+		a.cumIATHistogram = copyHistogram(ev.IATHistogram)
+	}
+	if len(ev.NetFlowV2IPSizeHistogram) > 0 {
+		a.cumNetflowIPSizeHistogram = copyHistogram(ev.NetFlowV2IPSizeHistogram)
+	}
+	reset := false
+	a.cumIdleGapCount = latestMonotonic(a.cumIdleGapCount, ev.IdleGapCount, &reset)
+	a.cumBurstCount = latestMonotonic(a.cumBurstCount, ev.BurstCount, &reset)
+	a.cumSYNCount = latestMonotonic(a.cumSYNCount, ev.SYNCount, &reset)
+	a.cumFINCount = latestMonotonic(a.cumFINCount, ev.FINCount, &reset)
+	a.cumRSTCount = latestMonotonic(a.cumRSTCount, ev.RSTCount, &reset)
+	a.directionChanges = latestMonotonic(a.directionChanges, ev.DirectionChanges, &reset)
+	a.retransCount = latestMonotonic(a.retransCount, ev.RetransCount, &reset)
+	if reset {
+		a.counterResetCount++
+	}
+}
+
+// latestMonotonic returns the latest cumulative value under the monotonicity
+// constraint: increases are taken, a regression keeps the previous value and
+// flags *reset, and zero means "not provided" and is ignored.
+func latestMonotonic(prev, next uint64, reset *bool) uint64 {
+	if next == 0 {
+		return prev
+	}
+	if next < prev {
+		*reset = true
+		return prev
+	}
+	return next
+}
+
+func copyHistogram(src map[string]uint64) map[string]uint64 {
+	out := make(map[string]uint64, len(src))
+	for bucket, count := range src {
+		out[bucket] = count
+	}
+	return out
 }
 
 func (a *Accumulator) Snapshot(bytesOut, bytesIn, packetsOut, packetsIn uint64, duration time.Duration, longLivedThreshold time.Duration) Snapshot {
@@ -148,12 +309,23 @@ func (a *Accumulator) Snapshot(bytesOut, bytesIn, packetsOut, packetsIn uint64, 
 		histogram[PacketSizeBucket(size)]++
 	}
 	mergeHistogram(histogram, a.packetSizeHistogram)
+	// The cumulative state already holds the latest complete snapshot, so it
+	// contributes its totals exactly once.
+	mergeHistogram(histogram, a.cumPacketSizeHistogram)
 
 	iatHistogram := EmptyIATHistogram()
 	for _, iat := range a.iatMicros {
 		iatHistogram[IATBucket(iat)]++
 	}
 	mergeHistogram(iatHistogram, a.iatHistogram)
+	mergeHistogram(iatHistogram, a.cumIATHistogram)
+
+	var netflowHistogram map[string]uint64
+	if histogramHasData(a.netflowIPSizeHistogram) || histogramHasData(a.cumNetflowIPSizeHistogram) {
+		netflowHistogram = EmptyNetFlowV2IPSizeHistogram()
+		mergeHistogram(netflowHistogram, a.netflowIPSizeHistogram)
+		mergeHistogram(netflowHistogram, a.cumNetflowIPSizeHistogram)
+	}
 
 	bytesTotal := bytesOut + bytesIn
 	packetsTotal := packetsOut + packetsIn
@@ -174,7 +346,7 @@ func (a *Accumulator) Snapshot(bytesOut, bytesIn, packetsOut, packetsIn uint64, 
 	pktSizeP95 := percentileUint64(packetSizes, 95)
 	pktSizeMean := meanUint64(packetSizes)
 	pktSizeStd := stddevUint64(packetSizes)
-	if histogramHasData(a.packetSizeHistogram) {
+	if histogramHasData(a.packetSizeHistogram) || histogramHasData(a.cumPacketSizeHistogram) {
 		// Percentiles from eBPF histograms are estimates; exact raw packet
 		// length sequences are deliberately not retained in eBPF mode.
 		pktSizeP50 = estimateHistogramPercentile(histogram, packetSizeBucketBounds(), 50)
@@ -194,7 +366,7 @@ func (a *Accumulator) Snapshot(bytesOut, bytesIn, packetsOut, packetsIn uint64, 
 	iatP95 := percentileUint64(iatMicros, 95)
 	iatStd := stddevUint64(iatMicros)
 	iatMean := meanUint64(iatMicros)
-	if histogramHasData(a.iatHistogram) {
+	if histogramHasData(a.iatHistogram) || histogramHasData(a.cumIATHistogram) {
 		// IAT percentiles from cgroup_skb are histogram estimates. Standard
 		// deviation can be approximated from bucket midpoints; the error is
 		// bounded by ~half the widest bucket width and is acceptable for the
@@ -227,15 +399,15 @@ func (a *Accumulator) Snapshot(bytesOut, bytesIn, packetsOut, packetsIn uint64, 
 		IATP95:       iatP95,
 		IATStd:       iatStd,
 		IATHistogram: iatHistogram,
-		IdleGapCount: countAbove(iatMicros, 1_000_000) + a.idleGapCount,
-		BurstCount:   countBelow(iatMicros, 10_000) + a.burstCount,
+		IdleGapCount: countAbove(iatMicros, 1_000_000) + a.idleGapCount + a.cumIdleGapCount,
+		BurstCount:   countBelow(iatMicros, 10_000) + a.burstCount + a.cumBurstCount,
 
 		ByteRate:   Rate(bytesTotal, duration),
 		PacketRate: Rate(packetsTotal, duration),
 
-		SYNCount:      a.synCount,
-		FINCount:      a.finCount,
-		RSTCount:      a.rstCount,
+		SYNCount:      a.synCount + a.cumSYNCount,
+		FINCount:      a.finCount + a.cumFINCount,
+		RSTCount:      a.rstCount + a.cumRSTCount,
 		RetransCount:  a.retransCount,
 		RTTEstimateUS: a.rttEstimateUS,
 
@@ -243,6 +415,141 @@ func (a *Accumulator) Snapshot(bytesOut, bytesIn, packetsOut, packetsIn uint64, 
 		PacketTimingAvailable:      a.packetTimingAvailable,
 		TCPMetricsAvailable:        a.tcpMetricsAvailable,
 		IsLongLived:                duration >= longLivedThreshold,
+
+		CounterResetDetected: a.counterResetCount > 0,
+		CounterResetCount:    a.counterResetCount,
+
+		NetFlowV2IPSizeHistogram:          netflowHistogram,
+		NetFlowV2IPSizeHistogramAvailable: netflowHistogram != nil,
+	}
+}
+
+// SubtractHistogram returns the per-bucket difference cur-base of two
+// cumulative histograms. regressed reports whether any bucket went backwards
+// (cur below base, or a base bucket missing from cur) — the signature of a
+// kernel-side counter reset. Regressed buckets are clamped to 0, never
+// underflowed; callers must treat the whole window as invalid when regressed.
+func SubtractHistogram(cur, base map[string]uint64) (map[string]uint64, bool) {
+	out := make(map[string]uint64, len(cur))
+	regressed := false
+	for bucket, v := range cur {
+		b := base[bucket]
+		if v < b {
+			regressed = true
+			out[bucket] = 0
+			continue
+		}
+		out[bucket] = v - b
+	}
+	for bucket, b := range base {
+		if _, ok := cur[bucket]; !ok && b > 0 {
+			regressed = true
+			out[bucket] = 0
+		}
+	}
+	return out, regressed
+}
+
+// WindowCounterDeltas are the additive counters of one fixed window: every
+// field is a current-minus-baseline difference computed by the sessionizer.
+// Histogram maps are already differenced per bucket; NetFlowV2IPSizeHistogram
+// is nil when the signal was never observed.
+type WindowCounterDeltas struct {
+	BytesOut, BytesIn        uint64
+	PacketsOut, PacketsIn    uint64
+	IdleGapCount, BurstCount uint64
+	SYNCount                 uint64
+	FINCount                 uint64
+	RSTCount                 uint64
+	RetransCount             uint64
+	DirectionChanges         uint64
+	PktSizeHistogram         map[string]uint64
+	IATHistogram             map[string]uint64
+	NetFlowV2IPSizeHistogram map[string]uint64
+}
+
+// WindowSnapshot builds the feature snapshot of one window-delta record.
+// Additive counters and histograms come from the differenced deltas and the
+// distribution stats are recomputed from the DELTA histograms; rates use the
+// window duration. Non-additive context is carried from the lifetime
+// snapshot unchanged: availability flags, IsLongLived, the RTT gauge, reset
+// diagnostics, and the pkt_size_min/max envelope — the kernel only keeps a
+// lifetime envelope, so window records must not present it as per-window.
+func WindowSnapshot(lifetime Snapshot, d WindowCounterDeltas, windowDuration time.Duration) Snapshot {
+	pktHist := d.PktSizeHistogram
+	if pktHist == nil {
+		pktHist = EmptyPacketSizeHistogram()
+	}
+	iatHist := d.IATHistogram
+	if iatHist == nil {
+		iatHist = EmptyIATHistogram()
+	}
+
+	var pktMean, pktP50, pktP95, pktStd *float64
+	if histogramHasData(pktHist) {
+		pktP50 = estimateHistogramPercentile(pktHist, packetSizeBucketBounds(), 50)
+		pktP95 = estimateHistogramPercentile(pktHist, packetSizeBucketBounds(), 95)
+		pktMean = estimateHistogramMean(pktHist, packetSizeBucketBounds())
+		pktStd = estimateHistogramStddev(pktHist, packetSizeBucketBounds())
+		// Estimates stay inside the lifetime envelope; the true window
+		// envelope is unknown (kernel keeps only lifetime min/max).
+		clampFloatPtr(pktP50, lifetime.PktSizeMin, lifetime.PktSizeMax)
+		clampFloatPtr(pktP95, lifetime.PktSizeMin, lifetime.PktSizeMax)
+		clampFloatPtr(pktMean, lifetime.PktSizeMin, lifetime.PktSizeMax)
+	}
+	var iatMean, iatP50, iatP95, iatStd *float64
+	if histogramHasData(iatHist) {
+		iatP50 = estimateHistogramPercentile(iatHist, iatBucketBounds(), 50)
+		iatP95 = estimateHistogramPercentile(iatHist, iatBucketBounds(), 95)
+		iatMean = estimateHistogramMean(iatHist, iatBucketBounds())
+		iatStd = estimateHistogramStddev(iatHist, iatBucketBounds())
+	}
+
+	bytesTotal := d.BytesOut + d.BytesIn
+	packetsTotal := d.PacketsOut + d.PacketsIn
+	return Snapshot{
+		BytesTotal:   bytesTotal,
+		PacketsTotal: packetsTotal,
+
+		ByteRatioOutIn:   SafeRatio(d.BytesOut, d.BytesIn),
+		PacketRatioOutIn: SafeRatio(d.PacketsOut, d.PacketsIn),
+		DirectionChanges: d.DirectionChanges,
+
+		PktSizeMin:       lifetime.PktSizeMin,
+		PktSizeMax:       lifetime.PktSizeMax,
+		PktSizeMean:      pktMean,
+		PktSizeP50:       pktP50,
+		PktSizeP95:       pktP95,
+		PktSizeStd:       pktStd,
+		PktSizeHistogram: pktHist,
+
+		IATMean:      iatMean,
+		IATP50:       iatP50,
+		IATP95:       iatP95,
+		IATStd:       iatStd,
+		IATHistogram: iatHist,
+		IdleGapCount: d.IdleGapCount,
+		BurstCount:   d.BurstCount,
+
+		ByteRate:   Rate(bytesTotal, windowDuration),
+		PacketRate: Rate(packetsTotal, windowDuration),
+
+		SYNCount:      d.SYNCount,
+		FINCount:      d.FINCount,
+		RSTCount:      d.RSTCount,
+		RetransCount:  d.RetransCount,
+		RTTEstimateUS: lifetime.RTTEstimateUS,
+
+		TrafficAccountingAvailable: lifetime.TrafficAccountingAvailable,
+		PacketTimingAvailable:      lifetime.PacketTimingAvailable,
+		TCPMetricsAvailable:        lifetime.TCPMetricsAvailable,
+		IsLongLived:                lifetime.IsLongLived,
+
+		CounterResetDetected: lifetime.CounterResetDetected,
+		CounterResetCount:    lifetime.CounterResetCount,
+
+		NetFlowV2IPSizeHistogram:          d.NetFlowV2IPSizeHistogram,
+		NetFlowV2IPSizeHistogramAvailable: d.NetFlowV2IPSizeHistogram != nil,
 	}
 }
 

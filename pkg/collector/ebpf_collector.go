@@ -18,6 +18,12 @@ type EBPFOptions struct {
 	EnablePacketTiming        bool
 	EnablePacketHistogram     bool
 	EnableTLSHandshakeInspect bool
+	EnableHeaderAggregates    bool
+	EnableNetFlowV2Histogram  bool
+	OnRetransAttach           func(attached bool)
+	MapStatsInterval          time.Duration
+	OnMapOccupancy            func(samples []EBPFMapOccupancy)
+	OnMapWalkError            func(mapName string, err error)
 }
 
 func NewEBPFCollector() *EBPFCollector {

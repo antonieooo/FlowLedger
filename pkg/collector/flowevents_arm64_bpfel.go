@@ -14,7 +14,9 @@ import (
 
 type flowEventsFlowConfig struct {
 	TlsHandshakeInspectEnabled uint8
-	Pad                        [7]uint8
+	CollectHeaderAggregates    uint8
+	CollectNetflowV2Histogram  uint8
+	Pad                        [5]uint8
 }
 
 type flowEventsFlowKey struct {
@@ -47,17 +49,31 @@ type flowEventsFlowStats struct {
 	RealPacketsRecv            uint64
 	LastPacketNsSent           uint64
 	LastPacketNsRecv           uint64
+	FirstPacketNsSent          uint64
+	FirstPacketNsRecv          uint64
+	NfIpSizeBuckets            [6]uint64
+	RetransSkbCount            uint64
+	RetransSkbBytes            uint64
 	SynCount                   uint32
 	FinCount                   uint32
 	RstCount                   uint32
+	TcpFlagsOrSent             uint32
+	TcpFlagsOrRecv             uint32
+	TcpWinMaxSent              uint16
+	TcpWinMaxRecv              uint16
+	IpPktLenMin                uint16
+	IpPktLenMax                uint16
+	IpTtlMin                   uint8
+	IpTtlMax                   uint8
 	CloseSeen                  uint8
 	ClientHelloInspected       uint8
 	ServerHelloInspected       uint8
 	TrafficAccountingAvailable uint8
 	PacketTimingAvailable      uint8
 	TcpMetricsAvailable        uint8
+	TcpHeaderObservedSent      uint8
+	TcpHeaderObservedRecv      uint8
 	Pad1                       [2]uint8
-	_                          [4]byte
 }
 
 type flowEventsLocalEp struct {
@@ -112,6 +128,7 @@ type flowEventsProgramSpecs struct {
 	HandleInetSockSetState *ebpf.ProgramSpec `ebpf:"handle_inet_sock_set_state"`
 	HandleTcpRecvmsgEntry  *ebpf.ProgramSpec `ebpf:"handle_tcp_recvmsg_entry"`
 	HandleTcpRecvmsgReturn *ebpf.ProgramSpec `ebpf:"handle_tcp_recvmsg_return"`
+	HandleTcpRetransmitSkb *ebpf.ProgramSpec `ebpf:"handle_tcp_retransmit_skb"`
 	HandleTcpSendmsg       *ebpf.ProgramSpec `ebpf:"handle_tcp_sendmsg"`
 }
 
@@ -180,6 +197,7 @@ type flowEventsPrograms struct {
 	HandleInetSockSetState *ebpf.Program `ebpf:"handle_inet_sock_set_state"`
 	HandleTcpRecvmsgEntry  *ebpf.Program `ebpf:"handle_tcp_recvmsg_entry"`
 	HandleTcpRecvmsgReturn *ebpf.Program `ebpf:"handle_tcp_recvmsg_return"`
+	HandleTcpRetransmitSkb *ebpf.Program `ebpf:"handle_tcp_retransmit_skb"`
 	HandleTcpSendmsg       *ebpf.Program `ebpf:"handle_tcp_sendmsg"`
 }
 
@@ -190,6 +208,7 @@ func (p *flowEventsPrograms) Close() error {
 		p.HandleInetSockSetState,
 		p.HandleTcpRecvmsgEntry,
 		p.HandleTcpRecvmsgReturn,
+		p.HandleTcpRetransmitSkb,
 		p.HandleTcpSendmsg,
 	)
 }

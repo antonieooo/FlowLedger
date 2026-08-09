@@ -55,6 +55,9 @@ type config struct {
 	ebpfEnablePacketTiming        bool
 	ebpfEnablePacketHistogram     bool
 	ebpfEnableTLSHandshakeInspect bool
+	ebpfEnableHeaderAggregates    bool
+	ebpfEnableNetFlowV2Histogram  bool
+	ebpfMapStatsInterval          time.Duration
 }
 
 func main() {
@@ -137,6 +140,25 @@ func main() {
 			EnablePacketTiming:        cfg.ebpfEnablePacketTiming,
 			EnablePacketHistogram:     cfg.ebpfEnablePacketHistogram,
 			EnableTLSHandshakeInspect: cfg.ebpfEnableTLSHandshakeInspect,
+			EnableHeaderAggregates:    cfg.ebpfEnableHeaderAggregates,
+			EnableNetFlowV2Histogram:  cfg.ebpfEnableNetFlowV2Histogram,
+			OnRetransAttach: func(attached bool) {
+				if attached {
+					m.EBPFRetransAttachTotal.WithLabelValues("success").Inc()
+					m.EBPFRetransHookAttached.Set(1)
+				} else {
+					m.EBPFRetransAttachTotal.WithLabelValues("failure").Inc()
+					m.EBPFRetransHookAttached.Set(0)
+				}
+			},
+			MapStatsInterval: cfg.ebpfMapStatsInterval,
+			OnMapOccupancy: func(samples []collector.EBPFMapOccupancy) {
+				applyMapOccupancyMetrics(m, samples)
+			},
+			OnMapWalkError: func(mapName string, err error) {
+				m.EBPFMapWalkErrors.WithLabelValues(mapName).Inc()
+				log.Printf("ebpf map occupancy walk failed map=%s: %v", mapName, err)
+			},
 		})
 	default:
 		log.Fatalf("unsupported --mode %q", cfg.mode)
@@ -151,6 +173,10 @@ func main() {
 	sessions.SetK8sMeta(metaCache)
 	sessions.SetNATAliasMetrics(m)
 	resolver := identity.NewResolverWithCgroups(metaCache, cgroupResolver)
+	// Freeze source identity per connection generation at event time; record
+	// emission then materializes the frozen snapshot instead of re-resolving
+	// the source against the current cache state.
+	sessions.SetSourceIdentityResolver(resolver)
 	recordContext := ledger.BuildContext{
 		ClusterID:      cfg.clusterID,
 		AgentID:        cfg.agentID,
@@ -169,10 +195,11 @@ func main() {
 	defer diagTicker.Stop()
 
 	log.Printf("flow-ledger node-agent started mode=%s node=%s ledger=%s metrics=%s", cfg.mode, cfg.nodeName, cfg.ledgerPath, cfg.metricsAddr)
-	log.Printf("ebpf flags: traffic_accounting=%t tcp_metrics=%t packet_timing=%t packet_histogram=%t tls_handshake_inspect=%t",
+	log.Printf("ebpf flags: traffic_accounting=%t tcp_metrics=%t packet_timing=%t packet_histogram=%t tls_handshake_inspect=%t header_aggregates=%t netflow_v2_histogram=%t",
 		cfg.ebpfEnableTrafficAccounting, cfg.ebpfEnableTCPBasicMetrics,
 		cfg.ebpfEnablePacketTiming, cfg.ebpfEnablePacketHistogram,
-		cfg.ebpfEnableTLSHandshakeInspect)
+		cfg.ebpfEnableTLSHandshakeInspect, cfg.ebpfEnableHeaderAggregates,
+		cfg.ebpfEnableNetFlowV2Histogram)
 
 	eventsClosed := false
 	var lastCgroupErrors uint64
@@ -376,6 +403,9 @@ func parseFlags() config {
 	flag.BoolVar(&cfg.ebpfEnablePacketTiming, "ebpf-enable-packet-timing", true, "attach eBPF cgroup_skb hooks for histogram-based IAT features")
 	flag.BoolVar(&cfg.ebpfEnablePacketHistogram, "ebpf-enable-packet-histogram", true, "attach eBPF cgroup_skb hooks for packet size histogram features")
 	flag.BoolVar(&cfg.ebpfEnableTLSHandshakeInspect, "ebpf-enable-tls-handshake-inspect", true, "inspect at most the first 1024 bytes of the first TLS ClientHello per flow")
+	flag.BoolVar(&cfg.ebpfEnableHeaderAggregates, "ebpf-enable-header-aggregates", true, "collect TCP/IP header aggregates (TTL/flags/window/IP-length envelopes) in BPF; when false the kernel skips the updates and the extra TCP header load")
+	flag.BoolVar(&cfg.ebpfEnableNetFlowV2Histogram, "ebpf-enable-netflow-v2-histogram", true, "collect the NetFlow-v2 IP-size histogram in BPF; when false the kernel skips the histogram updates")
+	flag.DurationVar(&cfg.ebpfMapStatsInterval, "ebpf-map-stats-interval", 15*time.Second, "period of the low-frequency eBPF map occupancy sampler (recommended 10-30s); 0 uses the default, negative disables sampling")
 	flag.Parse()
 	return cfg
 }
@@ -497,23 +527,64 @@ func hookSource(mode string) string {
 }
 
 func applyEBPFDropMetric(m *flmetrics.Metrics, ev collector.FlowEvent) {
-	count := ev.DropCount
+	count := float64(ev.DropCount)
 	if count == 0 {
 		count = 1
 	}
 	switch ev.DropReason {
 	case "map_update_failed":
-		m.EBPFMapFullDropsTotal.Add(float64(count))
+		m.EBPFMapFullDropsTotal.Add(count)
 	case "ringbuf_reserve_failed":
-		m.EBPFRingbufReserveFailures.Add(float64(count))
+		// A reserve failure IS a flow event lost before userspace: count it
+		// both in its dedicated metric and in the lost-events aggregate.
+		m.EBPFRingbufReserveFailures.Add(count)
+		m.EBPFLostEventsTotal.Add(count)
 	case "tls_buffer_reserve_failed":
-		m.TLSBufferReserveFailedTotal.Add(float64(count))
+		m.TLSBufferReserveFailedTotal.Add(count)
+		m.EBPFLostEventsTotal.Add(count)
 	case "tls_server_hello_no_stats":
-		m.TLSServerHelloNoStatsTotal.Add(float64(count))
+		m.TLSServerHelloNoStatsTotal.Add(count)
+	case "retrans_flow_miss":
+		m.EBPFRetransFlowMissTotal.Add(count)
+	case "packet_ep_miss":
+		// Per-packet canonical-endpoint miss — NOT a lost event; it must
+		// never inflate lost_events_total.
+		m.EBPFPacketEpMissTotal.Add(count)
 	case "unsupported_family", "recv_arg_missed":
+		// Deliberately unmetered: expected high-volume noise (non-IPv4
+		// traffic, sendfile-style recv paths).
 		return
 	default:
-		m.EBPFLostEventsTotal.Add(float64(count))
+		// Anything else (unsupported_ipv6, future BPF-side reasons) is
+		// surfaced by raw reason for diagnosis, but is not a measured
+		// pre-userspace event loss and stays out of lost_events_total.
+		m.EBPFDropsByReason.WithLabelValues(ev.DropReason).Add(count)
+	}
+}
+
+// applyMapOccupancyMetrics publishes one round of eBPF map occupancy samples.
+// Ratio is only exported when max_entries is known (> 0).
+func applyMapOccupancyMetrics(m *flmetrics.Metrics, samples []collector.EBPFMapOccupancy) {
+	type gaugePair struct {
+		entries prometheus.Gauge
+		max     prometheus.Gauge
+	}
+	gauges := map[string]gaugePair{
+		"flow_stats": {m.EBPFFlowMapEntries, m.EBPFFlowMapMaxEntries},
+		"local_ep":   {m.EBPFLocalEpMapEntries, m.EBPFLocalEpMapMaxEntries},
+		"tls_seen":   {m.EBPFTlsSeenMapEntries, m.EBPFTlsSeenMapMaxEntries},
+		"recv_args":  {m.EBPFRecvArgsMapEntries, m.EBPFRecvArgsMapMaxEntries},
+	}
+	for _, sample := range samples {
+		pair, ok := gauges[sample.Name]
+		if !ok {
+			continue
+		}
+		pair.entries.Set(float64(sample.Entries))
+		pair.max.Set(float64(sample.MaxEntries))
+		if sample.MaxEntries > 0 {
+			m.EBPFMapOccupancyRatio.WithLabelValues(sample.Name).Set(float64(sample.Entries) / float64(sample.MaxEntries))
+		}
 	}
 }
 

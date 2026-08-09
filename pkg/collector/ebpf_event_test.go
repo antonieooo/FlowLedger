@@ -213,3 +213,224 @@ func TestConvertRawTLSServerHelloEvent(t *testing.T) {
 func ipv4Raw(a, b, c, d byte) uint32 {
 	return binary.LittleEndian.Uint32([]byte{a, b, c, d})
 }
+
+// Every converted eBPF flow event must declare cumulative counter semantics
+// and the cgroup_skb provenance of its skb-level packet counts — downstream
+// aggregation depends on this marking to avoid re-summing snapshots.
+func TestConvertRawEBPFEventMarksCumulativeSemantics(t *testing.T) {
+	for _, eventType := range []uint32{ebpfEventConnect, ebpfEventClose, ebpfEventStats} {
+		ev, err := convertRawEBPFEventToFlowEvent(rawEBPFEvent{
+			EventType: eventType,
+			Family:    ebpfFamilyIPv4,
+			Protocol:  ebpfProtocolTCP,
+		})
+		if err != nil {
+			t.Fatalf("convertRawEBPFEventToFlowEvent(type=%d): %v", eventType, err)
+		}
+		if ev.CounterSemantics != CounterSemanticsCumulative {
+			t.Fatalf("type=%d CounterSemantics = %q, want cumulative", eventType, ev.CounterSemantics)
+		}
+		if ev.ObservedSKBPacketsSource != ObservedSKBPacketsSourceCgroupSKB {
+			t.Fatalf("type=%d ObservedSKBPacketsSource = %q, want cgroup_skb", eventType, ev.ObservedSKBPacketsSource)
+		}
+	}
+}
+
+// The C struct flow_event in bpf/flow_events.bpf.c and rawEBPFEvent must stay
+// byte-identical: 320 bytes through retrans_skb_bytes + 5×4 (syn/fin/rst +
+// 2 flag OR-masks, u32) + 4×2 (window/ip-length, u16) + 7×1 (2 TTL + 3
+// availability + 2 tcp_header_observed, u8) + 5 explicit pad = 360.
+func TestRawEBPFEventBinarySize(t *testing.T) {
+	const want = uintptr(360)
+	if got := unsafe.Sizeof(rawEBPFEvent{}); got != want {
+		t.Fatalf("rawEBPFEvent size = %d, want %d", got, want)
+	}
+}
+
+// Key offsets of rawEBPFEvent, hand-computed from the C layout of flow_event.
+// TestRawEBPFEventLayoutMatchesBTF cross-checks the same offsets against the
+// compiled object's BTF; this test keeps failing loudly even on builds where
+// the BTF-carrying object is unavailable.
+func TestRawEBPFEventKeyOffsets(t *testing.T) {
+	raw := rawEBPFEvent{}
+	for _, tc := range []struct {
+		name string
+		got  uintptr
+		want uintptr
+	}{
+		{"SYNCount", unsafe.Offsetof(raw.SYNCount), 320},
+		// Flags stay u32 at 4-aligned offsets (atomic OR operand requirement).
+		{"TcpFlagsOrSent", unsafe.Offsetof(raw.TcpFlagsOrSent), 332},
+		{"TcpFlagsOrRecv", unsafe.Offsetof(raw.TcpFlagsOrRecv), 336},
+		{"TcpWinMaxSent", unsafe.Offsetof(raw.TcpWinMaxSent), 340},
+		{"TcpWinMaxRecv", unsafe.Offsetof(raw.TcpWinMaxRecv), 342},
+		{"IpPktLenMin", unsafe.Offsetof(raw.IpPktLenMin), 344},
+		{"IpPktLenMax", unsafe.Offsetof(raw.IpPktLenMax), 346},
+		{"IpTtlMin", unsafe.Offsetof(raw.IpTtlMin), 348},
+		{"IpTtlMax", unsafe.Offsetof(raw.IpTtlMax), 349},
+		{"TrafficAccountingAvailable", unsafe.Offsetof(raw.TrafficAccountingAvailable), 350},
+		{"TcpHeaderObservedSent", unsafe.Offsetof(raw.TcpHeaderObservedSent), 353},
+		{"TcpHeaderObservedRecv", unsafe.Offsetof(raw.TcpHeaderObservedRecv), 354},
+	} {
+		if tc.got != tc.want {
+			t.Errorf("offsetof(%s) = %d, want %d", tc.name, tc.got, tc.want)
+		}
+	}
+}
+
+func TestConvertRawEBPFEventP1HeaderAggregates(t *testing.T) {
+	ev, err := convertRawEBPFEventToFlowEvent(rawEBPFEvent{
+		EventType:               ebpfEventStats,
+		Family:                  ebpfFamilyIPv4,
+		Protocol:                ebpfProtocolTCP,
+		RealPacketsSent:         3,
+		RealPacketsRecv:         0,
+		DirectionDurationNsSent: 900_000_000,
+		DirectionDurationNsRecv: 0,
+		NfIpSizeBuckets:         [6]uint64{1, 2, 3, 4, 5, 6},
+		IpTtlMin:                61,
+		IpTtlMax:                64,
+		TcpFlagsOrSent:          0x1a, // PSH|ACK|SYN
+		TcpFlagsOrRecv:          0,
+		TcpHeaderObservedSent:   1,
+		TcpHeaderObservedRecv:   0,
+		TcpWinMaxSent:           64240,
+		TcpWinMaxRecv:           65160,
+		IpPktLenMin:             52,
+		IpPktLenMax:             1500,
+	})
+	if err != nil {
+		t.Fatalf("convertRawEBPFEventToFlowEvent: %v", err)
+	}
+	if ev.IPTTLMin == nil || *ev.IPTTLMin != 61 || ev.IPTTLMax == nil || *ev.IPTTLMax != 64 {
+		t.Fatalf("ttl fields wrong: %#v", ev)
+	}
+	if ev.TCPFlagsOut != 0x1a || ev.TCPFlagsIn != 0 {
+		t.Fatalf("flag masks wrong: %#v", ev)
+	}
+	if ev.TCPWindowMaxOut == nil || *ev.TCPWindowMaxOut != 64240 {
+		t.Fatalf("window out wrong: %#v", ev.TCPWindowMaxOut)
+	}
+	// No TCP header was observed inbound (tcp_header_observed_recv == 0), so
+	// the inbound window must be null even though the raw field carries a
+	// non-zero garbage value — and observation must come from the witness
+	// flag, never be re-inferred from the flags OR-mask.
+	if ev.TCPWindowMaxIn != nil {
+		t.Fatalf("window in = %v, want nil when direction unobserved", *ev.TCPWindowMaxIn)
+	}
+	if !ev.TCPHeaderObservedOut || ev.TCPHeaderObservedIn {
+		t.Fatalf("header observed flags wrong: out=%v in=%v", ev.TCPHeaderObservedOut, ev.TCPHeaderObservedIn)
+	}
+	if ev.DirectionDurationOutNS != 900_000_000 || !ev.DirectionDurationOutObserved {
+		t.Fatalf("out duration wrong: %#v", ev)
+	}
+	if ev.DirectionDurationInObserved {
+		t.Fatalf("in direction marked observed with zero packets")
+	}
+	if ev.IPPktLenMin == nil || *ev.IPPktLenMin != 52 || ev.IPPktLenMax == nil || *ev.IPPktLenMax != 1500 {
+		t.Fatalf("ip pkt len wrong: %#v", ev)
+	}
+	if ev.NetFlowV2IPSizeHistogram["<=128"] != 1 || ev.NetFlowV2IPSizeHistogram[">1514"] != 6 {
+		t.Fatalf("nf histogram wrong: %#v", ev.NetFlowV2IPSizeHistogram)
+	}
+}
+
+// Unobserved header signals stay nil/zero — no fabricated values.
+func TestConvertRawEBPFEventP1Unavailable(t *testing.T) {
+	ev, err := convertRawEBPFEventToFlowEvent(rawEBPFEvent{
+		EventType: ebpfEventStats,
+		Family:    ebpfFamilyIPv4,
+		Protocol:  ebpfProtocolTCP,
+	})
+	if err != nil {
+		t.Fatalf("convertRawEBPFEventToFlowEvent: %v", err)
+	}
+	if ev.IPTTLMin != nil || ev.IPTTLMax != nil || ev.TCPWindowMaxOut != nil || ev.TCPWindowMaxIn != nil {
+		t.Fatalf("nullable header fields fabricated: %#v", ev)
+	}
+	if ev.IPPktLenMin != nil || ev.IPPktLenMax != nil || ev.NetFlowV2IPSizeHistogram != nil {
+		t.Fatalf("ip length fields fabricated: %#v", ev)
+	}
+	if ev.DirectionDurationOutObserved || ev.DirectionDurationInObserved {
+		t.Fatalf("direction observation fabricated: %#v", ev)
+	}
+}
+
+// P2: the converter copies the retransmit counters but must NOT set
+// availability/source — only the collector's attach path knows whether the
+// tracepoint is live, so a converted event alone never claims availability.
+func TestConvertRawEBPFEventRetransCountersWithoutAvailability(t *testing.T) {
+	ev, err := convertRawEBPFEventToFlowEvent(rawEBPFEvent{
+		EventType:       ebpfEventStats,
+		Family:          ebpfFamilyIPv4,
+		Protocol:        ebpfProtocolTCP,
+		RetransSkbCount: 3,
+		RetransSkbBytes: 4200,
+	})
+	if err != nil {
+		t.Fatalf("convertRawEBPFEventToFlowEvent: %v", err)
+	}
+	if ev.LocalRetransSKBCount != 3 || ev.LocalRetransSKBBytes != 4200 {
+		t.Fatalf("retrans counters not copied: %#v", ev)
+	}
+	if ev.LocalRetransAvailable || ev.LocalRetransSource != "" {
+		t.Fatalf("availability/source fabricated by converter: %#v", ev)
+	}
+}
+
+// A TCP NULL scan (flag byte 0) with a zero advertised window is a legitimate
+// observation: with the header-observed witness set, the converter must keep
+// flags==0 alongside observed=true and produce a NON-nil zero window pointer —
+// never collapse the direction to "unobserved".
+func TestConvertRawEBPFEventNullScanObservedZeroFlagsZeroWindow(t *testing.T) {
+	ev, err := convertRawEBPFEventToFlowEvent(rawEBPFEvent{
+		EventType:             ebpfEventStats,
+		Family:                ebpfFamilyIPv4,
+		Protocol:              ebpfProtocolTCP,
+		TcpFlagsOrSent:        0,
+		TcpFlagsOrRecv:        0,
+		TcpWinMaxSent:         0,
+		TcpWinMaxRecv:         0,
+		TcpHeaderObservedSent: 1,
+		TcpHeaderObservedRecv: 1,
+	})
+	if err != nil {
+		t.Fatalf("convertRawEBPFEventToFlowEvent: %v", err)
+	}
+	if !ev.TCPHeaderObservedOut || !ev.TCPHeaderObservedIn {
+		t.Fatalf("observed witnesses lost: %#v", ev)
+	}
+	if ev.TCPFlagsOut != 0 || ev.TCPFlagsIn != 0 {
+		t.Fatalf("flags masks wrong: %#v", ev)
+	}
+	if ev.TCPWindowMaxOut == nil || *ev.TCPWindowMaxOut != 0 {
+		t.Fatalf("window out = %v, want pointer to 0 for observed zero-window", ev.TCPWindowMaxOut)
+	}
+	if ev.TCPWindowMaxIn == nil || *ev.TCPWindowMaxIn != 0 {
+		t.Fatalf("window in = %v, want pointer to 0 for observed zero-window", ev.TCPWindowMaxIn)
+	}
+}
+
+// Asymmetric observation: only the egress direction saw a TCP header (with an
+// all-zero flag byte); the ingress direction was never read. The observed side
+// keeps its genuine zeros, the unobserved side stays nil/false.
+func TestConvertRawEBPFEventOneDirectionObserved(t *testing.T) {
+	ev, err := convertRawEBPFEventToFlowEvent(rawEBPFEvent{
+		EventType:             ebpfEventStats,
+		Family:                ebpfFamilyIPv4,
+		Protocol:              ebpfProtocolTCP,
+		TcpHeaderObservedSent: 1,
+	})
+	if err != nil {
+		t.Fatalf("convertRawEBPFEventToFlowEvent: %v", err)
+	}
+	if !ev.TCPHeaderObservedOut || ev.TCPHeaderObservedIn {
+		t.Fatalf("observed flags wrong: %#v", ev)
+	}
+	if ev.TCPWindowMaxOut == nil || *ev.TCPWindowMaxOut != 0 {
+		t.Fatalf("observed-out window = %v, want pointer to 0", ev.TCPWindowMaxOut)
+	}
+	if ev.TCPWindowMaxIn != nil {
+		t.Fatalf("unobserved-in window = %v, want nil", *ev.TCPWindowMaxIn)
+	}
+}

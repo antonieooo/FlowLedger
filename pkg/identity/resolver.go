@@ -117,7 +117,16 @@ func NewResolverWithCgroups(cache *k8smeta.Cache, cgroups CgroupLookup) *Resolve
 }
 
 func (r *Resolver) Resolve(session sessionizer.FlowSession) ResolvedFlow {
-	src := r.resolveSource(session)
+	// Source identity: when the sessionizer captured a per-generation
+	// snapshot, materialize THAT — emission must never re-resolve the source
+	// against the current cache state. The legacy resolve-at-output path
+	// remains only for pipelines without a wired snapshotter.
+	var src EndpointIdentity
+	if session.SourceIdentity.Attempted {
+		src = endpointFromSourceSnapshot(session.SourceIdentity)
+	} else {
+		src = r.resolveSource(session)
+	}
 	dst := r.resolveDestination(session)
 	return ResolvedFlow{
 		Src:              src,
@@ -128,20 +137,29 @@ func (r *Resolver) Resolve(session sessionizer.FlowSession) ResolvedFlow {
 }
 
 func (r *Resolver) resolveSource(session sessionizer.FlowSession) EndpointIdentity {
+	id, _ := r.resolveSourceEndpoint(session.CgroupID, session.SrcIP, session.NetnsIno, session.StartTime)
+	return id
+}
+
+// resolveSourceEndpoint is ONE atomic source resolution: every field of the
+// returned identity comes from the same cache-read moment. It also returns
+// the pod it resolved (nil when no pod identity was found) so callers can
+// derive pod-scoped context (rollout revision) from the SAME pod object.
+func (r *Resolver) resolveSourceEndpoint(cgroupID uint64, srcIP string, netnsIno uint64, flowStart time.Time) (EndpointIdentity, *k8smeta.PodInfo) {
 	if r.cache == nil {
 		id := unknown("unknown")
 		id.ResolutionStatus = ResolutionStatusUnknown
-		return id
+		return id, nil
 	}
 	// Path 1: cgroup_id -> pod_uid -> pod
 	// C10: use ResolveWithRetry so a Pod created just before its first network
 	// event still has a chance to be picked up by an on-demand cgroup rescan
 	// before we declare the identity unresolved.
-	if session.CgroupID != 0 && r.cgroups != nil {
-		if podUID, containerID, ok := r.cgroups.ResolveWithRetry(session.CgroupID); ok {
+	if cgroupID != 0 && r.cgroups != nil {
+		if podUID, containerID, ok := r.cgroups.ResolveWithRetry(cgroupID); ok {
 			if pod, podOK := r.cache.PodByUID(podUID); podOK {
-				id := identityFromPod(pod, session.StartTime, "cgroup_id")
-				id.CgroupID = session.CgroupID
+				id := identityFromPod(pod, flowStart, "cgroup_id")
+				id.CgroupID = cgroupID
 				if containerID != "" {
 					id.ContainerID = containerID
 					if name, nameOK := r.cache.ContainerNameByID(podUID, containerID); nameOK {
@@ -149,22 +167,22 @@ func (r *Resolver) resolveSource(session sessionizer.FlowSession) EndpointIdenti
 					}
 				}
 				id.ResolutionStatus = classifyResolutionStatus(id, pod.HostNetwork)
-				return id
+				return id, pod
 			}
 			// C10/C11: cgroup resolved to a pod_uid but informer cache has no
 			// pod entry yet (eBPF triggered before pod cache populated).
 			id := unknown("informer_miss")
-			id.CgroupID = session.CgroupID
+			id.CgroupID = cgroupID
 			id.ResolutionStatus = ResolutionStatusInformerMiss
 			id.Reason = "cgroup_resolved_but_pod_uncached"
-			return id
+			return id, nil
 		}
 	}
 	// Path 2: source IP -> pod via informer cache (works for host-network too)
-	if pod, ok := r.cache.PodByIP(session.SrcIP); ok {
-		id := identityFromPod(pod, session.StartTime, "pod_ip")
+	if pod, ok := r.cache.PodByIP(srcIP); ok {
+		id := identityFromPod(pod, flowStart, "pod_ip")
 		id.CgroupID = 0
-		if session.NetnsIno != 0 && r.hostNetnsIno != 0 && session.NetnsIno == r.hostNetnsIno {
+		if netnsIno != 0 && r.hostNetnsIno != 0 && netnsIno == r.hostNetnsIno {
 			id.Confidence = "medium"
 			id.Reason = "host_netns"
 		}
@@ -173,31 +191,135 @@ func (r *Resolver) resolveSource(session sessionizer.FlowSession) EndpointIdenti
 			id.Reason = "hostNetwork"
 		}
 		id.ResolutionStatus = classifyResolutionStatus(id, pod.HostNetwork)
-		return id
+		return id, pod
 	}
 	// C11: host-loopback / host-netns flows without a backing pod entry
-	if session.NetnsIno != 0 && r.hostNetnsIno != 0 && session.NetnsIno == r.hostNetnsIno {
+	if netnsIno != 0 && r.hostNetnsIno != 0 && netnsIno == r.hostNetnsIno {
 		id := unknown("host_netns")
 		id.Reason = "host_netns_no_pod"
 		id.ResolutionStatus = ResolutionStatusHostNetwork
-		return id
+		return id, nil
 	}
-	if isLoopback(session.SrcIP) {
+	if isLoopback(srcIP) {
 		id := unknown("host_netns")
 		id.Reason = "loopback_src"
 		id.ResolutionStatus = ResolutionStatusHostNetwork
-		return id
+		return id, nil
 	}
-	if isProbablyExternal(session.SrcIP) {
+	if isProbablyExternal(srcIP) {
 		id := unknown("external")
 		id.External = true
 		id.Confidence = "low"
 		id.ResolutionStatus = ResolutionStatusExternal
-		return id
+		return id, nil
 	}
 	id := unknown("unknown")
 	id.ResolutionStatus = ResolutionStatusUnknown
-	return id
+	return id, nil
+}
+
+// ResolveSourceIdentity implements sessionizer.SourceIdentityResolver: one
+// atomic resolution attempt whose result the sessionizer freezes per
+// connection generation. terminal=false only for transient states
+// (informer/cgroup caches not ready yet) that deserve a retry; resolved
+// identities and by-design-no-identity outcomes (host network, external,
+// loopback) are terminal. The revision is derived from the SAME pod object
+// the identity came from, pod-scoped (owner ReplicaSet / revision hash) —
+// never the controller's current latest revision.
+func (r *Resolver) ResolveSourceIdentity(req sessionizer.SourceIdentityRequest) (sessionizer.SourceIdentity, bool) {
+	id, pod := r.resolveSourceEndpoint(req.CgroupID, req.SrcIP, req.NetnsIno, req.ConnStart)
+
+	snapshot := sessionizer.SourceIdentity{
+		ObservedAt:       time.Now().UTC(),
+		CgroupID:         id.CgroupID,
+		SrcIP:            req.SrcIP,
+		Namespace:        id.Namespace,
+		PodName:          id.PodName,
+		PodUID:           id.PodUID,
+		NodeName:         id.NodeName,
+		ContainerName:    id.ContainerName,
+		ContainerID:      id.ContainerID,
+		WorkloadKind:     id.WorkloadKind,
+		WorkloadName:     id.WorkloadName,
+		WorkloadUID:      id.WorkloadUID,
+		ReplicaSet:       id.ReplicaSet,
+		ServiceAccount:   id.ServiceAccount,
+		ImageDigest:      id.ImageDigest,
+		External:         id.External,
+		Confidence:       id.Confidence,
+		Method:           id.Method,
+		ResolutionStatus: id.ResolutionStatus,
+	}
+	if snapshot.CgroupID == 0 {
+		snapshot.CgroupID = req.CgroupID
+	}
+	if pod != nil {
+		// Pod-scoped rollout binding: the pod's own template hash and the
+		// revision of the rollout that created THIS pod.
+		snapshot.PodTemplateHash = pod.Labels["pod-template-hash"]
+		if snapshot.PodTemplateHash == "" {
+			snapshot.PodTemplateHash = id.PodTemplateHash
+		}
+		snapshot.Revision, snapshot.RevisionSource = r.cache.PodRolloutRevision(pod)
+	}
+	if snapshot.PodUID == "" {
+		snapshot.MissingReason = missingReasonForStatus(id.ResolutionStatus, id.Reason)
+	}
+
+	switch id.ResolutionStatus {
+	case ResolutionStatusInformerMiss, ResolutionStatusUnknown, ResolutionStatusServiceOnly:
+		return snapshot, false
+	default:
+		return snapshot, true
+	}
+}
+
+// missingReasonForStatus maps a no-pod-identity outcome to an explicit
+// missing reason. Identity is never silently substituted with IP/name.
+func missingReasonForStatus(status, reason string) string {
+	switch status {
+	case ResolutionStatusHostNetwork:
+		return "host_network"
+	case ResolutionStatusExternal:
+		return "external_source"
+	case ResolutionStatusInformerMiss:
+		if reason != "" {
+			return reason
+		}
+		return "informer_miss"
+	case ResolutionStatusKubeSystem:
+		return "kube_system_without_pod"
+	default:
+		return "unknown_source"
+	}
+}
+
+// endpointFromSourceSnapshot materializes a frozen (or in-progress)
+// generation snapshot as the record's source identity. No cache access
+// happens here: emission-time state can never leak into the identity.
+func endpointFromSourceSnapshot(snapshot sessionizer.SourceIdentity) EndpointIdentity {
+	return EndpointIdentity{
+		Namespace:        snapshot.Namespace,
+		PodName:          snapshot.PodName,
+		PodUID:           snapshot.PodUID,
+		NodeName:         snapshot.NodeName,
+		ContainerName:    snapshot.ContainerName,
+		ContainerID:      snapshot.ContainerID,
+		CgroupID:         snapshot.CgroupID,
+		WorkloadKind:     snapshot.WorkloadKind,
+		WorkloadName:     snapshot.WorkloadName,
+		WorkloadUID:      snapshot.WorkloadUID,
+		ReplicaSet:       snapshot.ReplicaSet,
+		PodTemplateHash:  snapshot.PodTemplateHash,
+		ImageDigest:      snapshot.ImageDigest,
+		ServiceAccount:   snapshot.ServiceAccount,
+		Revision:         snapshot.Revision,
+		External:         snapshot.External,
+		Confidence:       snapshot.Confidence,
+		Method:           snapshot.Method,
+		Reason:           snapshot.MissingReason,
+		ResolutionStatus: snapshot.ResolutionStatus,
+	}
 }
 
 var netnsLinkRE = regexp.MustCompile(`net:\[(\d+)\]`)
