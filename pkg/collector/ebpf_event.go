@@ -40,39 +40,56 @@ var ebpfIATHistogramBuckets = []string{
 }
 
 type rawEBPFEvent struct {
-	TimestampNS                uint64
-	EventType                  uint32
-	PID                        uint32
-	TGID                       uint32
-	_                          uint32
-	CgroupID                   uint64
-	NetnsIno                   uint64
-	Family                     uint16
-	Protocol                   uint8
-	_                          uint8
-	SrcIPv4                    uint32
-	DstIPv4                    uint32
-	SrcPort                    uint16
-	DstPort                    uint16
-	BytesSent                  uint64
-	BytesRecv                  uint64
-	PacketsSent                uint64
-	PacketsRecv                uint64
-	PktSizeBuckets             [7]uint64
-	IATBuckets                 [6]uint64
-	PktSizeMin                 uint64
-	PktSizeMax                 uint64
-	IdleGapCount               uint64
-	BurstCount                 uint64
-	RealPacketsSent            uint64
-	RealPacketsRecv            uint64
-	SYNCount                   uint32
-	FINCount                   uint32
-	RSTCount                   uint32
+	TimestampNS             uint64
+	EventType               uint32
+	PID                     uint32
+	TGID                    uint32
+	_                       uint32
+	CgroupID                uint64
+	NetnsIno                uint64
+	Family                  uint16
+	Protocol                uint8
+	_                       uint8
+	SrcIPv4                 uint32
+	DstIPv4                 uint32
+	SrcPort                 uint16
+	DstPort                 uint16
+	BytesSent               uint64
+	BytesRecv               uint64
+	PacketsSent             uint64
+	PacketsRecv             uint64
+	PktSizeBuckets          [7]uint64
+	IATBuckets              [6]uint64
+	PktSizeMin              uint64
+	PktSizeMax              uint64
+	IdleGapCount            uint64
+	BurstCount              uint64
+	RealPacketsSent         uint64
+	RealPacketsRecv         uint64
+	DirectionDurationNsSent uint64
+	DirectionDurationNsRecv uint64
+	NfIpSizeBuckets         [6]uint64
+	RetransSkbCount         uint64
+	RetransSkbBytes         uint64
+	SYNCount                uint32
+	FINCount                uint32
+	RSTCount                uint32
+	// Flags stay uint32 (the BPF side needs a 4-aligned 32-bit operand for
+	// the atomic OR); window/tot_len are 16-bit wire fields, TTL is 8-bit.
+	TcpFlagsOrSent             uint32
+	TcpFlagsOrRecv             uint32
+	TcpWinMaxSent              uint16
+	TcpWinMaxRecv              uint16
+	IpPktLenMin                uint16
+	IpPktLenMax                uint16
+	IpTtlMin                   uint8
+	IpTtlMax                   uint8
 	TrafficAccountingAvailable uint8
 	PacketTimingAvailable      uint8
 	TCPMetricsAvailable        uint8
-	_                          uint8
+	TcpHeaderObservedSent      uint8
+	TcpHeaderObservedRecv      uint8
+	_                          [5]uint8
 }
 
 type rawTLSHandshakeEvent struct {
@@ -131,6 +148,37 @@ func convertRawEBPFEventToFlowEvent(raw rawEBPFEvent) (FlowEvent, error) {
 		TrafficAccountingAvailable: raw.TrafficAccountingAvailable != 0,
 		PacketTimingAvailable:      raw.PacketTimingAvailable != 0,
 		TCPMetricsAvailable:        raw.TCPMetricsAvailable != 0,
+
+		IPTTLMin:    pointerIfNonZero32(uint32(raw.IpTtlMin)),
+		IPTTLMax:    pointerIfNonZero32(uint32(raw.IpTtlMax)),
+		TCPFlagsOut: raw.TcpFlagsOrSent,
+		TCPFlagsIn:  raw.TcpFlagsOrRecv,
+		// Per-direction observation comes exclusively from the kernel's
+		// tcp_header_observed_* witness (set when the TCP byte-12..15 load
+		// succeeded), NEVER inferred from flag/window values: a TCP NULL
+		// scan (flags==0) or an all-zero-window direction must survive as an
+		// observed 0, not collapse to null.
+		TCPHeaderObservedOut:         raw.TcpHeaderObservedSent != 0,
+		TCPHeaderObservedIn:          raw.TcpHeaderObservedRecv != 0,
+		TCPWindowMaxOut:              u32IfObserved(uint32(raw.TcpWinMaxSent), raw.TcpHeaderObservedSent != 0),
+		TCPWindowMaxIn:               u32IfObserved(uint32(raw.TcpWinMaxRecv), raw.TcpHeaderObservedRecv != 0),
+		DirectionDurationOutNS:       raw.DirectionDurationNsSent,
+		DirectionDurationInNS:        raw.DirectionDurationNsRecv,
+		DirectionDurationOutObserved: raw.RealPacketsSent > 0,
+		DirectionDurationInObserved:  raw.RealPacketsRecv > 0,
+		IPPktLenMin:                  pointerIfNonZero32(uint32(raw.IpPktLenMin)),
+		IPPktLenMax:                  pointerIfNonZero32(uint32(raw.IpPktLenMax)),
+		// Availability/source are NOT set here: only the collector knows
+		// whether the tcp_retransmit_skb tracepoint actually attached.
+		LocalRetransSKBCount:     raw.RetransSkbCount,
+		LocalRetransSKBBytes:     raw.RetransSkbBytes,
+		NetFlowV2IPSizeHistogram: histogramFromArray(netFlowV2IPSizeBucketLabels, raw.NfIpSizeBuckets[:]),
+
+		// The BPF flow_stats entry is a per-flow monotonic accumulator; every
+		// emitted event carries totals since flow start, so downstream
+		// aggregation must not sum across events.
+		CounterSemantics:         CounterSemanticsCumulative,
+		ObservedSKBPacketsSource: ObservedSKBPacketsSourceCgroupSKB,
 	}
 	switch eventType {
 	case "CONNECT":
@@ -232,8 +280,37 @@ func histogramFromArray(labels []string, values []uint64) map[string]uint64 {
 	return out
 }
 
+// netFlowV2IPSizeBucketLabels must stay in sync with the BPF
+// nf_ip_size_bucket() edges and features.NetFlowV2IPSizeBuckets.
+var netFlowV2IPSizeBucketLabels = []string{
+	"<=128",
+	"129-256",
+	"257-512",
+	"513-1024",
+	"1025-1514",
+	">1514",
+}
+
 func pointerIfNonZero(v uint64) *uint64 {
 	if v == 0 {
+		return nil
+	}
+	return &v
+}
+
+func pointerIfNonZero32(v uint32) *uint32 {
+	if v == 0 {
+		return nil
+	}
+	return &v
+}
+
+// u32IfObserved returns a pointer to the value only when the direction was
+// actually observed (kernel tcp_header_observed_* witness); otherwise nil.
+// A present value may legitimately be 0 — never fabricate a 0 for an
+// unobserved direction, and never turn an observed 0 into null.
+func u32IfObserved(v uint32, observed bool) *uint32 {
+	if !observed {
 		return nil
 	}
 	return &v

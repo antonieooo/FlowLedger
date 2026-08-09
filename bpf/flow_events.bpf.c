@@ -40,7 +40,8 @@ typedef unsigned long long __u64;
 #define DROP_TLS_SERVER_HELLO_NO_STATS 5
 #define DROP_UNSUPPORTED_V6 6
 #define DROP_PACKET_EP_MISS 7
-#define DROP_COUNTERS_LEN 8
+#define DROP_RETRANS_FLOW_MISS 8
+#define DROP_COUNTERS_LEN 9
 
 #define FLOW_STATS_MAX_ENTRIES 65536
 #define RECV_ARGS_MAX_ENTRIES 16384
@@ -139,6 +140,13 @@ struct sock {
 	struct sock_cgroup_data sk_cgrp_data;
 } __attribute__((preserve_access_index));
 
+// Minimal kernel sk_buff view for the tcp_retransmit_skb tracepoint. The len
+// field offset is resolved by name from kernel BTF via CO-RE
+// (preserve_access_index); no hard-coded offset is used.
+struct sk_buff {
+	unsigned int len;
+} __attribute__((preserve_access_index));
+
 struct ns_common {
 	unsigned int inum;
 } __attribute__((preserve_access_index));
@@ -203,15 +211,63 @@ struct flow_stats {
 	__u64 real_packets_recv;
 	__u64 last_packet_ns_sent;
 	__u64 last_packet_ns_recv;
+	// v1alpha3 P1: TCP/IP header aggregates observed at cgroup_skb. All are
+	// cumulative over the flow_stats entry lifetime. "sent" = local egress,
+	// "recv" = local ingress; NOT client/server. first/last_packet_ns_* stay
+	// kernel-internal: only the derived per-direction duration is exported.
+	__u64 first_packet_ns_sent;
+	__u64 first_packet_ns_recv;
+	// NetFlow-v2 edge histogram over ntohs(ip.tot_len), both directions:
+	// <=128, 129-256, 257-512, 513-1024, 1025-1514, >1514 (overflow bucket,
+	// mostly GSO/GRO aggregates; must never be folded into 1025-1514).
+	__u64 nf_ip_size_buckets[6];
+	// v1alpha3 P2: LOCAL-egress retransmissions from tracepoint
+	// tcp/tcp_retransmit_skb, keyed by the pre-DNAT socket flow key. skb
+	// granularity: one retransmitted skb may be a GSO aggregate of several
+	// wire segments, so this is NOT a wire-packet count. Peer (dst->src)
+	// retransmissions are NOT observable from this hook.
+	__u64 retrans_skb_count;
+	__u64 retrans_skb_bytes;
 	__u32 syn_count;
 	__u32 fin_count;
 	__u32 rst_count;
+	// CONCURRENCY: the min/max extrema below (ip_ttl_*, tcp_win_max_*,
+	// ip_pkt_len_*, and pkt_size_min/max above) are updated with non-atomic
+	// compare-then-store. Two CPUs racing on the same flow can each pass the
+	// compare and the later store wins, so an extremum update can be lost.
+	// They are concurrent BEST-EFFORT extrema, NOT exact — a strict CAS loop
+	// per packet is not worth the hot-path cost. The flag OR-masks are exempt:
+	// they use atomic fetch-or and are exact.
+	//
+	// COMPACTNESS: fields are sized to their wire domain (window and tot_len
+	// are 16-bit header fields, TTL is 8-bit). The flag OR-masks alone stay
+	// __u32: the BPF atomic fetch-or needs a 4-byte-aligned 32-bit operand,
+	// and both sit at 4-aligned offsets by construction.
+	// Bitwise OR of the raw TCP flag byte per direction, updated with 32-bit
+	// atomic fetch-or (BPF ISA v3, -mcpu=v3) so a one-shot SYN/RST/FIN bit can
+	// never be lost to a cross-CPU race. 0 with tcp_header_observed_* set is a
+	// genuine all-zero flag byte (TCP NULL scan), not "unobserved".
+	__u32 tcp_flags_or_sent;
+	__u32 tcp_flags_or_recv;
+	__u16 tcp_win_max_sent; // raw advertised window (ntohs), NOT scale-corrected
+	__u16 tcp_win_max_recv;
+	__u16 ip_pkt_len_min; // ntohs(ip.tot_len); 0 = never observed
+	__u16 ip_pkt_len_max;
+	__u8 ip_ttl_min; // 0 = never observed (TTL 0 is invalid on the wire)
+	__u8 ip_ttl_max;
 	__u8 close_seen;
 	__u8 client_hello_inspected;
 	__u8 server_hello_inspected;
 	__u8 traffic_accounting_available;
 	__u8 packet_timing_available;
 	__u8 tcp_metrics_available;
+	// Monotonic 0->1 per-direction witness that the TCP byte-12..15 header
+	// load succeeded at least once. Set on read success ONLY — never inferred
+	// from flag/window values, so flags==0 / window==0 segments still count as
+	// observed. A plain store is race-free here: every writer stores the same
+	// value and the flag never goes back to 0 while the entry lives.
+	__u8 tcp_header_observed_sent;
+	__u8 tcp_header_observed_recv;
 	__u8 _pad1[2];
 };
 
@@ -241,13 +297,34 @@ struct flow_event {
 	__u64 burst_count;
 	__u64 real_packets_sent;
 	__u64 real_packets_recv;
+	// v1alpha3 P1 additions; must stay in sync with rawEBPFEvent in
+	// pkg/collector/ebpf_event.go. Durations are derived from the
+	// kernel-internal first/last packet timestamps at emit time.
+	__u64 direction_duration_ns_sent;
+	__u64 direction_duration_ns_recv;
+	__u64 nf_ip_size_buckets[6];
+	__u64 retrans_skb_count;
+	__u64 retrans_skb_bytes;
 	__u32 syn_count;
 	__u32 fin_count;
 	__u32 rst_count;
+	// Same compactness/alignment rules as flow_stats: flags stay __u32 for
+	// the atomic OR source field they mirror; window/tot_len are 16-bit wire
+	// fields, TTL is 8-bit.
+	__u32 tcp_flags_or_sent;
+	__u32 tcp_flags_or_recv;
+	__u16 tcp_win_max_sent;
+	__u16 tcp_win_max_recv;
+	__u16 ip_pkt_len_min;
+	__u16 ip_pkt_len_max;
+	__u8 ip_ttl_min;
+	__u8 ip_ttl_max;
 	__u8 traffic_accounting_available;
 	__u8 packet_timing_available;
 	__u8 tcp_metrics_available;
-	__u8 _pad2;
+	__u8 tcp_header_observed_sent;
+	__u8 tcp_header_observed_recv;
+	__u8 _pad2[5];
 };
 
 struct trace_event_raw_inet_sock_set_state {
@@ -268,9 +345,29 @@ struct trace_event_raw_inet_sock_set_state {
 	__u8 daddr_v6[16];
 };
 
+// tracepoint tcp/tcp_retransmit_skb: only the leading skbaddr/skaddr pointers
+// (stable at offsets 8/16 since the tracepoint was introduced in 4.15) are
+// declared; the record tail (state/ports/addrs) varies across kernel versions
+// and is deliberately not referenced.
+struct trace_event_raw_tcp_event_sk_skb {
+	__u16 common_type;
+	__u8 common_flags;
+	__u8 common_preempt_count;
+	__u32 common_pid;
+	const void *skbaddr;
+	const void *skaddr;
+};
+
 struct flow_config {
 	__u8 tls_handshake_inspect_enabled;
-	__u8 _pad[7];
+	// v1alpha3 hot-path gates. When 0 the BPF program itself skips the
+	// corresponding flow_stats updates — and, for header aggregates, the
+	// phase-B TCP byte-12..15 load — so disabling a feature is never just
+	// Go-side field nulling. Must stay in sync with bpfFlowConfig in
+	// pkg/collector/ebpf_collector_linux.go.
+	__u8 collect_header_aggregates;   // TTL/flags/window/IP-length envelopes
+	__u8 collect_netflow_v2_histogram; // NetFlow-v2 IP-size histogram
+	__u8 _pad[5];
 };
 
 struct tls_handshake_event {
@@ -394,12 +491,17 @@ static void increment_drop(__u32 idx)
 		__sync_fetch_and_add(counter, 1);
 }
 
-static int tls_inspect_enabled(void)
+static struct flow_config *get_flow_config(void)
 {
 	__u32 idx = 0;
-	struct flow_config *cfg;
 
-	cfg = bpf_map_lookup_elem(&config_map, &idx);
+	return bpf_map_lookup_elem(&config_map, &idx);
+}
+
+static int tls_inspect_enabled(void)
+{
+	struct flow_config *cfg = get_flow_config();
+
 	return cfg && cfg->tls_handshake_inspect_enabled;
 }
 
@@ -507,6 +609,27 @@ static void fill_event_fields(struct flow_event *event, struct flow_key *key, st
 		event->burst_count = stats->burst_count;
 		event->real_packets_sent = stats->real_packets_sent;
 		event->real_packets_recv = stats->real_packets_recv;
+		// first/last packet timestamps are kernel-internal; only the derived
+		// per-direction active span leaves the kernel.
+		if (stats->first_packet_ns_sent != 0 && stats->last_packet_ns_sent >= stats->first_packet_ns_sent)
+			event->direction_duration_ns_sent = stats->last_packet_ns_sent - stats->first_packet_ns_sent;
+		if (stats->first_packet_ns_recv != 0 && stats->last_packet_ns_recv >= stats->first_packet_ns_recv)
+			event->direction_duration_ns_recv = stats->last_packet_ns_recv - stats->first_packet_ns_recv;
+#pragma unroll
+		for (i = 0; i < 6; i++)
+			event->nf_ip_size_buckets[i] = stats->nf_ip_size_buckets[i];
+		event->ip_ttl_min = stats->ip_ttl_min;
+		event->ip_ttl_max = stats->ip_ttl_max;
+		event->tcp_flags_or_sent = stats->tcp_flags_or_sent;
+		event->tcp_flags_or_recv = stats->tcp_flags_or_recv;
+		event->tcp_header_observed_sent = stats->tcp_header_observed_sent;
+		event->tcp_header_observed_recv = stats->tcp_header_observed_recv;
+		event->tcp_win_max_sent = stats->tcp_win_max_sent;
+		event->tcp_win_max_recv = stats->tcp_win_max_recv;
+		event->retrans_skb_count = stats->retrans_skb_count;
+		event->retrans_skb_bytes = stats->retrans_skb_bytes;
+		event->ip_pkt_len_min = stats->ip_pkt_len_min;
+		event->ip_pkt_len_max = stats->ip_pkt_len_max;
 		event->syn_count = stats->syn_count;
 		event->fin_count = stats->fin_count;
 		event->rst_count = stats->rst_count;
@@ -654,6 +777,24 @@ static int packet_size_bucket(__u64 size)
 	return 6;
 }
 
+// NetFlow-v2 edge buckets over ntohs(ip.tot_len). Bucket edges MUST stay in
+// sync with features.NetFlowV2IPSizeBucket (pkg/features/features.go), which
+// is the unit-tested Go mirror of this function.
+static int nf_ip_size_bucket(__u16 tot_len)
+{
+	if (tot_len <= 128)
+		return 0;
+	if (tot_len <= 256)
+		return 1;
+	if (tot_len <= 512)
+		return 2;
+	if (tot_len <= 1024)
+		return 3;
+	if (tot_len <= 1514)
+		return 4;
+	return 5;
+}
+
 static int iat_bucket(__u64 iat_us)
 {
 	if (iat_us < 100)
@@ -669,10 +810,35 @@ static int iat_bucket(__u64 iat_us)
 	return 5;
 }
 
-static int key_from_skb(struct __sk_buff *skb, struct flow_key *key, int ingress)
+// Phase-A packet metadata, filled by key_from_skb exclusively from bytes it
+// already loads for key construction (the IPv4 header and TCP ports): TTL and
+// tot_len come for free from the IPv4 header, tcp_hdr_off records where the
+// TCP header starts (IHL in bytes). The TCP byte-12..15 load (flags/window)
+// deliberately does NOT happen here: it is phase-B work, done in
+// update_packet_stats only after the canonical local_ep_to_key lookup hit, so
+// packet_ep_miss traffic never pays that extra helper call.
+// ip_tot_len is converted to host byte order; ip_tot_len==0 means the header
+// carried an implausible total length (< 20) and IP-length stats are skipped.
+struct skb_pkt_meta {
+	__u16 ip_tot_len;
+	__u16 tcp_hdr_off;
+	__u8 ip_ttl;
+	__u8 _pad[3];
+};
+
+// Raw TCP header bytes 12..15: data-offset/reserved byte, flag byte, and the
+// advertised window (network byte order). Loaded only on the phase-B path.
+struct tcp_flags_window {
+	__u8 doff_res;
+	__u8 flags;
+	__u16 window;
+};
+
+static int key_from_skb(struct __sk_buff *skb, struct flow_key *key, int ingress, struct skb_pkt_meta *meta)
 {
 	struct ipv4_header ip = {};
 	struct tcp_ports ports = {};
+	__u16 tot_len;
 	__u32 ihl_bytes;
 
 	if (bpf_skb_load_bytes(skb, 0, &ip, sizeof(ip)) != 0)
@@ -691,6 +857,15 @@ static int key_from_skb(struct __sk_buff *skb, struct flow_key *key, int ingress
 		return -1;
 	if (bpf_skb_load_bytes(skb, ihl_bytes, &ports, sizeof(ports)) != 0)
 		return -1;
+	if (meta) {
+		__builtin_memset(meta, 0, sizeof(*meta));
+		meta->ip_ttl = ip.ttl;
+		meta->tcp_hdr_off = ihl_bytes;
+		// ip.tot_len is network byte order on the wire.
+		tot_len = bpf_ntohs(ip.tot_len);
+		if (tot_len >= sizeof(ip))
+			meta->ip_tot_len = tot_len;
+	}
 
 	__builtin_memset(key, 0, sizeof(*key));
 	if (ingress) {
@@ -837,13 +1012,21 @@ static void maybe_emit_tls_handshake(struct __sk_buff *skb, struct flow_key *key
 	bpf_ringbuf_submit(event, 0);
 }
 
-static void update_packet_stats(struct __sk_buff *skb, struct flow_key *key, __u64 packet_len, int ingress, __u64 now)
+// NOTE: BPF-to-BPF calls pass at most 5 register arguments, so `now` is taken
+// inside the function body instead of being a sixth parameter.
+static void update_packet_stats(struct __sk_buff *skb, struct flow_key *key, __u64 packet_len, int ingress, struct skb_pkt_meta *meta)
 {
 	struct flow_stats *stats;
 	__u64 *last_packet_ns;
+	__u64 *first_packet_ns;
+	__u64 now = bpf_ktime_get_ns();
 	__u64 cgroup_id;
 	__u64 iat_us;
+	struct flow_config *cfg;
+	struct tcp_flags_window tcpfw = {};
+	__u16 win;
 	int pkt_bucket;
+	int nf_idx;
 	int iat_idx;
 
 	stats = bpf_map_lookup_elem(&flow_stats_map, key);
@@ -859,18 +1042,74 @@ static void update_packet_stats(struct __sk_buff *skb, struct flow_key *key, __u
 	pkt_bucket = packet_size_bucket(packet_len);
 	if (pkt_bucket >= 0 && pkt_bucket < 7)
 		__sync_fetch_and_add(&stats->pkt_size_buckets[pkt_bucket], 1);
+	// flow_pkt_len (pkt_size_min/max) keeps its skb->len semantics.
 	if (stats->pkt_size_min == 0 || packet_len < stats->pkt_size_min)
 		stats->pkt_size_min = packet_len;
 	if (packet_len > stats->pkt_size_max)
 		stats->pkt_size_max = packet_len;
 
+	// Phase B: this point is reached only for canonical-key hits (the caller
+	// resolved local_ep_to_key and the flow_stats lookup above succeeded), so
+	// everything below — including the only TCP byte-12..15 load — is never
+	// paid by packet_ep_miss traffic. The config gates skip the updates in
+	// the BPF program itself; a disabled feature is never just Go-side
+	// nulling.
+	cfg = get_flow_config();
+	if (meta && cfg && cfg->collect_header_aggregates) {
+		// TTL / IP-length envelopes reuse phase-A bytes (no extra loads).
+		if (meta->ip_ttl != 0) {
+			if (stats->ip_ttl_min == 0 || meta->ip_ttl < stats->ip_ttl_min)
+				stats->ip_ttl_min = meta->ip_ttl;
+			if (meta->ip_ttl > stats->ip_ttl_max)
+				stats->ip_ttl_max = meta->ip_ttl;
+		}
+		if (meta->ip_tot_len != 0) {
+			if (stats->ip_pkt_len_min == 0 || meta->ip_tot_len < stats->ip_pkt_len_min)
+				stats->ip_pkt_len_min = meta->ip_tot_len;
+			if (meta->ip_tot_len > stats->ip_pkt_len_max)
+				stats->ip_pkt_len_max = meta->ip_tot_len;
+		}
+		// The ONLY TCP byte-12..15 load in the packet path. On success mark
+		// the direction header-observed regardless of the flag/window VALUES
+		// (a NULL scan segment has flags==0 and must still count as
+		// observed). The flag OR is a 32-bit atomic fetch-or (BPF ISA v3,
+		// -mcpu=v3; kernel >= 5.12 x86_64 JIT / >= 5.17 arm64 JIT, target
+		// 6.8): a plain |= is a read-modify-write and a cross-CPU race could
+		// permanently lose a one-shot SYN/RST/FIN bit. The window max stays
+		// a best-effort extremum (see flow_stats comment).
+		if (meta->tcp_hdr_off != 0 &&
+		    bpf_skb_load_bytes(skb, meta->tcp_hdr_off + 12, &tcpfw, sizeof(tcpfw)) == 0) {
+			win = bpf_ntohs(tcpfw.window);
+			if (ingress) {
+				stats->tcp_header_observed_recv = 1;
+				__sync_fetch_and_or(&stats->tcp_flags_or_recv, (__u32)tcpfw.flags);
+				if (win > stats->tcp_win_max_recv)
+					stats->tcp_win_max_recv = win;
+			} else {
+				stats->tcp_header_observed_sent = 1;
+				__sync_fetch_and_or(&stats->tcp_flags_or_sent, (__u32)tcpfw.flags);
+				if (win > stats->tcp_win_max_sent)
+					stats->tcp_win_max_sent = win;
+			}
+		}
+	}
+	if (meta && cfg && cfg->collect_netflow_v2_histogram && meta->ip_tot_len != 0) {
+		nf_idx = nf_ip_size_bucket(meta->ip_tot_len);
+		if (nf_idx >= 0 && nf_idx < 6)
+			__sync_fetch_and_add(&stats->nf_ip_size_buckets[nf_idx], 1);
+	}
+
 	if (ingress) {
 		__sync_fetch_and_add(&stats->real_packets_recv, 1);
 		last_packet_ns = &stats->last_packet_ns_recv;
+		first_packet_ns = &stats->first_packet_ns_recv;
 	} else {
 		__sync_fetch_and_add(&stats->real_packets_sent, 1);
 		last_packet_ns = &stats->last_packet_ns_sent;
+		first_packet_ns = &stats->first_packet_ns_sent;
 	}
+	if (*first_packet_ns == 0)
+		*first_packet_ns = now;
 
 	if (*last_packet_ns != 0 && now > *last_packet_ns) {
 		iat_us = (now - *last_packet_ns) / 1000;
@@ -1039,11 +1278,12 @@ int handle_cgroup_skb_ingress(struct __sk_buff *skb)
 	struct flow_key key;
 	struct flow_key *canon;
 	struct flow_stats *stats;
+	struct skb_pkt_meta meta = {};
 
-	if (key_from_skb(skb, &key, 1) == 0) {
+	if (key_from_skb(skb, &key, 1, &meta) == 0) {
 		canon = canonical_key_from_skb(&key);
 		if (canon)
-			update_packet_stats(skb, canon, skb->len, 1, bpf_ktime_get_ns());
+			update_packet_stats(skb, canon, skb->len, 1, &meta);
 		// TLS handshake dedup/emit deliberately keeps the post-NAT tuple key.
 		stats = bpf_map_lookup_elem(&flow_stats_map, &key);
 		maybe_emit_tls_handshake(skb, &key, stats, DIRECTION_RECV, 0x02);
@@ -1057,16 +1297,53 @@ int handle_cgroup_skb_egress(struct __sk_buff *skb)
 	struct flow_key key;
 	struct flow_key *canon;
 	struct flow_stats *stats;
+	struct skb_pkt_meta meta = {};
 
-	if (key_from_skb(skb, &key, 0) == 0) {
+	if (key_from_skb(skb, &key, 0, &meta) == 0) {
 		canon = canonical_key_from_skb(&key);
 		if (canon)
-			update_packet_stats(skb, canon, skb->len, 0, bpf_ktime_get_ns());
+			update_packet_stats(skb, canon, skb->len, 0, &meta);
 		// TLS handshake dedup/emit deliberately keeps the post-NAT tuple key.
 		stats = bpf_map_lookup_elem(&flow_stats_map, &key);
 		maybe_emit_tls_handshake(skb, &key, stats, DIRECTION_SEND, 0x01);
 	}
 	return CGROUP_SKB_PASS;
+}
+
+// LOCAL egress retransmissions only. The flow key is built from the socket
+// (skaddr) exactly like the tcp_sendmsg/tcp_recvmsg accounting hooks, so it is
+// the pre-DNAT canonical key: for a client talking to a Service the key's dst
+// is the ClusterIP tuple, i.e. the same flow_stats entry every other socket
+// hook updates — no kube-proxy DNAT reconciliation is needed here. IPv4 and
+// IPv4-mapped IPv6 sockets are supported via key_from_sock; genuine IPv6 is
+// dropped there (DROP_UNSUPPORTED_V6), unchanged from the rest of the
+// collector. Only flow_stats_map is updated — no per-retransmit ringbuf event
+// is ever emitted; the totals ride the existing STATS cadence. A retransmit
+// for a flow with no flow_stats entry (evicted, or raced with CLOSE) is
+// counted in DROP_RETRANS_FLOW_MISS instead of being attributed anywhere.
+SEC("tracepoint/tcp/tcp_retransmit_skb")
+int handle_tcp_retransmit_skb(struct trace_event_raw_tcp_event_sk_skb *ctx)
+{
+	struct flow_key key;
+	struct flow_stats *stats;
+	struct sk_buff *skb = (struct sk_buff *)ctx->skbaddr;
+	unsigned int skb_len = 0;
+
+	if (key_from_sock((struct sock *)ctx->skaddr, &key, DIRECTION_UNKNOWN) != 0)
+		return 0;
+	stats = bpf_map_lookup_elem(&flow_stats_map, &key);
+	if (!stats) {
+		increment_drop(DROP_RETRANS_FLOW_MISS);
+		return 0;
+	}
+	__sync_fetch_and_add(&stats->retrans_skb_count, 1);
+	if (skb) {
+		// CO-RE read of skb->len (offset resolved from BTF by name).
+		bpf_probe_read_kernel(&skb_len, sizeof(skb_len), &skb->len);
+		if (skb_len > 0)
+			__sync_fetch_and_add(&stats->retrans_skb_bytes, (__u64)skb_len);
+	}
+	return 0;
 }
 
 char __license[] SEC("license") = "Dual BSD/GPL";

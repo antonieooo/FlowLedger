@@ -27,9 +27,19 @@ type Metrics struct {
 	EBPFEventsByType             *prometheus.CounterVec
 	EBPFFlowMapEntries           prometheus.Gauge
 	EBPFFlowMapMaxEntries        prometheus.Gauge
+	EBPFLocalEpMapEntries        prometheus.Gauge
+	EBPFLocalEpMapMaxEntries     prometheus.Gauge
+	EBPFTlsSeenMapEntries        prometheus.Gauge
+	EBPFTlsSeenMapMaxEntries     prometheus.Gauge
+	EBPFRecvArgsMapEntries       prometheus.Gauge
+	EBPFRecvArgsMapMaxEntries    prometheus.Gauge
+	EBPFMapOccupancyRatio        *prometheus.GaugeVec
+	EBPFMapWalkErrors            *prometheus.CounterVec
 	EBPFMapFullDropsTotal        prometheus.Counter
 	EBPFRingbufReserveFailures   prometheus.Counter
 	EBPFLostEventsTotal          prometheus.Counter
+	EBPFPacketEpMissTotal        prometheus.Counter
+	EBPFDropsByReason            *prometheus.CounterVec
 	EBPFStatsEventsTotal         prometheus.Counter
 	EBPFConnectEventsTotal       prometheus.Counter
 	EBPFCloseEventsTotal         prometheus.Counter
@@ -45,6 +55,9 @@ type Metrics struct {
 	TLSServerHelloNATAliasMisses prometheus.Counter
 	CgroupResolutionsTotal       *prometheus.CounterVec
 	CgroupMapSize                prometheus.Gauge
+	EBPFRetransAttachTotal       *prometheus.CounterVec
+	EBPFRetransHookAttached      prometheus.Gauge
+	EBPFRetransFlowMissTotal     prometheus.Counter
 }
 
 func New() *Metrics {
@@ -111,12 +124,44 @@ func New() *Metrics {
 		}, []string{"event_type"}),
 		EBPFFlowMapEntries: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "flowledger_ebpf_flow_map_entries",
-			Help: "Current eBPF flow map entries when exported by the collector.",
+			Help: "Current flow_stats_map entries, sampled by the low-frequency map occupancy walker (default every 15s); an under-count is possible while entries churn during a walk.",
 		}),
 		EBPFFlowMapMaxEntries: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "flowledger_ebpf_flow_map_max_entries",
-			Help: "Configured maximum eBPF flow map entries.",
+			Help: "Configured maximum flow_stats_map entries.",
 		}),
+		EBPFLocalEpMapEntries: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "flowledger_ebpf_local_ep_map_entries",
+			Help: "Current local_ep_to_key entries (DNAT-invariant local-endpoint index), sampled by the map occupancy walker.",
+		}),
+		EBPFLocalEpMapMaxEntries: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "flowledger_ebpf_local_ep_map_max_entries",
+			Help: "Configured maximum local_ep_to_key entries.",
+		}),
+		EBPFTlsSeenMapEntries: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "flowledger_ebpf_tls_seen_map_entries",
+			Help: "Current tls_server_hello_seen_map entries (ServerHello dedup), sampled by the map occupancy walker.",
+		}),
+		EBPFTlsSeenMapMaxEntries: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "flowledger_ebpf_tls_seen_map_max_entries",
+			Help: "Configured maximum tls_server_hello_seen_map entries.",
+		}),
+		EBPFRecvArgsMapEntries: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "flowledger_ebpf_recv_args_map_entries",
+			Help: "Current recv_args_map entries (in-flight tcp_recvmsg args), sampled by the map occupancy walker.",
+		}),
+		EBPFRecvArgsMapMaxEntries: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "flowledger_ebpf_recv_args_map_max_entries",
+			Help: "Configured maximum recv_args_map entries.",
+		}),
+		EBPFMapOccupancyRatio: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "flowledger_ebpf_map_occupancy_ratio",
+			Help: "Sampled entries / max_entries per eBPF map (flow_stats | local_ep | tls_seen | recv_args); sustained values near 1.0 mean LRU eviction pressure.",
+		}, []string{"map"}),
+		EBPFMapWalkErrors: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "flowledger_ebpf_map_walk_errors_total",
+			Help: "Total failed occupancy walks per eBPF map; the collector keeps running and retries at the next sample interval.",
+		}, []string{"map"}),
 		EBPFMapFullDropsTotal: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "flowledger_ebpf_map_full_drops_total",
 			Help: "Total eBPF flow/drop map update failures.",
@@ -127,8 +172,16 @@ func New() *Metrics {
 		}),
 		EBPFLostEventsTotal: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "flowledger_ebpf_lost_events_total",
-			Help: "Total eBPF events dropped before userspace processing.",
+			Help: "Events genuinely lost before reaching userspace: the sum of flow-event and TLS ring buffer reserve failures — the only pre-userspace losses this implementation can measure. Per-packet/protocol drop reasons (packet_ep_miss, retrans_flow_miss, unsupported_*) are deliberately NOT included; see their dedicated counters.",
 		}),
+		EBPFPacketEpMissTotal: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "flowledger_ebpf_packet_ep_miss_total",
+			Help: "cgroup_skb packets whose canonical local_ep_to_key lookup missed (no flow_stats entry for the endpoint). A per-PACKET counter for flows outside socket-hook visibility — not a lost event and not ring buffer loss.",
+		}),
+		EBPFDropsByReason: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "flowledger_ebpf_drops_by_reason_total",
+			Help: "Kernel-side drop counters that have no dedicated metric, by raw reason (e.g. unsupported_ipv6, or a reason added in BPF before userspace learned about it). Diagnostic only — not part of lost_events_total.",
+		}, []string{"reason"}),
 		EBPFStatsEventsTotal: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "flowledger_ebpf_stats_events_total",
 			Help: "Total eBPF STATS summary events.",
@@ -189,6 +242,18 @@ func New() *Metrics {
 			Name: "flowledger_cgroup_map_size",
 			Help: "Current number of cgroup_id entries in the local cgroup resolver map.",
 		}),
+		EBPFRetransAttachTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "flowledger_ebpf_retrans_attach_total",
+			Help: "tcp/tcp_retransmit_skb tracepoint attach outcomes by status (success|failure).",
+		}, []string{"status"}),
+		EBPFRetransHookAttached: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "flowledger_ebpf_retrans_hook_attached",
+			Help: "Whether the tcp/tcp_retransmit_skb tracepoint is currently attached (1) or not (0); when 0, local_retrans_available is false on every record.",
+		}),
+		EBPFRetransFlowMissTotal: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "flowledger_ebpf_retrans_flow_miss_total",
+			Help: "Total retransmit tracepoint hits whose socket flow key had no flow_stats entry (evicted or raced with CLOSE); these retransmissions are counted nowhere.",
+		}),
 	}
 	prometheus.MustRegister(
 		m.EventsTotal,
@@ -208,9 +273,19 @@ func New() *Metrics {
 		m.EBPFEventsByType,
 		m.EBPFFlowMapEntries,
 		m.EBPFFlowMapMaxEntries,
+		m.EBPFLocalEpMapEntries,
+		m.EBPFLocalEpMapMaxEntries,
+		m.EBPFTlsSeenMapEntries,
+		m.EBPFTlsSeenMapMaxEntries,
+		m.EBPFRecvArgsMapEntries,
+		m.EBPFRecvArgsMapMaxEntries,
+		m.EBPFMapOccupancyRatio,
+		m.EBPFMapWalkErrors,
 		m.EBPFMapFullDropsTotal,
 		m.EBPFRingbufReserveFailures,
 		m.EBPFLostEventsTotal,
+		m.EBPFPacketEpMissTotal,
+		m.EBPFDropsByReason,
 		m.EBPFStatsEventsTotal,
 		m.EBPFConnectEventsTotal,
 		m.EBPFCloseEventsTotal,
@@ -226,6 +301,9 @@ func New() *Metrics {
 		m.TLSServerHelloNATAliasMisses,
 		m.CgroupResolutionsTotal,
 		m.CgroupMapSize,
+		m.EBPFRetransAttachTotal,
+		m.EBPFRetransHookAttached,
+		m.EBPFRetransFlowMissTotal,
 	)
 	return m
 }

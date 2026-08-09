@@ -82,6 +82,29 @@ func (c *MockCollector) Run(ctx context.Context) (<-chan FlowEvent, <-chan error
 				if ev.SYNCount > 0 || ev.FINCount > 0 || ev.RSTCount > 0 || ev.RetransCount > 0 || ev.RTTEstimateUS > 0 {
 					ev.TCPMetricsAvailable = true
 				}
+				// TCP header observation (tcp_header_observed_out/in) is
+				// never inferred from flag/window values: fixtures that
+				// model observed TCP headers must set the witness fields
+				// explicitly, exactly like the kernel path does.
+				// Mock fixtures default to the legacy per-event delta
+				// semantics; a fixture may opt into "cumulative" explicitly
+				// to exercise the eBPF aggregation path.
+				if ev.CounterSemantics == "" {
+					ev.CounterSemantics = CounterSemanticsDelta
+				}
+				if (ev.RealPacketsSent > 0 || ev.RealPacketsRecv > 0) && ev.ObservedSKBPacketsSource == "" {
+					ev.ObservedSKBPacketsSource = "mock"
+				}
+				// Retransmission fixtures: non-zero counters imply the fixture
+				// modelled an attached hook; a fixture may also set
+				// local_retrans_available explicitly (with zero counters) to
+				// model "hook attached, no retransmissions".
+				if ev.LocalRetransSKBCount > 0 || ev.LocalRetransSKBBytes > 0 {
+					ev.LocalRetransAvailable = true
+				}
+				if ev.LocalRetransAvailable && ev.LocalRetransSource == "" {
+					ev.LocalRetransSource = "mock"
+				}
 
 				select {
 				case <-ctx.Done():

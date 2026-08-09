@@ -19,7 +19,10 @@ import (
 	"github.com/cilium/ebpf/rlimit"
 )
 
-//go:generate go tool bpf2go -no-strip -target amd64,arm64 flowEvents ../../bpf/flow_events.bpf.c -- -g
+// -mcpu=v3 is required for the 32-bit atomic OR (__sync_fetch_and_or) on the
+// per-direction TCP flag masks. Minimum kernel for BPF ISA v3 atomics:
+// Linux >= 5.12 (x86_64 JIT), >= 5.17 (arm64 JIT); deployment target is 6.8.
+//go:generate go tool bpf2go -no-strip -target amd64,arm64 flowEvents ../../bpf/flow_events.bpf.c -- -g -mcpu=v3
 
 const (
 	defaultEBPFFlowMapMaxEntries = 65536
@@ -34,7 +37,35 @@ type EBPFOptions struct {
 	EnablePacketTiming        bool
 	EnablePacketHistogram     bool
 	EnableTLSHandshakeInspect bool
+	// EnableHeaderAggregates gates the v1alpha3 TCP/IP header aggregates
+	// (TTL/flags/window/IP-length envelopes) inside the BPF program via
+	// flow_config.collect_header_aggregates: when false the kernel skips the
+	// updates AND the phase-B TCP byte-12..15 load — not just Go-side
+	// nulling. Disabled fields surface as null/unobserved.
+	EnableHeaderAggregates bool
+	// EnableNetFlowV2Histogram gates the NetFlow-v2 IP-size histogram inside
+	// the BPF program via flow_config.collect_netflow_v2_histogram; same
+	// kernel-side-skip semantics as EnableHeaderAggregates.
+	EnableNetFlowV2Histogram bool
+	// OnRetransAttach, when non-nil, is called exactly once with the
+	// tcp/tcp_retransmit_skb tracepoint attach outcome (metrics hook).
+	OnRetransAttach func(attached bool)
+
+	// MapStatsInterval is the period of the low-frequency map occupancy
+	// sampler (flow_stats/local_ep/tls_seen/recv_args entry counts). 0 means
+	// the 15s default; a negative value disables sampling. The walk runs in
+	// its own goroutine and NEVER on the packet/event hot path.
+	MapStatsInterval time.Duration
+	// OnMapOccupancy, when non-nil, receives each round of occupancy samples
+	// (only maps whose walk succeeded that round).
+	OnMapOccupancy func(samples []EBPFMapOccupancy)
+	// OnMapWalkError, when non-nil, is called once per failed map walk. A
+	// walk failure only skips that map's sample for the round — the
+	// collector keeps running and retries next round.
+	OnMapWalkError func(mapName string, err error)
 }
+
+const defaultMapStatsInterval = 15 * time.Second
 
 type EBPFCollector struct {
 	opts EBPFOptions
@@ -132,8 +163,34 @@ func (c *EBPFCollector) Run(ctx context.Context) (<-chan FlowEvent, <-chan error
 			log.Print("ebpf traffic accounting disabled; only lifecycle tracepoint events will be collected")
 		}
 
+		// v1alpha3 P2: local retransmission counters. Best-effort: on kernels
+		// without the tracepoint (or without BTF for the CO-RE skb->len read)
+		// the collector keeps running, every event carries
+		// local_retrans_available=false, and the failure is logged and
+		// surfaced through OnRetransAttach — a 0 never impersonates
+		// "confirmed no retransmissions".
+		retransAttached := false
+		if c.opts.EnableTCPBasicMetrics {
+			retransTP, retransErr := link.Tracepoint("tcp", "tcp_retransmit_skb", objs.HandleTcpRetransmitSkb, nil)
+			if retransErr != nil {
+				log.Printf("attach tcp/tcp_retransmit_skb tracepoint failed; local retransmission metrics disabled (local_retrans_available=false): %v", retransErr)
+			} else {
+				defer retransTP.Close()
+				retransAttached = true
+				log.Print("ebpf collector attached tcp/tcp_retransmit_skb tracepoint")
+			}
+			// The callback fires only when an attach was actually attempted,
+			// so a config-disabled hook is not misreported as a failure.
+			if c.opts.OnRetransAttach != nil {
+				c.opts.OnRetransAttach(retransAttached)
+			}
+		} else {
+			log.Print("ebpf tcp basic metrics disabled; tcp/tcp_retransmit_skb tracepoint not attached")
+		}
+
 		var ingressCG, egressCG link.Link
-		if c.opts.EnablePacketHistogram || c.opts.EnablePacketTiming || c.opts.EnableTLSHandshakeInspect {
+		if c.opts.EnablePacketHistogram || c.opts.EnablePacketTiming || c.opts.EnableTLSHandshakeInspect ||
+			c.opts.EnableHeaderAggregates || c.opts.EnableNetFlowV2Histogram {
 			if !isCgroupV2Root("/sys/fs/cgroup") {
 				log.Print("ebpf cgroup_skb packet features require cgroup v2; skipping packet histogram/timing hooks")
 			} else {
@@ -163,6 +220,8 @@ func (c *EBPFCollector) Run(ctx context.Context) (<-chan FlowEvent, <-chan error
 		} else {
 			log.Print("ebpf cgroup_skb packet histogram/timing hooks disabled")
 		}
+
+		c.startMapStatsSampler(ctx, &objs)
 
 		reader, err := ringbuf.NewReader(objs.Events)
 		if err != nil {
@@ -228,6 +287,15 @@ func (c *EBPFCollector) Run(ctx context.Context) (<-chan FlowEvent, <-chan error
 				errs <- fmt.Errorf("convert ebpf event: %w", err)
 				continue
 			}
+			ev.LocalRetransAvailable = retransAttached
+			if retransAttached {
+				ev.LocalRetransSource = LocalRetransSourceTCPRetransmitSKB
+			} else {
+				// Not attached: counters cannot have been collected; make
+				// sure stale zeros never masquerade as measurements.
+				ev.LocalRetransSKBCount = 0
+				ev.LocalRetransSKBBytes = 0
+			}
 			c.applyPacketFeatureOptions(&ev)
 
 			select {
@@ -241,18 +309,117 @@ func (c *EBPFCollector) Run(ctx context.Context) (<-chan FlowEvent, <-chan error
 	return events, errs
 }
 
+// bpfFlowConfig must stay byte-identical to struct flow_config in
+// bpf/flow_events.bpf.c (checked against BTF by TestFlowConfigLayoutMatchesBTF).
 type bpfFlowConfig struct {
 	TLSHandshakeInspectEnabled uint8
-	_                          [7]uint8
+	CollectHeaderAggregates    uint8
+	CollectNetFlowV2Histogram  uint8
+	_                          [5]uint8
 }
 
-func configureBPF(objs *flowEventsObjects, opts EBPFOptions) error {
+// buildBPFFlowConfig maps collector options onto the kernel-side feature
+// gates. These bits act inside the BPF program: a 0 makes the kernel skip the
+// corresponding updates (and the header-aggregate TCP load) entirely.
+func buildBPFFlowConfig(opts EBPFOptions) bpfFlowConfig {
 	cfg := bpfFlowConfig{}
 	if opts.EnableTLSHandshakeInspect {
 		cfg.TLSHandshakeInspectEnabled = 1
 	}
+	if opts.EnableHeaderAggregates {
+		cfg.CollectHeaderAggregates = 1
+	}
+	if opts.EnableNetFlowV2Histogram {
+		cfg.CollectNetFlowV2Histogram = 1
+	}
+	return cfg
+}
+
+func configureBPF(objs *flowEventsObjects, opts EBPFOptions) error {
 	var key uint32
-	return objs.ConfigMap.Update(key, cfg, ebpf.UpdateAny)
+	return objs.ConfigMap.Update(key, buildBPFFlowConfig(opts), ebpf.UpdateAny)
+}
+
+// startMapStatsSampler launches the low-frequency map occupancy walker. It
+// runs entirely off the packet/event hot path: a dedicated goroutine walks
+// the four bounded maps every MapStatsInterval (default 15s) and reports
+// entry counts through OnMapOccupancy. A failed walk is reported through
+// OnMapWalkError and only skips that map for the round — it never stops the
+// sampler or the collector.
+func (c *EBPFCollector) startMapStatsSampler(ctx context.Context, objs *flowEventsObjects) {
+	interval := c.opts.MapStatsInterval
+	if interval == 0 {
+		interval = defaultMapStatsInterval
+	}
+	if interval < 0 || (c.opts.OnMapOccupancy == nil && c.opts.OnMapWalkError == nil) {
+		return
+	}
+	maps := []struct {
+		name string
+		m    *ebpf.Map
+	}{
+		{"flow_stats", objs.FlowStatsMap},
+		{"local_ep", objs.LocalEpToKey},
+		{"tls_seen", objs.TlsServerHelloSeenMap},
+		{"recv_args", objs.RecvArgsMap},
+	}
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
+			samples := make([]EBPFMapOccupancy, 0, len(maps))
+			for _, entry := range maps {
+				if entry.m == nil {
+					continue
+				}
+				count, err := countMapEntries(entry.m)
+				if err != nil {
+					if ctx.Err() != nil {
+						// Shutdown race: maps are being closed; not a real
+						// walk failure.
+						return
+					}
+					if c.opts.OnMapWalkError != nil {
+						c.opts.OnMapWalkError(entry.name, err)
+					}
+					continue
+				}
+				samples = append(samples, EBPFMapOccupancy{
+					Name:       entry.name,
+					Entries:    count,
+					MaxEntries: uint64(entry.m.MaxEntries()),
+				})
+			}
+			if len(samples) > 0 && c.opts.OnMapOccupancy != nil {
+				c.opts.OnMapOccupancy(samples)
+			}
+		}
+	}()
+}
+
+// countMapEntries walks a map's keys and counts them. For LRU/hash maps under
+// concurrent kernel updates the count is a point-in-time sample (entries
+// created or evicted mid-walk may be missed or double-seen), which is exactly
+// good enough for occupancy monitoring.
+func countMapEntries(m *ebpf.Map) (uint64, error) {
+	var (
+		key   []byte
+		value []byte
+		count uint64
+	)
+	iter := m.Iterate()
+	for iter.Next(&key, &value) {
+		count++
+	}
+	if err := iter.Err(); err != nil {
+		return 0, err
+	}
+	return count, nil
 }
 
 func (c *EBPFCollector) readTLSHandshakeEvents(ctx context.Context, reader *ringbuf.Reader, events chan<- FlowEvent, errs chan<- error, wg *sync.WaitGroup) {
@@ -288,12 +455,37 @@ func (c *EBPFCollector) applyPacketFeatureOptions(ev *FlowEvent) {
 		ev.PktSizeMax = nil
 		ev.RealPacketsSent = 0
 		ev.RealPacketsRecv = 0
+		ev.ObservedSKBPacketsSource = ""
+	}
+	// v1alpha3 header aggregates and the NetFlow-v2 histogram have their own
+	// kernel-side gates (flow_config.collect_*); the BPF program already skips
+	// the updates when disabled. This Go-side clearing is belt-and-suspenders
+	// so stale kernel values can never leak: disabled features must surface
+	// as null/unobserved, never 0.
+	if !c.opts.EnableHeaderAggregates {
+		ev.IPTTLMin = nil
+		ev.IPTTLMax = nil
+		ev.TCPFlagsOut = 0
+		ev.TCPFlagsIn = 0
+		ev.TCPHeaderObservedOut = false
+		ev.TCPHeaderObservedIn = false
+		ev.TCPWindowMaxOut = nil
+		ev.TCPWindowMaxIn = nil
+		ev.IPPktLenMin = nil
+		ev.IPPktLenMax = nil
+	}
+	if !c.opts.EnableNetFlowV2Histogram {
+		ev.NetFlowV2IPSizeHistogram = nil
 	}
 	if !c.opts.EnablePacketTiming {
 		ev.IATHistogram = nil
 		ev.IdleGapCount = 0
 		ev.BurstCount = 0
 		ev.PacketTimingAvailable = false
+		ev.DirectionDurationOutNS = 0
+		ev.DirectionDurationInNS = 0
+		ev.DirectionDurationOutObserved = false
+		ev.DirectionDurationInObserved = false
 	}
 }
 
@@ -318,6 +510,7 @@ func readDropCounterDeltas(dropCounters *ebpf.Map, previous map[uint32]uint64) [
 		5: "tls_server_hello_no_stats",
 		6: "unsupported_ipv6",
 		7: "packet_ep_miss",
+		8: "retrans_flow_miss",
 	} {
 		var total uint64
 		if err := dropCounters.Lookup(idx, &total); err != nil {
