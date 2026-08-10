@@ -24,6 +24,9 @@ spec:
           image: flow-ledger:v0
           imagePullPolicy: IfNotPresent
           args:
+            # IMMUTABLE for formal collection (2026-08-10): native window MUST stay 30s;
+            # the feature pipeline asserts 120 % native == 0 (gnn/windowing.py).
+            - --window-size=30s
             # v0 Kubernetes deployment is intentionally mock-backed. It validates
             # DaemonSet lifecycle, metadata enrichment, JSONL writing, and metrics;
             # it does not collect real node traffic yet.
