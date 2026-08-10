@@ -41,7 +41,8 @@ typedef unsigned long long __u64;
 #define DROP_UNSUPPORTED_V6 6
 #define DROP_PACKET_EP_MISS 7
 #define DROP_RETRANS_FLOW_MISS 8
-#define DROP_COUNTERS_LEN 9
+#define DROP_DEGENERATE_KEY 9
+#define DROP_COUNTERS_LEN 10
 
 #define FLOW_STATS_MAX_ENTRIES 65536
 #define RECV_ARGS_MAX_ENTRIES 16384
@@ -537,6 +538,14 @@ static int key_from_sock(struct sock *sk, struct flow_key *key, __u8 direction)
 	bpf_probe_read_kernel(&key->src_port, sizeof(key->src_port), &sk->__sk_common.skc_num);
 	bpf_probe_read_kernel(&dport, sizeof(dport), &sk->__sk_common.skc_dport);
 	key->dst_port = bpf_ntohs(dport);
+	// Degenerate-key guard: a socket doing sendmsg/recvmsg before the kernel has
+	// assigned its source port (e.g. connect-during-sendmsg paths) yields skc_num==0.
+	// Such a key can never be matched by the state/skb hooks (they see the real port),
+	// so the entry would leak until session timeout. Reject at the single choke point.
+	if (key->src_port == 0 || key->dst_port == 0) {
+		increment_drop(DROP_DEGENERATE_KEY);
+		return -1;
+	}
 	key->protocol = IPPROTO_TCP;
 	key->direction = direction;
 	return 0;

@@ -153,3 +153,28 @@ epoch, or final-window markers. In v1alpha4 that differencing (including
 reset/unknown-baseline handling) is done in the sessionizer and every window
 is directly usable as a fixed-window sample after filtering
 `window_valid == true`.
+
+## Degenerate flow keys (`src_port=0`) — guard added 2026-08-10 (v1a4e2)
+
+History, stated honestly: earlier project notes claimed "the BPF entry rejects
+degenerate keys". That claim described an abandoned v1alpha3 branch and was
+**never true for this lineage** — the 2026-08-09 benign smoke run still
+contained 144/124,806 such records (93 window + 51 session; all with
+`tcp_state=unknown`, `syn_count=0`, session `close_reason=timeout`).
+
+Mechanism: `tcp_sendmsg`/`tcp_recvmsg` fire while the socket's source port is
+not yet assigned (`skc_num==0`, e.g. connect-during-send paths). The shared
+`key_from_sock()` helper built a `src_port=0` key and `ensure_stats()` created
+a flow entry for it. The real connection's state/skb hooks see the assigned
+port and use the correct key, so the degenerate entry never receives a CLOSE
+and dies by session timeout.
+
+As of v1a4e2, `key_from_sock()` rejects keys with `src_port==0 || dst_port==0`
+at the single choke point (callers: sendmsg, recvmsg, retransmit) and counts
+the rejection in drop counter `degenerate_key` (index 9), exported like every
+other drop reason. The state-transition and cgroup_skb paths are unchanged —
+they read ports from the tracepoint/packet and were never implicated.
+
+Downstream rule (defense in depth): any consumer keying or pairing on
+(address, port) MUST still drop `src_port=0` records explicitly when reading
+pre-v1a4e2 ledgers.

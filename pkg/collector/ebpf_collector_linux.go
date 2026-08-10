@@ -511,6 +511,7 @@ func readDropCounterDeltas(dropCounters *ebpf.Map, previous map[uint32]uint64) [
 		6: "unsupported_ipv6",
 		7: "packet_ep_miss",
 		8: "retrans_flow_miss",
+		9: "degenerate_key",
 	} {
 		var total uint64
 		if err := dropCounters.Lookup(idx, &total); err != nil {
