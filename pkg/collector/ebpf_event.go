@@ -71,9 +71,23 @@ type rawEBPFEvent struct {
 	NfIpSizeBuckets         [6]uint64
 	RetransSkbCount         uint64
 	RetransSkbBytes         uint64
-	SYNCount                uint32
-	FINCount                uint32
-	RSTCount                uint32
+	// v1alpha5 per-direction additions. Field ORDER here is the wire layout:
+	// binary.Read is padding-blind, so every byte of struct flow_event —
+	// including its explicit _pad members — must appear in order.
+	// TestRawEBPFEventLayoutMatchesBTF checks this against the compiled BTF.
+	PktSizeBucketsOut [7]uint64
+	PktSizeBucketsIn  [7]uint64
+	IATBucketsOut     [6]uint64
+	IATBucketsIn      [6]uint64
+	SYNCount          uint32
+	FINCount          uint32
+	RSTCount          uint32
+	SYNCountOut       uint32
+	SYNCountIn        uint32
+	FINCountOut       uint32
+	FINCountIn        uint32
+	RSTCountOut       uint32
+	RSTCountIn        uint32
 	// Flags stay uint32 (the BPF side needs a 4-aligned 32-bit operand for
 	// the atomic OR); window/tot_len are 16-bit wire fields, TTL is 8-bit.
 	TcpFlagsOrSent             uint32
@@ -84,12 +98,16 @@ type rawEBPFEvent struct {
 	IpPktLenMax                uint16
 	IpTtlMin                   uint8
 	IpTtlMax                   uint8
+	IpTtlMinOut                uint8
+	IpTtlMaxOut                uint8
+	IpTtlMinIn                 uint8
+	IpTtlMaxIn                 uint8
 	TrafficAccountingAvailable uint8
 	PacketTimingAvailable      uint8
 	TCPMetricsAvailable        uint8
 	TcpHeaderObservedSent      uint8
 	TcpHeaderObservedRecv      uint8
-	_                          [5]uint8
+	_                          [9]uint8
 }
 
 type rawTLSHandshakeEvent struct {
@@ -168,6 +186,29 @@ func convertRawEBPFEventToFlowEvent(raw rawEBPFEvent) (FlowEvent, error) {
 		DirectionDurationInObserved:  raw.RealPacketsRecv > 0,
 		IPPktLenMin:                  pointerIfNonZero32(uint32(raw.IpPktLenMin)),
 		IPPktLenMax:                  pointerIfNonZero32(uint32(raw.IpPktLenMax)),
+
+		// --- v1alpha5 per-direction split ---
+		// The per-direction histograms are labelled from the SAME bucket-name
+		// slices as the mixed ones above, so a bucket edge can never diverge
+		// between the two: there is one label table per family, not three.
+		PacketSizeHistogramOut: histogramFromArray(ebpfPacketSizeHistogramBuckets, raw.PktSizeBucketsOut[:]),
+		PacketSizeHistogramIn:  histogramFromArray(ebpfPacketSizeHistogramBuckets, raw.PktSizeBucketsIn[:]),
+		IATHistogramOut:        histogramFromArray(ebpfIATHistogramBuckets, raw.IATBucketsOut[:]),
+		IATHistogramIn:         histogramFromArray(ebpfIATHistogramBuckets, raw.IATBucketsIn[:]),
+		SYNCountOut:            uint64(raw.SYNCountOut),
+		SYNCountIn:             uint64(raw.SYNCountIn),
+		FINCountOut:            uint64(raw.FINCountOut),
+		FINCountIn:             uint64(raw.FINCountIn),
+		RSTCountOut:            uint64(raw.RSTCountOut),
+		RSTCountIn:             uint64(raw.RSTCountIn),
+		// TTL 0 is invalid on the wire, so 0 unambiguously means "this
+		// direction never observed a packet" — same convention as the mixed
+		// pair, hence the same pointerIfNonZero32 treatment and no
+		// *_available companion flag.
+		IPTTLMinOut: pointerIfNonZero32(uint32(raw.IpTtlMinOut)),
+		IPTTLMaxOut: pointerIfNonZero32(uint32(raw.IpTtlMaxOut)),
+		IPTTLMinIn:  pointerIfNonZero32(uint32(raw.IpTtlMinIn)),
+		IPTTLMaxIn:  pointerIfNonZero32(uint32(raw.IpTtlMaxIn)),
 		// Availability/source are NOT set here: only the collector knows
 		// whether the tcp_retransmit_skb tracepoint actually attached.
 		LocalRetransSKBCount:     raw.RetransSkbCount,

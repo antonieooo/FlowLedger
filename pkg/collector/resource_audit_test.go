@@ -23,8 +23,10 @@ func TestAuditEBPFResources(t *testing.T) {
 	if got, want := structs["flow_event"], uint32(unsafe.Sizeof(rawEBPFEvent{})); got != want {
 		t.Errorf("audited flow_event size = %d, want %d (rawEBPFEvent)", got, want)
 	}
-	if structs["flow_stats"] == 0 || structs["flow_stats"] > 384 {
-		t.Errorf("audited flow_stats size = %d, want (0, 384]", structs["flow_stats"])
+	// Budget raised for the v1alpha5 per-direction split; see the rationale
+	// and the memory arithmetic on TestBPFStructResourceBudget.
+	if structs["flow_stats"] == 0 || structs["flow_stats"] > 608 {
+		t.Errorf("audited flow_stats size = %d, want (0, 608]", structs["flow_stats"])
 	}
 	if structs["flow_config"] == 0 || structs["flow_key"] == 0 || structs["local_ep"] == 0 {
 		t.Errorf("missing audited structs: %v", structs)
