@@ -87,7 +87,8 @@ type flowEventsFlowStats struct {
 	TcpMetricsAvailable        uint8
 	TcpHeaderObservedSent      uint8
 	TcpHeaderObservedRecv      uint8
-	Pad1                       [6]uint8
+	Established                uint8
+	Pad1                       [5]uint8
 }
 
 type flowEventsLocalEp struct {
@@ -140,6 +141,7 @@ type flowEventsProgramSpecs struct {
 	HandleCgroupSkbEgress  *ebpf.ProgramSpec `ebpf:"handle_cgroup_skb_egress"`
 	HandleCgroupSkbIngress *ebpf.ProgramSpec `ebpf:"handle_cgroup_skb_ingress"`
 	HandleInetSockSetState *ebpf.ProgramSpec `ebpf:"handle_inet_sock_set_state"`
+	HandleTcpConnect       *ebpf.ProgramSpec `ebpf:"handle_tcp_connect"`
 	HandleTcpRecvmsgEntry  *ebpf.ProgramSpec `ebpf:"handle_tcp_recvmsg_entry"`
 	HandleTcpRecvmsgReturn *ebpf.ProgramSpec `ebpf:"handle_tcp_recvmsg_return"`
 	HandleTcpRetransmitSkb *ebpf.ProgramSpec `ebpf:"handle_tcp_retransmit_skb"`
@@ -212,6 +214,7 @@ type flowEventsPrograms struct {
 	HandleCgroupSkbEgress  *ebpf.Program `ebpf:"handle_cgroup_skb_egress"`
 	HandleCgroupSkbIngress *ebpf.Program `ebpf:"handle_cgroup_skb_ingress"`
 	HandleInetSockSetState *ebpf.Program `ebpf:"handle_inet_sock_set_state"`
+	HandleTcpConnect       *ebpf.Program `ebpf:"handle_tcp_connect"`
 	HandleTcpRecvmsgEntry  *ebpf.Program `ebpf:"handle_tcp_recvmsg_entry"`
 	HandleTcpRecvmsgReturn *ebpf.Program `ebpf:"handle_tcp_recvmsg_return"`
 	HandleTcpRetransmitSkb *ebpf.Program `ebpf:"handle_tcp_retransmit_skb"`
@@ -223,6 +226,7 @@ func (p *flowEventsPrograms) Close() error {
 		p.HandleCgroupSkbEgress,
 		p.HandleCgroupSkbIngress,
 		p.HandleInetSockSetState,
+		p.HandleTcpConnect,
 		p.HandleTcpRecvmsgEntry,
 		p.HandleTcpRecvmsgReturn,
 		p.HandleTcpRetransmitSkb,

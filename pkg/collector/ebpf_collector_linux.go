@@ -136,6 +136,24 @@ func (c *EBPFCollector) Run(ctx context.Context) (<-chan FlowEvent, <-chan error
 		defer tp.Close()
 		log.Print("ebpf collector attached tracepoint sock/inet_sock_set_state")
 
+		// v1alpha6: create the flow entry at tcp_connect, the last point at
+		// which the flow key is complete (the ephemeral source port has been
+		// assigned) and the SYN has not yet been transmitted. The
+		// inet_sock_set_state(SYN_SENT) tracepoint fires too early for that
+		// -- the port is still 0 unless the application bound one -- so
+		// without this kprobe the handshake of an ordinary connect() client
+		// is uncountable. Best-effort: tcp_connect is a stable, long-lived
+		// symbol, but if it cannot be attached the collector keeps running
+		// with v1alpha5 coverage rather than failing closed.
+		connKP, err := link.Kprobe("tcp_connect", objs.HandleTcpConnect, nil)
+		if err != nil {
+			log.Printf("ebpf collector could not attach tcp_connect kprobe (%v); "+
+				"failed/refused connections will carry no directional flag counts", err)
+		} else {
+			defer connKP.Close()
+			log.Print("ebpf collector attached tcp_connect kprobe (early flow entry)")
+		}
+
 		var sendKP, recvKP, recvRetKP link.Link
 		if c.opts.EnableTrafficAccounting {
 			sendKP, err = link.Kprobe("tcp_sendmsg", objs.HandleTcpSendmsg, nil)

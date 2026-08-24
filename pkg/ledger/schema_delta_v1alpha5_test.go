@@ -289,10 +289,58 @@ func TestSchemaDeltaIsAdditiveOnly(t *testing.T) {
 	}
 }
 
-// The schema version must advance exactly one step, and the record must carry
-// it. A stale version on new fields is worse than no version at all.
-func TestSchemaVersionIsV1Alpha5(t *testing.T) {
-	if features.SchemaVersion != "v1alpha5" {
-		t.Fatalf("SchemaVersion = %q, want v1alpha5", features.SchemaVersion)
+// The schema version must advance with every change to what the ledger means,
+// even when — as in v1alpha6 — the change is to WHEN a field is filled rather
+// than to the set of fields. A stale version on redefined semantics is worse
+// than no version at all.
+func TestSchemaVersionIsV1Alpha6(t *testing.T) {
+	if features.SchemaVersion != "v1alpha6" {
+		t.Fatalf("SchemaVersion = %q, want v1alpha6", features.SchemaVersion)
+	}
+}
+
+// v1alpha6 adds NO ledger field. It moves entry creation forward to the SYN
+// states so the six v1alpha5 directional flag counters can be filled for
+// connections that never establish; the counters, their names, their types and
+// their semantics are untouched. So the v1alpha6 key set must equal the
+// v1alpha5 key set exactly — the corpus-derived v1alpha4 keys plus those 14
+// and nothing more. This is the machine judge for "zero new fields".
+func TestV1Alpha6AddsNoLedgerField(t *testing.T) {
+	blob, err := json.Marshal(Record{})
+	if err != nil {
+		t.Fatalf("marshal Record: %v", err)
+	}
+	var decoded map[string]json.RawMessage
+	if err := json.Unmarshal(blob, &decoded); err != nil {
+		t.Fatalf("unmarshal Record: %v", err)
+	}
+	want := map[string]bool{}
+	for _, k := range v1alpha4RecordKeys {
+		want[k] = true
+	}
+	for _, k := range v1alpha5AddedKeys {
+		want[k] = true
+	}
+	var extra, missing []string
+	for k := range decoded {
+		if !want[k] {
+			extra = append(extra, k)
+		}
+	}
+	for k := range want {
+		if _, ok := decoded[k]; !ok {
+			missing = append(missing, k)
+		}
+	}
+	sort.Strings(extra)
+	sort.Strings(missing)
+	if len(extra) > 0 {
+		t.Errorf("v1alpha6 added ledger field(s) it is not authorised to add: %v", extra)
+	}
+	if len(missing) > 0 {
+		t.Errorf("v1alpha6 dropped field(s): %v", missing)
+	}
+	if got, want := len(decoded), len(v1alpha4RecordKeys)+len(v1alpha5AddedKeys); got != want {
+		t.Errorf("Record key count = %d, want %d", got, want)
 	}
 }
