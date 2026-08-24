@@ -22,6 +22,14 @@ typedef unsigned long long __u64;
 #define IPPROTO_TCP 6
 
 #define TCP_ESTABLISHED 1
+// v1alpha6: entry creation moves forward to the SYN states so a connection's
+// handshake packets have somewhere to be counted. TCP_NEW_SYN_RECV (12) is
+// deliberately NOT handled: its tracepoint fires with skaddr pointing at a
+// struct request_sock, whose layout only guarantees the embedded sock_common
+// -- sk_cgrp_data (read by sk_cgroup_id) lives outside it, so attributing
+// from that pointer would read whatever happens to sit at that offset.
+#define TCP_SYN_SENT 2
+#define TCP_SYN_RECV 3
 #define TCP_CLOSE 7
 
 #define EVENT_CONNECT 1
@@ -335,9 +343,19 @@ struct flow_stats {
 	// value and the flag never goes back to 0 while the entry lives.
 	__u8 tcp_header_observed_sent;
 	__u8 tcp_header_observed_recv;
-	// Explicit tail padding: keep it exact so the struct never grows implicit
-	// padding the Go mirror cannot see (binary.Read is padding-blind).
-	__u8 _pad1[6];
+	// v1alpha6: 0 while the connection has NOT yet reached ESTABLISHED. It
+	// gates update_packet_stats' single pre-establishment write barrier, where
+	// the ONLY fields allowed to move are the six directional flag counters.
+	// Kernel-internal: deliberately NOT mirrored into struct flow_event, so
+	// v1alpha6 adds no ledger field at all. Carved out of the existing tail
+	// padding, so sizeof(struct flow_stats) is unchanged at 600 bytes.
+	//
+	// Set to 1 by: the TCP_ESTABLISHED branch, and ensure_stats() -- a socket
+	// already doing sendmsg/recvmsg is established by construction, and that
+	// path must keep its full v1alpha5 accounting even when the ESTABLISHED
+	// tracepoint was missed.
+	__u8 established;
+	__u8 _pad1[5];
 };
 
 struct flow_event {
@@ -856,6 +874,11 @@ static struct flow_stats *ensure_stats(struct flow_key *key, __u64 now)
 	init->last_seen_ns = now;
 	init->last_emit_ns = now;
 	init->cgroup_id = bpf_get_current_cgroup_id();
+	// This path is only reached from tcp_sendmsg/tcp_recvmsg, i.e. a socket
+	// that is already carrying data. Marking it established keeps the
+	// v1alpha6 write barrier from silently muting a flow whose ESTABLISHED
+	// tracepoint we never saw -- its accounting must stay exactly v1alpha5.
+	init->established = 1;
 	if (bpf_map_update_elem(&flow_stats_map, key, init, BPF_ANY) != 0) {
 		increment_drop(DROP_MAP_UPDATE_FAILED);
 		return 0;
@@ -1176,6 +1199,7 @@ static void update_packet_stats(struct __sk_buff *skb, struct flow_key *key, __u
 	__u64 iat_us;
 	struct flow_config *cfg;
 	struct tcp_flags_window tcpfw = {};
+	int tcp_hdr_ok = 0;
 	__u16 win;
 	int pkt_bucket;
 	int nf_idx;
@@ -1192,12 +1216,6 @@ static void update_packet_stats(struct __sk_buff *skb, struct flow_key *key, __u
 	stats = bpf_map_lookup_elem(&flow_stats_map, key);
 	if (!stats)
 		return;
-	if (stats->cgroup_id == 0) {
-		cgroup_id = bpf_skb_cgroup_id(skb);
-		if (cgroup_id == 0)
-			cgroup_id = bpf_get_current_cgroup_id();
-		stats->cgroup_id = cgroup_id;
-	}
 
 	// ------------------------------------------------------------------
 	// THE direction split. This is the ONLY place in the collector where a
@@ -1229,6 +1247,55 @@ static void update_packet_stats(struct __sk_buff *skb, struct flow_key *key, __u
 		dir_ttl_max = &stats->ip_ttl_max_out;
 	}
 
+	// ------------------------------------------------------------------
+	// Phase B, hoisted above the v1alpha6 barrier. The TCP byte-12..15 load
+	// is unchanged and still happens at most once per packet; only its
+	// position moved, because the flag COUNTS it feeds are the one field
+	// family allowed to move before the connection is established. Everything
+	// else this load supplies (the flag OR-masks, the header-observed
+	// witness, the window maximum) stays below the barrier and is therefore
+	// still written only for established flows, exactly as in v1alpha5.
+	// ------------------------------------------------------------------
+	cfg = get_flow_config();
+	if (meta && cfg && cfg->collect_header_aggregates && meta->tcp_hdr_off != 0 &&
+	    bpf_skb_load_bytes(skb, meta->tcp_hdr_off + 12, &tcpfw, sizeof(tcpfw)) == 0) {
+		tcp_hdr_ok = 1;
+		// v1alpha5 semantics, unchanged: counts of PACKETS BEARING each flag,
+		// per direction, atomically so a one-shot SYN/RST can never be lost
+		// to a cross-CPU race. A packet carrying several flags increments
+		// each corresponding counter.
+		if (tcpfw.flags & TCP_FLAG_SYN)
+			__sync_fetch_and_add(dir_syn_count, 1);
+		if (tcpfw.flags & TCP_FLAG_FIN)
+			__sync_fetch_and_add(dir_fin_count, 1);
+		if (tcpfw.flags & TCP_FLAG_RST)
+			__sync_fetch_and_add(dir_rst_count, 1);
+	}
+
+	// ==================================================================
+	// v1alpha6 PRE-ESTABLISHMENT WRITE BARRIER -- the single short-circuit.
+	//
+	// Above this line: the six directional flag counters, and nothing else.
+	// Below this line: every other field, reached only once the connection
+	// has reached ESTABLISHED (or was adopted mid-flight by ensure_stats).
+	//
+	// This is what makes v1alpha6 "A-double-prime": a refused or unanswered
+	// connect now leaves flag evidence on its session_summary row, while
+	// every other field on every row -- successful or failed -- keeps exactly
+	// the value v1alpha5 would have produced. Anything that needs to run for
+	// a not-yet-established flow MUST be placed above this barrier, and
+	// placing anything else there breaks that guarantee.
+	// ==================================================================
+	if (!stats->established)
+		return;
+
+	if (stats->cgroup_id == 0) {
+		cgroup_id = bpf_skb_cgroup_id(skb);
+		if (cgroup_id == 0)
+			cgroup_id = bpf_get_current_cgroup_id();
+		stats->cgroup_id = cgroup_id;
+	}
+
 	pkt_bucket = packet_size_bucket(packet_len);
 	if (pkt_bucket >= 0 && pkt_bucket < 7) {
 		__sync_fetch_and_add(&stats->pkt_size_buckets[pkt_bucket], 1);
@@ -1248,7 +1315,6 @@ static void update_packet_stats(struct __sk_buff *skb, struct flow_key *key, __u
 	// paid by packet_ep_miss traffic. The config gates skip the updates in
 	// the BPF program itself; a disabled feature is never just Go-side
 	// nulling.
-	cfg = get_flow_config();
 	if (meta && cfg && cfg->collect_header_aggregates) {
 		// TTL / IP-length envelopes reuse phase-A bytes (no extra loads).
 		if (meta->ip_ttl != 0) {
@@ -1277,21 +1343,9 @@ static void update_packet_stats(struct __sk_buff *skb, struct flow_key *key, __u
 		// 6.8): a plain |= is a read-modify-write and a cross-CPU race could
 		// permanently lose a one-shot SYN/RST/FIN bit. The window max stays
 		// a best-effort extremum (see flow_stats comment).
-		if (meta->tcp_hdr_off != 0 &&
-		    bpf_skb_load_bytes(skb, meta->tcp_hdr_off + 12, &tcpfw, sizeof(tcpfw)) == 0) {
+		// Reuses the single hoisted load above -- no second read.
+		if (tcp_hdr_ok) {
 			win = bpf_ntohs(tcpfw.window);
-			// v1alpha5: count the flag bits of THIS packet into the
-			// direction selected above. Atomic add for the same reason the
-			// OR is atomic: a lost SYN/RST on a cross-CPU race would be
-			// unrecoverable. A packet carrying several flags (SYN+ACK,
-			// FIN+ACK, RST+ACK) increments each corresponding counter --
-			// these count PACKETS BEARING the flag, not TCP events.
-			if (tcpfw.flags & TCP_FLAG_SYN)
-				__sync_fetch_and_add(dir_syn_count, 1);
-			if (tcpfw.flags & TCP_FLAG_FIN)
-				__sync_fetch_and_add(dir_fin_count, 1);
-			if (tcpfw.flags & TCP_FLAG_RST)
-				__sync_fetch_and_add(dir_rst_count, 1);
 			if (ingress) {
 				stats->tcp_header_observed_recv = 1;
 				__sync_fetch_and_or(&stats->tcp_flags_or_recv, (__u32)tcpfw.flags);
@@ -1356,6 +1410,7 @@ int handle_inet_sock_set_state(struct trace_event_raw_inet_sock_set_state *ctx)
 	struct flow_key key = {};
 	struct flow_stats *init;
 	struct flow_stats *stats;
+	__u64 cgid;
 	__u64 now = bpf_ktime_get_ns();
 	__u64 netns_ino = netns_ino_from_sock((struct sock *)ctx->skaddr);
 
@@ -1386,7 +1441,79 @@ int handle_inet_sock_set_state(struct trace_event_raw_inet_sock_set_state *ctx)
 	key.protocol = IPPROTO_TCP;
 	key.direction = DIRECTION_UNKNOWN;
 
+	// v1alpha6: create the entry (and its local-endpoint index) as soon as the
+	// connection leaves CLOSED, so the handshake packets -- and, for a refused
+	// or unanswered connect, the ONLY packets there will ever be -- have an
+	// entry to be counted against. No ringbuf event is emitted here: the Go
+	// sessionizer must keep learning about a connection from CONNECT/CLOSE
+	// exactly as in v1alpha5, which is what keeps conn_start_time and the
+	// window-validity logic byte-for-byte unchanged.
+	//
+	// The entry is born with established=0, so update_packet_stats' write
+	// barrier lets ONLY the six directional flag counters move until the
+	// ESTABLISHED transition below opens it up.
+	if (ctx->newstate == TCP_SYN_SENT || ctx->newstate == TCP_SYN_RECV) {
+		// PORT-ZERO HAZARD (measured, not theoretical). tcp_v4_connect calls
+		// tcp_set_state(sk, TCP_SYN_SENT) -- which fires this tracepoint --
+		// BEFORE inet_hash_connect() picks the ephemeral source port; the
+		// kernel's own comment there reads "sport may be zero". An
+		// application that binds before connecting (busybox nc) already has a
+		// port here; one that just calls connect() (busybox wget, and most
+		// libraries) does not. Creating an entry keyed on port 0 would index
+		// a key no packet can ever resolve to, so refuse it and let the
+		// tcp_connect kprobe below -- which runs after the port is assigned
+		// and before the SYN is transmitted -- create the entry instead.
+		if (key.src_port == 0) {
+			increment_drop(DROP_DEGENERATE_KEY);
+			return 0;
+		}
+		if (bpf_map_lookup_elem(&flow_stats_map, &key))
+			return 0; // already tracked; never re-create
+		init = zeroed_stats_template();
+		if (!init) {
+			increment_drop(DROP_MAP_UPDATE_FAILED);
+			return 0;
+		}
+		init->start_ns = now;
+		init->last_seen_ns = now;
+		init->last_emit_ns = now;
+		init->cgroup_id = sk_cgroup_id((struct sock *)ctx->skaddr);
+		if (init->cgroup_id == 0)
+			init->cgroup_id = bpf_get_current_cgroup_id();
+		init->netns_ino = netns_ino;
+		init->established = 0;
+		if (bpf_map_update_elem(&flow_stats_map, &key, init, BPF_ANY) != 0) {
+			increment_drop(DROP_MAP_UPDATE_FAILED);
+			return 0;
+		}
+		index_local_ep(&key);
+		return 0;
+	}
+
 	if (ctx->newstate == TCP_ESTABLISHED) {
+		// IDEMPOTENT: an entry created at SYN_SENT/SYN_RECV is ADOPTED, never
+		// overwritten -- a blind re-create here would discard the handshake
+		// flag counts we just went to the trouble of collecting, and would
+		// also reset start_ns mid-connection.
+		stats = bpf_map_lookup_elem(&flow_stats_map, &key);
+		if (stats) {
+			stats->established = 1;
+			stats->last_seen_ns = now;
+			// socket-owned cgroup: see the fresh-create path below.
+			cgid = sk_cgroup_id((struct sock *)ctx->skaddr);
+			if (cgid == 0)
+				cgid = bpf_get_current_cgroup_id();
+			if (cgid != 0)
+				stats->cgroup_id = cgid;
+			if (netns_ino != 0)
+				stats->netns_ino = netns_ino;
+			stats->syn_count = 1;
+			stats->tcp_metrics_available = 1;
+			index_local_ep(&key);
+			emit_flow_event(&key, stats, EVENT_CONNECT, now, netns_ino);
+			return 0;
+		}
+
 		init = zeroed_stats_template();
 		if (!init) {
 			increment_drop(DROP_MAP_UPDATE_FAILED);
@@ -1407,6 +1534,7 @@ int handle_inet_sock_set_state(struct trace_event_raw_inet_sock_set_state *ctx)
 		// different, packet-level quantity written only at cgroup_skb.
 		init->syn_count = 1;
 		init->tcp_metrics_available = 1;
+		init->established = 1;
 		if (bpf_map_update_elem(&flow_stats_map, &key, init, BPF_ANY) != 0) {
 			increment_drop(DROP_MAP_UPDATE_FAILED);
 			return 0;
@@ -1421,7 +1549,15 @@ int handle_inet_sock_set_state(struct trace_event_raw_inet_sock_set_state *ctx)
 		struct local_ep ep = {};
 
 		stats = bpf_map_lookup_elem(&flow_stats_map, &key);
-		if (stats) {
+		// v1alpha6 write barrier, event-path half. Before v1alpha6 a refused
+		// or unanswered connect had NO entry here, so this block never ran for
+		// one and its record carried fin_count=0 / tcp_metrics_available=false.
+		// Early entry creation would silently start writing all three on those
+		// records -- existing fields changing value on existing rows. Gate them
+		// on established so a never-established connection's record keeps
+		// exactly its v1alpha5 shape, plus the six flag counters and nothing
+		// else.
+		if (stats && stats->established) {
 			stats->close_seen = 1;
 			stats->fin_count += 1;
 			stats->tcp_metrics_available = 1;
@@ -1434,6 +1570,54 @@ int handle_inet_sock_set_state(struct trace_event_raw_inet_sock_set_state *ctx)
 		return 0;
 	}
 
+	return 0;
+}
+
+// v1alpha6: the reliable early-creation point for ACTIVE connects.
+//
+// The inet_sock_set_state(TCP_SYN_SENT) tracepoint fires before the ephemeral
+// source port exists (see the PORT-ZERO HAZARD note above), so for the common
+// connect()-without-bind path it cannot produce a usable key. tcp_connect() is
+// entered after inet_hash_connect() has assigned and hashed the port, and it
+// is what builds and transmits the SYN -- so a kprobe on its entry is the last
+// moment at which the flow key is complete and the first packet has not yet
+// left. Creating the entry here is what makes the handshake countable for
+// every client, not just the ones that happen to bind first.
+//
+// Idempotent and established=0, exactly like the tracepoint path: this only
+// ever creates, never overwrites, and the ESTABLISHED transition adopts.
+SEC("kprobe/tcp_connect")
+int handle_tcp_connect(struct pt_regs *ctx)
+{
+	struct sock *sk = (struct sock *)PT_REGS_PARM1(ctx);
+	struct flow_key key;
+	struct flow_stats *init;
+	__u64 now;
+
+	// key_from_sock rejects degenerate (port-0) keys for us.
+	if (key_from_sock(sk, &key, DIRECTION_UNKNOWN) != 0)
+		return 0;
+	if (bpf_map_lookup_elem(&flow_stats_map, &key))
+		return 0;
+	init = zeroed_stats_template();
+	if (!init) {
+		increment_drop(DROP_MAP_UPDATE_FAILED);
+		return 0;
+	}
+	now = bpf_ktime_get_ns();
+	init->start_ns = now;
+	init->last_seen_ns = now;
+	init->last_emit_ns = now;
+	init->cgroup_id = sk_cgroup_id(sk);
+	if (init->cgroup_id == 0)
+		init->cgroup_id = bpf_get_current_cgroup_id();
+	init->netns_ino = netns_ino_from_sock(sk);
+	init->established = 0;
+	if (bpf_map_update_elem(&flow_stats_map, &key, init, BPF_ANY) != 0) {
+		increment_drop(DROP_MAP_UPDATE_FAILED);
+		return 0;
+	}
+	index_local_ep(&key);
 	return 0;
 }
 
