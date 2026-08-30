@@ -19,7 +19,13 @@ const (
 	// docs/schema-v1alpha4.md). v1alpha3 fixed the cumulative-snapshot
 	// double-counting present in v1alpha2 and exported cgroup_skb-observed skb
 	// packet counts (docs/schema-v1alpha3.md, "Migration from v1alpha2").
-	SchemaVersion = "v1alpha4"
+	// v1alpha5 ADDS per-direction (_out/_in) variants of the packet-size
+	// histogram, the IAT histogram and the TTL envelope, plus per-direction
+	// TCP flag PACKET counts (syn/fin/rst_count_out/in). It changes NOTHING
+	// about any v1alpha4 field: names, types, semantics, bucket edges, window
+	// logic and window length are byte-for-byte the same, so a v1alpha4
+	// analysis reads a v1alpha5 record unchanged (docs/schema-v1alpha5.md).
+	SchemaVersion = "v1alpha7"
 	// Bumped alongside the schema: window records' histogram/idle/burst/
 	// SYN/FIN/RST/byte features are now fixed-window increments, not
 	// lifetime-cumulative values, so their distributions are not comparable

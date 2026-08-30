@@ -12,6 +12,7 @@ typedef unsigned long long __u64;
 
 #define BPF_MAP_TYPE_HASH 1
 #define BPF_MAP_TYPE_ARRAY 2
+#define BPF_MAP_TYPE_PERCPU_ARRAY 6
 #define BPF_MAP_TYPE_LRU_HASH 9
 #define BPF_MAP_TYPE_RINGBUF 27
 #define BPF_ANY 0
@@ -21,6 +22,14 @@ typedef unsigned long long __u64;
 #define IPPROTO_TCP 6
 
 #define TCP_ESTABLISHED 1
+// v1alpha6: entry creation moves forward to the SYN states so a connection's
+// handshake packets have somewhere to be counted. TCP_NEW_SYN_RECV (12) is
+// deliberately NOT handled: its tracepoint fires with skaddr pointing at a
+// struct request_sock, whose layout only guarantees the embedded sock_common
+// -- sk_cgrp_data (read by sk_cgroup_id) lives outside it, so attributing
+// from that pointer would read whatever happens to sit at that offset.
+#define TCP_SYN_SENT 2
+#define TCP_SYN_RECV 3
 #define TCP_CLOSE 7
 
 #define EVENT_CONNECT 1
@@ -32,6 +41,13 @@ typedef unsigned long long __u64;
 #define DIRECTION_SEND 1
 #define DIRECTION_RECV 2
 
+// Raw TCP header flag bits, used only by the v1alpha5 per-direction flag
+// counters. Deliberately NOT applied to tcp_flags_or_sent/recv, which keep
+// exporting the whole flag byte unmasked.
+#define TCP_FLAG_FIN 0x01
+#define TCP_FLAG_SYN 0x02
+#define TCP_FLAG_RST 0x04
+
 #define DROP_MAP_UPDATE_FAILED 0
 #define DROP_RINGBUF_RESERVE_FAILED 1
 #define DROP_UNSUPPORTED_FAMILY 2
@@ -42,7 +58,12 @@ typedef unsigned long long __u64;
 #define DROP_PACKET_EP_MISS 7
 #define DROP_RETRANS_FLOW_MISS 8
 #define DROP_DEGENERATE_KEY 9
-#define DROP_COUNTERS_LEN 10
+// v1alpha7 aliasing diagnostics. Neither is an error: DIRECT_MISS counts the
+// packets that had to fall back to the (ambiguous) local-endpoint index, and
+// ALIAS_OVERWRITE counts index slots taken away from a still-live neighbour.
+#define DROP_PACKET_DIRECT_MISS 10
+#define DROP_LOCAL_EP_ALIAS_OVERWRITE 11
+#define DROP_COUNTERS_LEN 12
 
 #define FLOW_STATS_MAX_ENTRIES 65536
 #define RECV_ARGS_MAX_ENTRIES 16384
@@ -229,9 +250,59 @@ struct flow_stats {
 	// retransmissions are NOT observable from this hook.
 	__u64 retrans_skb_count;
 	__u64 retrans_skb_bytes;
+	// v1alpha5: per-direction split of the packet-size and IAT histograms.
+	// "out" = local egress, "in" = local ingress (the SAME `ingress` argument
+	// of update_packet_stats that selects real_packets_sent/recv); NOT
+	// client/server. Bucket edges are the SAME packet_size_bucket() /
+	// iat_bucket() functions as the mixed arrays above -- there is no second
+	// bucket table.
+	//
+	// pkt_size_buckets_out/in: EXACT decomposition of pkt_size_buckets --
+	// every packet is counted once into the mixed array and once into its
+	// direction array from the same call site, so out[i] + in[i] ==
+	// pkt_size_buckets[i] holds bucket by bucket. The mixed array is
+	// deliberately NOT rewritten as a derived sum: keeping the two
+	// accumulations independent is what makes that identity a real check
+	// instead of a tautology.
+	//
+	// iat_buckets_out/in: ALSO an exact decomposition, and this is a property
+	// of the implementation, not of IAT in general. The mixed iat_buckets
+	// array never measured cross-direction interleaving: update_packet_stats
+	// has always differenced against last_packet_ns_sent / last_packet_ns_recv,
+	// i.e. the previous packet IN THE SAME DIRECTION, and added the result to
+	// one shared array. Splitting the destination therefore reproduces the
+	// mixed array exactly. Do not describe these as "a new quantity that must
+	// not be summed" -- for THIS collector out + in == mixed, per bucket.
+	__u64 pkt_size_buckets_out[7];
+	__u64 pkt_size_buckets_in[7];
+	__u64 iat_buckets_out[6];
+	__u64 iat_buckets_in[6];
 	__u32 syn_count;
 	__u32 fin_count;
 	__u32 rst_count;
+	// v1alpha5: per-direction TCP flag PACKET counts, read from the raw TCP
+	// flag byte at cgroup_skb (bit 0x02 SYN, 0x01 FIN, 0x04 RST) on the same
+	// phase-B path and under the same collect_header_aggregates gate as
+	// tcp_flags_or_sent/recv. These are per-PACKET counts and are a DIFFERENT
+	// quantity from the legacy syn_count/fin_count above, which are
+	// per-CONNECTION constants written by the inet_sock_set_state tracepoint
+	// (syn_count=1 at ESTABLISHED, fin_count+=1 at TCP_CLOSE). A SYN
+	// retransmission increments syn_count_out and never touches syn_count.
+	//
+	// COVERAGE (structural, v1alpha5): the packet path is reached only after
+	// canonical_key_from_skb resolves local_ep_to_key, which is populated
+	// exclusively when a connection reaches ESTABLISHED. A connection that is
+	// refused (SYN -> RST) or never answered (SYN -> timeout) has no
+	// flow_stats entry at all, so its packets are counted in
+	// DROP_PACKET_EP_MISS and are attributed nowhere. rst_count_in therefore
+	// observes resets on ESTABLISHED connections (server reset, idle-timeout
+	// reset, abortive close) and NOT closed-port connection refusals.
+	__u32 syn_count_out;
+	__u32 syn_count_in;
+	__u32 fin_count_out;
+	__u32 fin_count_in;
+	__u32 rst_count_out;
+	__u32 rst_count_in;
 	// CONCURRENCY: the min/max extrema below (ip_ttl_*, tcp_win_max_*,
 	// ip_pkt_len_*, and pkt_size_min/max above) are updated with non-atomic
 	// compare-then-store. Two CPUs racing on the same flow can each pass the
@@ -256,6 +327,14 @@ struct flow_stats {
 	__u16 ip_pkt_len_max;
 	__u8 ip_ttl_min; // 0 = never observed (TTL 0 is invalid on the wire)
 	__u8 ip_ttl_max;
+	// v1alpha5: same TTL envelope, split by direction. Identical rolling
+	// semantics to the mixed pair above -- cumulative over the flow_stats
+	// entry lifetime, NEVER reset per window -- and the same best-effort
+	// concurrent-extremum caveat. 0 = that direction never observed a packet.
+	__u8 ip_ttl_min_out;
+	__u8 ip_ttl_max_out;
+	__u8 ip_ttl_min_in;
+	__u8 ip_ttl_max_in;
 	__u8 close_seen;
 	__u8 client_hello_inspected;
 	__u8 server_hello_inspected;
@@ -269,7 +348,19 @@ struct flow_stats {
 	// value and the flag never goes back to 0 while the entry lives.
 	__u8 tcp_header_observed_sent;
 	__u8 tcp_header_observed_recv;
-	__u8 _pad1[2];
+	// v1alpha6: 0 while the connection has NOT yet reached ESTABLISHED. It
+	// gates update_packet_stats' single pre-establishment write barrier, where
+	// the ONLY fields allowed to move are the six directional flag counters.
+	// Kernel-internal: deliberately NOT mirrored into struct flow_event, so
+	// v1alpha6 adds no ledger field at all. Carved out of the existing tail
+	// padding, so sizeof(struct flow_stats) is unchanged at 600 bytes.
+	//
+	// Set to 1 by: the TCP_ESTABLISHED branch, and ensure_stats() -- a socket
+	// already doing sendmsg/recvmsg is established by construction, and that
+	// path must keep its full v1alpha5 accounting even when the ESTABLISHED
+	// tracepoint was missed.
+	__u8 established;
+	__u8 _pad1[5];
 };
 
 struct flow_event {
@@ -306,9 +397,25 @@ struct flow_event {
 	__u64 nf_ip_size_buckets[6];
 	__u64 retrans_skb_count;
 	__u64 retrans_skb_bytes;
+	// v1alpha5 per-direction additions; must stay in sync with rawEBPFEvent
+	// in pkg/collector/ebpf_event.go (TestRawEBPFEventLayoutMatchesBTF is the
+	// authoritative check). See the flow_stats comments for semantics: the
+	// two histogram pairs are EXACT decompositions of the mixed arrays, the
+	// *_count_out/in are per-PACKET flag counts (not the per-connection
+	// syn_count/fin_count), and the TTL pairs are lifetime envelopes.
+	__u64 pkt_size_buckets_out[7];
+	__u64 pkt_size_buckets_in[7];
+	__u64 iat_buckets_out[6];
+	__u64 iat_buckets_in[6];
 	__u32 syn_count;
 	__u32 fin_count;
 	__u32 rst_count;
+	__u32 syn_count_out;
+	__u32 syn_count_in;
+	__u32 fin_count_out;
+	__u32 fin_count_in;
+	__u32 rst_count_out;
+	__u32 rst_count_in;
 	// Same compactness/alignment rules as flow_stats: flags stay __u32 for
 	// the atomic OR source field they mirror; window/tot_len are 16-bit wire
 	// fields, TTL is 8-bit.
@@ -320,12 +427,16 @@ struct flow_event {
 	__u16 ip_pkt_len_max;
 	__u8 ip_ttl_min;
 	__u8 ip_ttl_max;
+	__u8 ip_ttl_min_out;
+	__u8 ip_ttl_max_out;
+	__u8 ip_ttl_min_in;
+	__u8 ip_ttl_max_in;
 	__u8 traffic_accounting_available;
 	__u8 packet_timing_available;
 	__u8 tcp_metrics_available;
 	__u8 tcp_header_observed_sent;
 	__u8 tcp_header_observed_recv;
-	__u8 _pad2[5];
+	__u8 _pad2[9];
 };
 
 struct trace_event_raw_inet_sock_set_state {
@@ -402,6 +513,21 @@ struct {
 	__type(key, struct flow_key);
 	__type(value, struct flow_stats);
 } flow_stats_map SEC(".maps");
+
+// Scratch space for the flow_stats initializer. struct flow_stats outgrew the
+// 512-byte BPF stack in v1alpha5 (the per-direction histograms alone are 208
+// bytes), so the zero-filled template is built in a per-CPU array instead of
+// on the stack. Per-CPU means no cross-CPU sharing and no locking is needed;
+// each user memsets it before filling and copies it into flow_stats_map in the
+// same call, so nothing is ever read back from here. Entry-creation paths only
+// (connection establishment / first syscall on an unindexed flow) -- never the
+// per-packet path.
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, struct flow_stats);
+} flow_stats_init_scratch SEC(".maps");
 
 // DNAT-invariant local-endpoint index: maps a connection's local endpoint
 // (local IP + local port) to the canonical socket-side flow_key stored in
@@ -627,6 +753,26 @@ static void fill_event_fields(struct flow_event *event, struct flow_key *key, st
 #pragma unroll
 		for (i = 0; i < 6; i++)
 			event->nf_ip_size_buckets[i] = stats->nf_ip_size_buckets[i];
+#pragma unroll
+		for (i = 0; i < 7; i++) {
+			event->pkt_size_buckets_out[i] = stats->pkt_size_buckets_out[i];
+			event->pkt_size_buckets_in[i] = stats->pkt_size_buckets_in[i];
+		}
+#pragma unroll
+		for (i = 0; i < 6; i++) {
+			event->iat_buckets_out[i] = stats->iat_buckets_out[i];
+			event->iat_buckets_in[i] = stats->iat_buckets_in[i];
+		}
+		event->syn_count_out = stats->syn_count_out;
+		event->syn_count_in = stats->syn_count_in;
+		event->fin_count_out = stats->fin_count_out;
+		event->fin_count_in = stats->fin_count_in;
+		event->rst_count_out = stats->rst_count_out;
+		event->rst_count_in = stats->rst_count_in;
+		event->ip_ttl_min_out = stats->ip_ttl_min_out;
+		event->ip_ttl_max_out = stats->ip_ttl_max_out;
+		event->ip_ttl_min_in = stats->ip_ttl_min_in;
+		event->ip_ttl_max_in = stats->ip_ttl_max_in;
 		event->ip_ttl_min = stats->ip_ttl_min;
 		event->ip_ttl_max = stats->ip_ttl_max;
 		event->tcp_flags_or_sent = stats->tcp_flags_or_sent;
@@ -693,27 +839,61 @@ static int emit_flow_event_no_pid(struct flow_key *key, struct flow_stats *stats
 static void index_local_ep(struct flow_key *key)
 {
 	struct local_ep ep = {};
+	struct flow_key *prev;
 
 	ep.ip = key->src_ip;
 	ep.port = key->src_port;
+	// v1alpha7 diagnostic. BPF_ANY overwrites a slot a live neighbour owns and
+	// returns SUCCESS -- which is why this aliasing ran for weeks with
+	// map_update_failed pinned at 0. Count it, so the ambiguity is observable
+	// for as long as the index survives as a fallback. Entry-creation path
+	// only, never per-packet.
+	prev = bpf_map_lookup_elem(&local_ep_to_key, &ep);
+	if (prev && (prev->dst_ip != key->dst_ip || prev->dst_port != key->dst_port))
+		increment_drop(DROP_LOCAL_EP_ALIAS_OVERWRITE);
 	if (bpf_map_update_elem(&local_ep_to_key, &ep, key, BPF_ANY) != 0)
 		increment_drop(DROP_MAP_UPDATE_FAILED);
 }
 
+// Return this CPU's zeroed flow_stats template (see flow_stats_init_scratch).
+// The returned pointer is scratch: fill it and hand it to bpf_map_update_elem
+// in the same call path; it is never a live flow's stats.
+static struct flow_stats *zeroed_stats_template(void)
+{
+	__u32 zero = 0;
+	struct flow_stats *init;
+
+	init = bpf_map_lookup_elem(&flow_stats_init_scratch, &zero);
+	if (!init)
+		return 0;
+	__builtin_memset(init, 0, sizeof(*init));
+	return init;
+}
+
 static struct flow_stats *ensure_stats(struct flow_key *key, __u64 now)
 {
-	struct flow_stats init = {};
+	struct flow_stats *init;
 	struct flow_stats *stats;
 
 	stats = bpf_map_lookup_elem(&flow_stats_map, key);
 	if (stats)
 		return stats;
 
-	init.start_ns = now;
-	init.last_seen_ns = now;
-	init.last_emit_ns = now;
-	init.cgroup_id = bpf_get_current_cgroup_id();
-	if (bpf_map_update_elem(&flow_stats_map, key, &init, BPF_ANY) != 0) {
+	init = zeroed_stats_template();
+	if (!init) {
+		increment_drop(DROP_MAP_UPDATE_FAILED);
+		return 0;
+	}
+	init->start_ns = now;
+	init->last_seen_ns = now;
+	init->last_emit_ns = now;
+	init->cgroup_id = bpf_get_current_cgroup_id();
+	// This path is only reached from tcp_sendmsg/tcp_recvmsg, i.e. a socket
+	// that is already carrying data. Marking it established keeps the
+	// v1alpha6 write barrier from silently muting a flow whose ESTABLISHED
+	// tracepoint we never saw -- its accounting must stay exactly v1alpha5.
+	init->established = 1;
+	if (bpf_map_update_elem(&flow_stats_map, key, init, BPF_ANY) != 0) {
 		increment_drop(DROP_MAP_UPDATE_FAILED);
 		return 0;
 	}
@@ -1033,14 +1213,96 @@ static void update_packet_stats(struct __sk_buff *skb, struct flow_key *key, __u
 	__u64 iat_us;
 	struct flow_config *cfg;
 	struct tcp_flags_window tcpfw = {};
+	int tcp_hdr_ok = 0;
 	__u16 win;
 	int pkt_bucket;
 	int nf_idx;
 	int iat_idx;
+	// v1alpha5 per-direction destinations. See the single split below.
+	__u64 *dir_pkt_buckets;
+	__u64 *dir_iat_buckets;
+	__u32 *dir_syn_count;
+	__u32 *dir_fin_count;
+	__u32 *dir_rst_count;
+	__u8 *dir_ttl_min;
+	__u8 *dir_ttl_max;
 
 	stats = bpf_map_lookup_elem(&flow_stats_map, key);
 	if (!stats)
 		return;
+
+	// ------------------------------------------------------------------
+	// THE direction split. This is the ONLY place in the collector where a
+	// v1alpha5 per-direction field is selected, and it branches on the very
+	// same `ingress` argument that selects real_packets_sent/recv further
+	// down (exported as observed_skb_packets_out/in). Every v1alpha5 write
+	// below goes through these pointers, so the whole feature has ONE
+	// direction predicate -- the function's own `ingress` parameter -- and no
+	// way for a new field to disagree with the skb packet counts about what
+	// "out" and "in" mean. (`ingress` is tested in two places in this
+	// function: here, and in the pre-existing real_packets_*/last_packet_ns_*
+	// block below, which v1alpha5 deliberately does not touch.)
+	// ------------------------------------------------------------------
+	if (ingress) {
+		dir_pkt_buckets = stats->pkt_size_buckets_in;
+		dir_iat_buckets = stats->iat_buckets_in;
+		dir_syn_count = &stats->syn_count_in;
+		dir_fin_count = &stats->fin_count_in;
+		dir_rst_count = &stats->rst_count_in;
+		dir_ttl_min = &stats->ip_ttl_min_in;
+		dir_ttl_max = &stats->ip_ttl_max_in;
+	} else {
+		dir_pkt_buckets = stats->pkt_size_buckets_out;
+		dir_iat_buckets = stats->iat_buckets_out;
+		dir_syn_count = &stats->syn_count_out;
+		dir_fin_count = &stats->fin_count_out;
+		dir_rst_count = &stats->rst_count_out;
+		dir_ttl_min = &stats->ip_ttl_min_out;
+		dir_ttl_max = &stats->ip_ttl_max_out;
+	}
+
+	// ------------------------------------------------------------------
+	// Phase B, hoisted above the v1alpha6 barrier. The TCP byte-12..15 load
+	// is unchanged and still happens at most once per packet; only its
+	// position moved, because the flag COUNTS it feeds are the one field
+	// family allowed to move before the connection is established. Everything
+	// else this load supplies (the flag OR-masks, the header-observed
+	// witness, the window maximum) stays below the barrier and is therefore
+	// still written only for established flows, exactly as in v1alpha5.
+	// ------------------------------------------------------------------
+	cfg = get_flow_config();
+	if (meta && cfg && cfg->collect_header_aggregates && meta->tcp_hdr_off != 0 &&
+	    bpf_skb_load_bytes(skb, meta->tcp_hdr_off + 12, &tcpfw, sizeof(tcpfw)) == 0) {
+		tcp_hdr_ok = 1;
+		// v1alpha5 semantics, unchanged: counts of PACKETS BEARING each flag,
+		// per direction, atomically so a one-shot SYN/RST can never be lost
+		// to a cross-CPU race. A packet carrying several flags increments
+		// each corresponding counter.
+		if (tcpfw.flags & TCP_FLAG_SYN)
+			__sync_fetch_and_add(dir_syn_count, 1);
+		if (tcpfw.flags & TCP_FLAG_FIN)
+			__sync_fetch_and_add(dir_fin_count, 1);
+		if (tcpfw.flags & TCP_FLAG_RST)
+			__sync_fetch_and_add(dir_rst_count, 1);
+	}
+
+	// ==================================================================
+	// v1alpha6 PRE-ESTABLISHMENT WRITE BARRIER -- the single short-circuit.
+	//
+	// Above this line: the six directional flag counters, and nothing else.
+	// Below this line: every other field, reached only once the connection
+	// has reached ESTABLISHED (or was adopted mid-flight by ensure_stats).
+	//
+	// This is what makes v1alpha6 "A-double-prime": a refused or unanswered
+	// connect now leaves flag evidence on its session_summary row, while
+	// every other field on every row -- successful or failed -- keeps exactly
+	// the value v1alpha5 would have produced. Anything that needs to run for
+	// a not-yet-established flow MUST be placed above this barrier, and
+	// placing anything else there breaks that guarantee.
+	// ==================================================================
+	if (!stats->established)
+		return;
+
 	if (stats->cgroup_id == 0) {
 		cgroup_id = bpf_skb_cgroup_id(skb);
 		if (cgroup_id == 0)
@@ -1049,8 +1311,12 @@ static void update_packet_stats(struct __sk_buff *skb, struct flow_key *key, __u
 	}
 
 	pkt_bucket = packet_size_bucket(packet_len);
-	if (pkt_bucket >= 0 && pkt_bucket < 7)
+	if (pkt_bucket >= 0 && pkt_bucket < 7) {
 		__sync_fetch_and_add(&stats->pkt_size_buckets[pkt_bucket], 1);
+		// Same packet, same bucket index, same call site: this is what makes
+		// out[i] + in[i] == pkt_size_buckets[i] an exact identity.
+		__sync_fetch_and_add(&dir_pkt_buckets[pkt_bucket], 1);
+	}
 	// flow_pkt_len (pkt_size_min/max) keeps its skb->len semantics.
 	if (stats->pkt_size_min == 0 || packet_len < stats->pkt_size_min)
 		stats->pkt_size_min = packet_len;
@@ -1063,7 +1329,6 @@ static void update_packet_stats(struct __sk_buff *skb, struct flow_key *key, __u
 	// paid by packet_ep_miss traffic. The config gates skip the updates in
 	// the BPF program itself; a disabled feature is never just Go-side
 	// nulling.
-	cfg = get_flow_config();
 	if (meta && cfg && cfg->collect_header_aggregates) {
 		// TTL / IP-length envelopes reuse phase-A bytes (no extra loads).
 		if (meta->ip_ttl != 0) {
@@ -1071,6 +1336,12 @@ static void update_packet_stats(struct __sk_buff *skb, struct flow_key *key, __u
 				stats->ip_ttl_min = meta->ip_ttl;
 			if (meta->ip_ttl > stats->ip_ttl_max)
 				stats->ip_ttl_max = meta->ip_ttl;
+			// v1alpha5: identical rule, per direction. Same best-effort
+			// concurrent-extremum caveat as the mixed pair.
+			if (*dir_ttl_min == 0 || meta->ip_ttl < *dir_ttl_min)
+				*dir_ttl_min = meta->ip_ttl;
+			if (meta->ip_ttl > *dir_ttl_max)
+				*dir_ttl_max = meta->ip_ttl;
 		}
 		if (meta->ip_tot_len != 0) {
 			if (stats->ip_pkt_len_min == 0 || meta->ip_tot_len < stats->ip_pkt_len_min)
@@ -1086,8 +1357,8 @@ static void update_packet_stats(struct __sk_buff *skb, struct flow_key *key, __u
 		// 6.8): a plain |= is a read-modify-write and a cross-CPU race could
 		// permanently lose a one-shot SYN/RST/FIN bit. The window max stays
 		// a best-effort extremum (see flow_stats comment).
-		if (meta->tcp_hdr_off != 0 &&
-		    bpf_skb_load_bytes(skb, meta->tcp_hdr_off + 12, &tcpfw, sizeof(tcpfw)) == 0) {
+		// Reuses the single hoisted load above -- no second read.
+		if (tcp_hdr_ok) {
 			win = bpf_ntohs(tcpfw.window);
 			if (ingress) {
 				stats->tcp_header_observed_recv = 1;
@@ -1123,8 +1394,15 @@ static void update_packet_stats(struct __sk_buff *skb, struct flow_key *key, __u
 	if (*last_packet_ns != 0 && now > *last_packet_ns) {
 		iat_us = (now - *last_packet_ns) / 1000;
 		iat_idx = iat_bucket(iat_us);
-		if (iat_idx >= 0 && iat_idx < 6)
+		if (iat_idx >= 0 && iat_idx < 6) {
 			__sync_fetch_and_add(&stats->iat_buckets[iat_idx], 1);
+			// iat_us was measured against *last_packet_ns, which is already
+			// the previous packet IN THIS DIRECTION (last_packet_ns_sent /
+			// last_packet_ns_recv). The mixed array has therefore always been
+			// the sum of the two within-direction histograms; splitting the
+			// destination reproduces it exactly, bucket by bucket.
+			__sync_fetch_and_add(&dir_iat_buckets[iat_idx], 1);
+		}
 		if (iat_us > 1000000)
 			__sync_fetch_and_add(&stats->idle_gap_count, 1);
 		if (iat_us > 0 && iat_us < 10000)
@@ -1144,8 +1422,9 @@ SEC("tracepoint/sock/inet_sock_set_state")
 int handle_inet_sock_set_state(struct trace_event_raw_inet_sock_set_state *ctx)
 {
 	struct flow_key key = {};
-	struct flow_stats init = {};
+	struct flow_stats *init;
 	struct flow_stats *stats;
+	__u64 cgid;
 	__u64 now = bpf_ktime_get_ns();
 	__u64 netns_ino = netns_ino_from_sock((struct sock *)ctx->skaddr);
 
@@ -1176,20 +1455,101 @@ int handle_inet_sock_set_state(struct trace_event_raw_inet_sock_set_state *ctx)
 	key.protocol = IPPROTO_TCP;
 	key.direction = DIRECTION_UNKNOWN;
 
+	// v1alpha6: create the entry (and its local-endpoint index) as soon as the
+	// connection leaves CLOSED, so the handshake packets -- and, for a refused
+	// or unanswered connect, the ONLY packets there will ever be -- have an
+	// entry to be counted against. No ringbuf event is emitted here: the Go
+	// sessionizer must keep learning about a connection from CONNECT/CLOSE
+	// exactly as in v1alpha5, which is what keeps conn_start_time and the
+	// window-validity logic byte-for-byte unchanged.
+	//
+	// The entry is born with established=0, so update_packet_stats' write
+	// barrier lets ONLY the six directional flag counters move until the
+	// ESTABLISHED transition below opens it up.
+	if (ctx->newstate == TCP_SYN_SENT || ctx->newstate == TCP_SYN_RECV) {
+		// PORT-ZERO HAZARD (measured, not theoretical). tcp_v4_connect calls
+		// tcp_set_state(sk, TCP_SYN_SENT) -- which fires this tracepoint --
+		// BEFORE inet_hash_connect() picks the ephemeral source port; the
+		// kernel's own comment there reads "sport may be zero". An
+		// application that binds before connecting (busybox nc) already has a
+		// port here; one that just calls connect() (busybox wget, and most
+		// libraries) does not. Creating an entry keyed on port 0 would index
+		// a key no packet can ever resolve to, so refuse it and let the
+		// tcp_connect kprobe below -- which runs after the port is assigned
+		// and before the SYN is transmitted -- create the entry instead.
+		if (key.src_port == 0) {
+			increment_drop(DROP_DEGENERATE_KEY);
+			return 0;
+		}
+		if (bpf_map_lookup_elem(&flow_stats_map, &key))
+			return 0; // already tracked; never re-create
+		init = zeroed_stats_template();
+		if (!init) {
+			increment_drop(DROP_MAP_UPDATE_FAILED);
+			return 0;
+		}
+		init->start_ns = now;
+		init->last_seen_ns = now;
+		init->last_emit_ns = now;
+		init->cgroup_id = sk_cgroup_id((struct sock *)ctx->skaddr);
+		if (init->cgroup_id == 0)
+			init->cgroup_id = bpf_get_current_cgroup_id();
+		init->netns_ino = netns_ino;
+		init->established = 0;
+		if (bpf_map_update_elem(&flow_stats_map, &key, init, BPF_ANY) != 0) {
+			increment_drop(DROP_MAP_UPDATE_FAILED);
+			return 0;
+		}
+		index_local_ep(&key);
+		return 0;
+	}
+
 	if (ctx->newstate == TCP_ESTABLISHED) {
-		init.start_ns = now;
-		init.last_seen_ns = now;
-		init.last_emit_ns = now;
+		// IDEMPOTENT: an entry created at SYN_SENT/SYN_RECV is ADOPTED, never
+		// overwritten -- a blind re-create here would discard the handshake
+		// flag counts we just went to the trouble of collecting, and would
+		// also reset start_ns mid-connection.
+		stats = bpf_map_lookup_elem(&flow_stats_map, &key);
+		if (stats) {
+			stats->established = 1;
+			stats->last_seen_ns = now;
+			// socket-owned cgroup: see the fresh-create path below.
+			cgid = sk_cgroup_id((struct sock *)ctx->skaddr);
+			if (cgid == 0)
+				cgid = bpf_get_current_cgroup_id();
+			if (cgid != 0)
+				stats->cgroup_id = cgid;
+			if (netns_ino != 0)
+				stats->netns_ino = netns_ino;
+			stats->syn_count = 1;
+			stats->tcp_metrics_available = 1;
+			index_local_ep(&key);
+			emit_flow_event(&key, stats, EVENT_CONNECT, now, netns_ino);
+			return 0;
+		}
+
+		init = zeroed_stats_template();
+		if (!init) {
+			increment_drop(DROP_MAP_UPDATE_FAILED);
+			return 0;
+		}
+		init->start_ns = now;
+		init->last_seen_ns = now;
+		init->last_emit_ns = now;
 		// socket-owned cgroup: ESTABLISHED fires in softirq on SYN-ACK for the active connector,
 		// so bpf_get_current_cgroup_id() may be an arbitrary co-located task. Attribute to the
 		// socket owner; fall back to current only for unowned (host-network) sockets.
-		init.cgroup_id = sk_cgroup_id((struct sock *)ctx->skaddr);
-		if (init.cgroup_id == 0)
-			init.cgroup_id = bpf_get_current_cgroup_id();
-		init.netns_ino = netns_ino;
-		init.syn_count = 1;
-		init.tcp_metrics_available = 1;
-		if (bpf_map_update_elem(&flow_stats_map, &key, &init, BPF_ANY) != 0) {
+		init->cgroup_id = sk_cgroup_id((struct sock *)ctx->skaddr);
+		if (init->cgroup_id == 0)
+			init->cgroup_id = bpf_get_current_cgroup_id();
+		init->netns_ino = netns_ino;
+		// UNCHANGED v1alpha4 semantics: the legacy syn_count stays a
+		// per-connection 1 written here. The v1alpha5 syn_count_out/in are a
+		// different, packet-level quantity written only at cgroup_skb.
+		init->syn_count = 1;
+		init->tcp_metrics_available = 1;
+		init->established = 1;
+		if (bpf_map_update_elem(&flow_stats_map, &key, init, BPF_ANY) != 0) {
 			increment_drop(DROP_MAP_UPDATE_FAILED);
 			return 0;
 		}
@@ -1201,21 +1561,86 @@ int handle_inet_sock_set_state(struct trace_event_raw_inet_sock_set_state *ctx)
 
 	if (ctx->newstate == TCP_CLOSE) {
 		struct local_ep ep = {};
+		struct flow_key *owner;
 
 		stats = bpf_map_lookup_elem(&flow_stats_map, &key);
-		if (stats) {
+		// v1alpha6 write barrier, event-path half. Before v1alpha6 a refused
+		// or unanswered connect had NO entry here, so this block never ran for
+		// one and its record carried fin_count=0 / tcp_metrics_available=false.
+		// Early entry creation would silently start writing all three on those
+		// records -- existing fields changing value on existing rows. Gate them
+		// on established so a never-established connection's record keeps
+		// exactly its v1alpha5 shape, plus the six flag counters and nothing
+		// else.
+		if (stats && stats->established) {
 			stats->close_seen = 1;
 			stats->fin_count += 1;
 			stats->tcp_metrics_available = 1;
 		}
 		emit_flow_event(&key, stats, EVENT_CLOSE, now, netns_ino);
 		bpf_map_delete_elem(&flow_stats_map, &key);
+		// v1alpha7: retract the index entry ONLY if it still points at THIS
+		// connection. The index key is (local ip, local port), which on a
+		// listening socket is shared with every other live connection to the
+		// same port; the old unconditional delete took the slot away from all
+		// of them and their subsequent packets went to DROP_PACKET_EP_MISS.
 		ep.ip = key.src_ip;
 		ep.port = key.src_port;
-		bpf_map_delete_elem(&local_ep_to_key, &ep);
+		owner = bpf_map_lookup_elem(&local_ep_to_key, &ep);
+		if (owner && owner->dst_ip == key.dst_ip &&
+		    owner->dst_port == key.dst_port)
+			bpf_map_delete_elem(&local_ep_to_key, &ep);
 		return 0;
 	}
 
+	return 0;
+}
+
+// v1alpha6: the reliable early-creation point for ACTIVE connects.
+//
+// The inet_sock_set_state(TCP_SYN_SENT) tracepoint fires before the ephemeral
+// source port exists (see the PORT-ZERO HAZARD note above), so for the common
+// connect()-without-bind path it cannot produce a usable key. tcp_connect() is
+// entered after inet_hash_connect() has assigned and hashed the port, and it
+// is what builds and transmits the SYN -- so a kprobe on its entry is the last
+// moment at which the flow key is complete and the first packet has not yet
+// left. Creating the entry here is what makes the handshake countable for
+// every client, not just the ones that happen to bind first.
+//
+// Idempotent and established=0, exactly like the tracepoint path: this only
+// ever creates, never overwrites, and the ESTABLISHED transition adopts.
+SEC("kprobe/tcp_connect")
+int handle_tcp_connect(struct pt_regs *ctx)
+{
+	struct sock *sk = (struct sock *)PT_REGS_PARM1(ctx);
+	struct flow_key key;
+	struct flow_stats *init;
+	__u64 now;
+
+	// key_from_sock rejects degenerate (port-0) keys for us.
+	if (key_from_sock(sk, &key, DIRECTION_UNKNOWN) != 0)
+		return 0;
+	if (bpf_map_lookup_elem(&flow_stats_map, &key))
+		return 0;
+	init = zeroed_stats_template();
+	if (!init) {
+		increment_drop(DROP_MAP_UPDATE_FAILED);
+		return 0;
+	}
+	now = bpf_ktime_get_ns();
+	init->start_ns = now;
+	init->last_seen_ns = now;
+	init->last_emit_ns = now;
+	init->cgroup_id = sk_cgroup_id(sk);
+	if (init->cgroup_id == 0)
+		init->cgroup_id = bpf_get_current_cgroup_id();
+	init->netns_ino = netns_ino_from_sock(sk);
+	init->established = 0;
+	if (bpf_map_update_elem(&flow_stats_map, &key, init, BPF_ANY) != 0) {
+		increment_drop(DROP_MAP_UPDATE_FAILED);
+		return 0;
+	}
+	index_local_ep(&key);
 	return 0;
 }
 
@@ -1264,14 +1689,34 @@ int handle_tcp_recvmsg_return(struct pt_regs *ctx)
 	return 0;
 }
 
-// Resolve the wire packet's local endpoint to the canonical socket-side key so
-// packet-size/IAT stats merge into the flow_stats entry the accounting hooks
-// created, despite kube-proxy DNAT. Returns 0 and counts a drop when the local
-// endpoint is not (yet) indexed (e.g. forwarded packets with no local socket).
+// Resolve the wire packet to the flow_stats entry the accounting hooks created.
+//
+// v1alpha7: try the WIRE TUPLE ITSELF first, and only fall back to the
+// local-endpoint index. The wire tuple is an exact 4-tuple, so a hit is
+// unambiguous. The index is keyed on (local ip, local port) ALONE -- it cannot
+// tell two connections apart when they share a local endpoint, which is every
+// connection to a listening socket. index_local_ep writes it with BPF_ANY, so
+// concurrent server-side connections overwrite one another and their packet
+// stats land on whichever neighbour last won the slot.
+//
+// The direct lookup works whenever nothing rewrote the destination between the
+// socket and this hook. For a pod-netns socket that is always: kube-proxy's nat
+// table exists only in the host netns, so DNAT happens after the packet has
+// left. The index is retained for the one case the direct lookup cannot serve
+// -- a host-netns socket to a ClusterIP, where nat OUTPUT rewrites the
+// destination before ip_finish_output runs this program -- and, on a fallback,
+// keeps exactly the pre-v1alpha7 behaviour rather than losing the packet.
+//
+// Cost is unchanged on the hit path: one lookup here plus the one
+// update_packet_stats does, same as the index lookup it replaces.
 static struct flow_key *canonical_key_from_skb(struct flow_key *skbkey)
 {
 	struct local_ep ep = {};
 	struct flow_key *canon;
+
+	if (bpf_map_lookup_elem(&flow_stats_map, skbkey))
+		return skbkey;
+	increment_drop(DROP_PACKET_DIRECT_MISS);
 
 	ep.ip = skbkey->src_ip;
 	ep.port = skbkey->src_port;
