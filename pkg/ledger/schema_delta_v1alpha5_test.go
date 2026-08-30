@@ -290,12 +290,19 @@ func TestSchemaDeltaIsAdditiveOnly(t *testing.T) {
 }
 
 // The schema version must advance with every change to what the ledger means,
-// even when — as in v1alpha6 — the change is to WHEN a field is filled rather
-// than to the set of fields. A stale version on redefined semantics is worse
-// than no version at all.
-func TestSchemaVersionIsV1Alpha6(t *testing.T) {
-	if features.SchemaVersion != "v1alpha6" {
-		t.Fatalf("SchemaVersion = %q, want v1alpha6", features.SchemaVersion)
+// even when — as in v1alpha6 and again in v1alpha7 — the change is to WHEN or
+// to WHICH FLOW a field is filled rather than to the set of fields. A stale
+// version on redefined semantics is worse than no version at all.
+//
+// v1alpha7 adds no field and moves no field, but it changes the VALUE of every
+// packet-path field on a server leg: before it, cgroup_skb attributed packets
+// through local_ep_to_key, an index keyed on (local ip, local port) alone, so
+// all concurrent connections to one listening socket collapsed onto whichever
+// of them last won the slot. Downstream fail-closed version gates are the only
+// mechanism that can notice that, so the version MUST move.
+func TestSchemaVersionIsV1Alpha7(t *testing.T) {
+	if features.SchemaVersion != "v1alpha7" {
+		t.Fatalf("SchemaVersion = %q, want v1alpha7", features.SchemaVersion)
 	}
 }
 
@@ -305,6 +312,10 @@ func TestSchemaVersionIsV1Alpha6(t *testing.T) {
 // their semantics are untouched. So the v1alpha6 key set must equal the
 // v1alpha5 key set exactly — the corpus-derived v1alpha4 keys plus those 14
 // and nothing more. This is the machine judge for "zero new fields".
+//
+// v1alpha7 is held to the same bar and so shares this test: it changes packet
+// attribution inside the kernel and adds two drop counters, neither of which
+// ever reaches the ledger, so the key set must still be identical.
 func TestV1Alpha6AddsNoLedgerField(t *testing.T) {
 	blob, err := json.Marshal(Record{})
 	if err != nil {
