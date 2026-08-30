@@ -58,7 +58,12 @@ typedef unsigned long long __u64;
 #define DROP_PACKET_EP_MISS 7
 #define DROP_RETRANS_FLOW_MISS 8
 #define DROP_DEGENERATE_KEY 9
-#define DROP_COUNTERS_LEN 10
+// v1alpha7 aliasing diagnostics. Neither is an error: DIRECT_MISS counts the
+// packets that had to fall back to the (ambiguous) local-endpoint index, and
+// ALIAS_OVERWRITE counts index slots taken away from a still-live neighbour.
+#define DROP_PACKET_DIRECT_MISS 10
+#define DROP_LOCAL_EP_ALIAS_OVERWRITE 11
+#define DROP_COUNTERS_LEN 12
 
 #define FLOW_STATS_MAX_ENTRIES 65536
 #define RECV_ARGS_MAX_ENTRIES 16384
@@ -834,9 +839,18 @@ static int emit_flow_event_no_pid(struct flow_key *key, struct flow_stats *stats
 static void index_local_ep(struct flow_key *key)
 {
 	struct local_ep ep = {};
+	struct flow_key *prev;
 
 	ep.ip = key->src_ip;
 	ep.port = key->src_port;
+	// v1alpha7 diagnostic. BPF_ANY overwrites a slot a live neighbour owns and
+	// returns SUCCESS -- which is why this aliasing ran for weeks with
+	// map_update_failed pinned at 0. Count it, so the ambiguity is observable
+	// for as long as the index survives as a fallback. Entry-creation path
+	// only, never per-packet.
+	prev = bpf_map_lookup_elem(&local_ep_to_key, &ep);
+	if (prev && (prev->dst_ip != key->dst_ip || prev->dst_port != key->dst_port))
+		increment_drop(DROP_LOCAL_EP_ALIAS_OVERWRITE);
 	if (bpf_map_update_elem(&local_ep_to_key, &ep, key, BPF_ANY) != 0)
 		increment_drop(DROP_MAP_UPDATE_FAILED);
 }
@@ -1547,6 +1561,7 @@ int handle_inet_sock_set_state(struct trace_event_raw_inet_sock_set_state *ctx)
 
 	if (ctx->newstate == TCP_CLOSE) {
 		struct local_ep ep = {};
+		struct flow_key *owner;
 
 		stats = bpf_map_lookup_elem(&flow_stats_map, &key);
 		// v1alpha6 write barrier, event-path half. Before v1alpha6 a refused
@@ -1564,9 +1579,17 @@ int handle_inet_sock_set_state(struct trace_event_raw_inet_sock_set_state *ctx)
 		}
 		emit_flow_event(&key, stats, EVENT_CLOSE, now, netns_ino);
 		bpf_map_delete_elem(&flow_stats_map, &key);
+		// v1alpha7: retract the index entry ONLY if it still points at THIS
+		// connection. The index key is (local ip, local port), which on a
+		// listening socket is shared with every other live connection to the
+		// same port; the old unconditional delete took the slot away from all
+		// of them and their subsequent packets went to DROP_PACKET_EP_MISS.
 		ep.ip = key.src_ip;
 		ep.port = key.src_port;
-		bpf_map_delete_elem(&local_ep_to_key, &ep);
+		owner = bpf_map_lookup_elem(&local_ep_to_key, &ep);
+		if (owner && owner->dst_ip == key.dst_ip &&
+		    owner->dst_port == key.dst_port)
+			bpf_map_delete_elem(&local_ep_to_key, &ep);
 		return 0;
 	}
 
@@ -1666,14 +1689,34 @@ int handle_tcp_recvmsg_return(struct pt_regs *ctx)
 	return 0;
 }
 
-// Resolve the wire packet's local endpoint to the canonical socket-side key so
-// packet-size/IAT stats merge into the flow_stats entry the accounting hooks
-// created, despite kube-proxy DNAT. Returns 0 and counts a drop when the local
-// endpoint is not (yet) indexed (e.g. forwarded packets with no local socket).
+// Resolve the wire packet to the flow_stats entry the accounting hooks created.
+//
+// v1alpha7: try the WIRE TUPLE ITSELF first, and only fall back to the
+// local-endpoint index. The wire tuple is an exact 4-tuple, so a hit is
+// unambiguous. The index is keyed on (local ip, local port) ALONE -- it cannot
+// tell two connections apart when they share a local endpoint, which is every
+// connection to a listening socket. index_local_ep writes it with BPF_ANY, so
+// concurrent server-side connections overwrite one another and their packet
+// stats land on whichever neighbour last won the slot.
+//
+// The direct lookup works whenever nothing rewrote the destination between the
+// socket and this hook. For a pod-netns socket that is always: kube-proxy's nat
+// table exists only in the host netns, so DNAT happens after the packet has
+// left. The index is retained for the one case the direct lookup cannot serve
+// -- a host-netns socket to a ClusterIP, where nat OUTPUT rewrites the
+// destination before ip_finish_output runs this program -- and, on a fallback,
+// keeps exactly the pre-v1alpha7 behaviour rather than losing the packet.
+//
+// Cost is unchanged on the hit path: one lookup here plus the one
+// update_packet_stats does, same as the index lookup it replaces.
 static struct flow_key *canonical_key_from_skb(struct flow_key *skbkey)
 {
 	struct local_ep ep = {};
 	struct flow_key *canon;
+
+	if (bpf_map_lookup_elem(&flow_stats_map, skbkey))
+		return skbkey;
+	increment_drop(DROP_PACKET_DIRECT_MISS);
 
 	ep.ip = skbkey->src_ip;
 	ep.port = skbkey->src_port;

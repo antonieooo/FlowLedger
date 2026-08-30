@@ -25,7 +25,7 @@ const (
 	// about any v1alpha4 field: names, types, semantics, bucket edges, window
 	// logic and window length are byte-for-byte the same, so a v1alpha4
 	// analysis reads a v1alpha5 record unchanged (docs/schema-v1alpha5.md).
-	SchemaVersion = "v1alpha6"
+	SchemaVersion = "v1alpha7"
 	// Bumped alongside the schema: window records' histogram/idle/burst/
 	// SYN/FIN/RST/byte features are now fixed-window increments, not
 	// lifetime-cumulative values, so their distributions are not comparable
