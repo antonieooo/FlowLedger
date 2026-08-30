@@ -237,11 +237,13 @@ func TestConvertRawEBPFEventMarksCumulativeSemantics(t *testing.T) {
 }
 
 // The C struct flow_event in bpf/flow_events.bpf.c and rawEBPFEvent must stay
-// byte-identical: 320 bytes through retrans_skb_bytes + 5×4 (syn/fin/rst +
-// 2 flag OR-masks, u32) + 4×2 (window/ip-length, u16) + 7×1 (2 TTL + 3
-// availability + 2 tcp_header_observed, u8) + 5 explicit pad = 360.
+// byte-identical: 320 bytes through retrans_skb_bytes + v1alpha5's 208 bytes
+// of per-direction histograms (2×7 + 2×6 u64) = 528 + 11×4 (syn/fin/rst,
+// their 6 per-direction counterparts, and 2 flag OR-masks, u32) = 572 + 4×2
+// (window/ip-length, u16) = 580 + 11×1 (2 mixed TTL + 4 per-direction TTL +
+// 3 availability + 2 tcp_header_observed, u8) + 9 explicit pad = 600.
 func TestRawEBPFEventBinarySize(t *testing.T) {
-	const want = uintptr(360)
+	const want = uintptr(600)
 	if got := unsafe.Sizeof(rawEBPFEvent{}); got != want {
 		t.Fatalf("rawEBPFEvent size = %d, want %d", got, want)
 	}
@@ -258,19 +260,36 @@ func TestRawEBPFEventKeyOffsets(t *testing.T) {
 		got  uintptr
 		want uintptr
 	}{
-		{"SYNCount", unsafe.Offsetof(raw.SYNCount), 320},
+		// v1alpha5 inserts the four per-direction histograms immediately
+		// after retrans_skb_bytes (offset 320), which shifts everything
+		// below by 208 bytes.
+		{"PktSizeBucketsOut", unsafe.Offsetof(raw.PktSizeBucketsOut), 320},
+		{"PktSizeBucketsIn", unsafe.Offsetof(raw.PktSizeBucketsIn), 376},
+		{"IATBucketsOut", unsafe.Offsetof(raw.IATBucketsOut), 432},
+		{"IATBucketsIn", unsafe.Offsetof(raw.IATBucketsIn), 480},
+		{"SYNCount", unsafe.Offsetof(raw.SYNCount), 528},
+		{"SYNCountOut", unsafe.Offsetof(raw.SYNCountOut), 540},
+		{"SYNCountIn", unsafe.Offsetof(raw.SYNCountIn), 544},
+		{"FINCountOut", unsafe.Offsetof(raw.FINCountOut), 548},
+		{"FINCountIn", unsafe.Offsetof(raw.FINCountIn), 552},
+		{"RSTCountOut", unsafe.Offsetof(raw.RSTCountOut), 556},
+		{"RSTCountIn", unsafe.Offsetof(raw.RSTCountIn), 560},
 		// Flags stay u32 at 4-aligned offsets (atomic OR operand requirement).
-		{"TcpFlagsOrSent", unsafe.Offsetof(raw.TcpFlagsOrSent), 332},
-		{"TcpFlagsOrRecv", unsafe.Offsetof(raw.TcpFlagsOrRecv), 336},
-		{"TcpWinMaxSent", unsafe.Offsetof(raw.TcpWinMaxSent), 340},
-		{"TcpWinMaxRecv", unsafe.Offsetof(raw.TcpWinMaxRecv), 342},
-		{"IpPktLenMin", unsafe.Offsetof(raw.IpPktLenMin), 344},
-		{"IpPktLenMax", unsafe.Offsetof(raw.IpPktLenMax), 346},
-		{"IpTtlMin", unsafe.Offsetof(raw.IpTtlMin), 348},
-		{"IpTtlMax", unsafe.Offsetof(raw.IpTtlMax), 349},
-		{"TrafficAccountingAvailable", unsafe.Offsetof(raw.TrafficAccountingAvailable), 350},
-		{"TcpHeaderObservedSent", unsafe.Offsetof(raw.TcpHeaderObservedSent), 353},
-		{"TcpHeaderObservedRecv", unsafe.Offsetof(raw.TcpHeaderObservedRecv), 354},
+		{"TcpFlagsOrSent", unsafe.Offsetof(raw.TcpFlagsOrSent), 564},
+		{"TcpFlagsOrRecv", unsafe.Offsetof(raw.TcpFlagsOrRecv), 568},
+		{"TcpWinMaxSent", unsafe.Offsetof(raw.TcpWinMaxSent), 572},
+		{"TcpWinMaxRecv", unsafe.Offsetof(raw.TcpWinMaxRecv), 574},
+		{"IpPktLenMin", unsafe.Offsetof(raw.IpPktLenMin), 576},
+		{"IpPktLenMax", unsafe.Offsetof(raw.IpPktLenMax), 578},
+		{"IpTtlMin", unsafe.Offsetof(raw.IpTtlMin), 580},
+		{"IpTtlMax", unsafe.Offsetof(raw.IpTtlMax), 581},
+		{"IpTtlMinOut", unsafe.Offsetof(raw.IpTtlMinOut), 582},
+		{"IpTtlMaxOut", unsafe.Offsetof(raw.IpTtlMaxOut), 583},
+		{"IpTtlMinIn", unsafe.Offsetof(raw.IpTtlMinIn), 584},
+		{"IpTtlMaxIn", unsafe.Offsetof(raw.IpTtlMaxIn), 585},
+		{"TrafficAccountingAvailable", unsafe.Offsetof(raw.TrafficAccountingAvailable), 586},
+		{"TcpHeaderObservedSent", unsafe.Offsetof(raw.TcpHeaderObservedSent), 589},
+		{"TcpHeaderObservedRecv", unsafe.Offsetof(raw.TcpHeaderObservedRecv), 590},
 	} {
 		if tc.got != tc.want {
 			t.Errorf("offsetof(%s) = %d, want %d", tc.name, tc.got, tc.want)

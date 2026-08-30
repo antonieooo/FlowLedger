@@ -63,20 +63,20 @@ type Record struct {
 	// previous baseline snapshot time); the interval ends at end_time.
 	// Empty on session_summary records.
 	WindowStartTime string `json:"window_start_time"`
-	SrcIP         string `json:"src_ip"`
-	SrcPort       uint16 `json:"src_port"`
-	DstIP         string `json:"dst_ip"`
-	DstPort       uint16 `json:"dst_port"`
-	Protocol      string `json:"protocol"`
-	Direction     string `json:"direction"`
-	IPFamily      string `json:"ip_family"`
-	ConnStartTime string `json:"conn_start_time"`
-	ConnEndTime   string `json:"conn_end_time"`
-	DurationMS    int64  `json:"duration_ms"`
-	TCPState      string `json:"tcp_state"`
-	CloseReason   string `json:"close_reason"`
-	IsLongLived   bool   `json:"is_long_lived"`
-	NetnsIno      uint64 `json:"netns_ino"`
+	SrcIP           string `json:"src_ip"`
+	SrcPort         uint16 `json:"src_port"`
+	DstIP           string `json:"dst_ip"`
+	DstPort         uint16 `json:"dst_port"`
+	Protocol        string `json:"protocol"`
+	Direction       string `json:"direction"`
+	IPFamily        string `json:"ip_family"`
+	ConnStartTime   string `json:"conn_start_time"`
+	ConnEndTime     string `json:"conn_end_time"`
+	DurationMS      int64  `json:"duration_ms"`
+	TCPState        string `json:"tcp_state"`
+	CloseReason     string `json:"close_reason"`
+	IsLongLived     bool   `json:"is_long_lived"`
+	NetnsIno        uint64 `json:"netns_ino"`
 
 	BytesOut                   uint64            `json:"bytes_out"`
 	BytesIn                    uint64            `json:"bytes_in"`
@@ -174,6 +174,76 @@ type Record struct {
 	// Anomal-E adapter selects only the first five buckets.
 	NetFlowV2IPSizeHistogram          map[string]uint64 `json:"netflow_v2_ip_size_histogram"`
 	NetFlowV2IPSizeHistogramAvailable bool              `json:"netflow_v2_ip_size_histogram_available"`
+
+	// --- v1alpha5: per-direction split of three existing families ---
+	// "out" = local egress, "in" = local ingress, decided by the SAME kernel
+	// predicate that produces observed_skb_packets_out/in. NOT client/server.
+	// The mixed fields above are untouched and keep their exact v1alpha4
+	// values; these are additions, never replacements.
+	//
+	// IDENTITIES that hold bucket by bucket on every window_valid record:
+	//   pkt_size_histogram_out[b] + pkt_size_histogram_in[b]
+	//       == pkt_size_histogram[b]
+	//   iat_histogram_out[b] + iat_histogram_in[b] == iat_histogram[b]
+	// The IAT one is a property of THIS collector, not of IAT in general: the
+	// kernel has always measured each gap against the previous packet in the
+	// same direction (last_packet_ns_sent / last_packet_ns_recv) and merged
+	// the results into one array, so the mixed histogram never encoded
+	// cross-direction interleaving and splitting it loses nothing.
+	//
+	// Σ_b pkt_size_histogram_out[b] == observed_skb_packets_out likewise
+	// holds (same call site, same skb), and the same for _in.
+	//
+	// NULL means no reading — either the direction was never observed on this
+	// flow or the window is invalid. An all-zero map means the direction IS
+	// observed and moved no packets in this window. There is deliberately no
+	// *_available companion flag: null carries that information.
+	PktSizeHistogramOut map[string]uint64 `json:"pkt_size_histogram_out"`
+	PktSizeHistogramIn  map[string]uint64 `json:"pkt_size_histogram_in"`
+	IATHistogramOut     map[string]uint64 `json:"iat_histogram_out"`
+	IATHistogramIn      map[string]uint64 `json:"iat_histogram_in"`
+
+	// Per-direction TTL envelope. Same rolling semantics as ip_ttl_min/max:
+	// cumulative over the connection, NEVER reset per window, and a
+	// best-effort concurrent extremum. Null = that direction observed no
+	// packet (TTL 0 is invalid on the wire, so 0 is unambiguous).
+	IPTTLMinOut *uint32 `json:"ip_ttl_min_out"`
+	IPTTLMaxOut *uint32 `json:"ip_ttl_max_out"`
+	IPTTLMinIn  *uint32 `json:"ip_ttl_min_in"`
+	IPTTLMaxIn  *uint32 `json:"ip_ttl_max_in"`
+
+	// Per-direction counts of PACKETS BEARING each TCP flag, read from the
+	// raw flag byte at cgroup_skb. Window deltas on window_summary records,
+	// lifetime totals on session_summary — same rule as every other additive
+	// counter here.
+	//
+	// These are NOT a decomposition of syn_count/fin_count/rst_count above.
+	// Those are per-CONNECTION values written by the socket-state tracepoint
+	// (syn_count == 1 in the window that saw ESTABLISHED, fin_count == 1 in
+	// the window that saw TCP_CLOSE, rst_count structurally always 0). A SYN
+	// retransmission increments syn_count_out and never syn_count; a SYN+ACK
+	// arriving increments syn_count_in; a FIN+ACK increments fin_count_in.
+	//
+	// COVERAGE (structural, v1alpha5): the packet path is only reached for
+	// connections that reached ESTABLISHED — the kernel indexes a flow's
+	// local endpoint at that transition and nowhere else. A connection
+	// REFUSED (SYN -> RST on a closed port) or UNANSWERED (SYN -> timeout)
+	// has no kernel flow entry, so its packets are counted in the
+	// packet_ep_miss drop counter and appear in NO record. Therefore:
+	//   - rst_count_in > 0 detects resets of ESTABLISHED connections
+	//     (server reset, idle-timeout reset, abortive close). It does NOT
+	//     detect closed-port connection refusal.
+	//   - "SYN unanswered" (syn_count_out > 0 with no inbound packet) is NOT
+	//     observable at all in v1alpha5; failed connection attempts surface
+	//     only as the zero-traffic session_summary records they already
+	//     produced in v1alpha4.
+	// Anything read out of these fields must respect that boundary.
+	SYNCountOut uint64 `json:"syn_count_out"`
+	SYNCountIn  uint64 `json:"syn_count_in"`
+	FINCountOut uint64 `json:"fin_count_out"`
+	FINCountIn  uint64 `json:"fin_count_in"`
+	RSTCountOut uint64 `json:"rst_count_out"`
+	RSTCountIn  uint64 `json:"rst_count_in"`
 
 	// --- v1alpha3 P2: LOCAL egress retransmissions from tracepoint
 	// tcp/tcp_retransmit_skb, keyed by the pre-DNAT socket flow key (for a
@@ -281,10 +351,10 @@ type Record struct {
 	// DESTINATION's method whenever the source did not resolve via cgroup_id.
 	SrcIdentityResolutionMethod string `json:"src_identity_resolution_method"`
 	SrcIdentityFrozen           bool   `json:"src_identity_frozen"`
-	SrcIdentityObservedTime  string `json:"src_identity_observed_time"`
-	SrcIdentityAttempts      uint64 `json:"src_identity_attempts"`
-	SrcIdentityMissingReason string `json:"src_identity_missing_reason"`
-	SrcRevisionSource        string `json:"src_revision_source"`
+	SrcIdentityObservedTime     string `json:"src_identity_observed_time"`
+	SrcIdentityAttempts         uint64 `json:"src_identity_attempts"`
+	SrcIdentityMissingReason    string `json:"src_identity_missing_reason"`
+	SrcRevisionSource           string `json:"src_revision_source"`
 	// Constructibility of the history-state keys from THIS record:
 	// G1 = src_ip (always present), G2 = pod UID, G3 = namespace + top-level
 	// controller kind + controller UID, G4 = G3 + rollout revision
@@ -696,20 +766,20 @@ func BuildRecordWithContext(session sessionizer.FlowSession, resolved identity.R
 		CounterEpoch:        session.CounterEpoch,
 		FinalWindow:         isWindow && session.FinalWindow,
 		WindowStartTime:     formatTime(session.WindowStartTime),
-		SrcIP:         session.SrcIP,
-		SrcPort:       session.SrcPort,
-		DstIP:         session.DstIP,
-		DstPort:       session.DstPort,
-		Protocol:      session.Protocol,
-		Direction:     direction,
-		IPFamily:      firstNonEmpty(session.IPFamily, features.Unknown),
-		ConnStartTime: formatTime(session.StartTime),
-		ConnEndTime:   formatTime(session.EndTime),
-		DurationMS:    session.DurationMS,
-		TCPState:      firstNonEmpty(session.TCPState, features.Unknown),
-		CloseReason:   firstNonEmpty(session.CloseReason, features.Unknown),
-		IsLongLived:   snapshot.IsLongLived,
-		NetnsIno:      session.NetnsIno,
+		SrcIP:               session.SrcIP,
+		SrcPort:             session.SrcPort,
+		DstIP:               session.DstIP,
+		DstPort:             session.DstPort,
+		Protocol:            session.Protocol,
+		Direction:           direction,
+		IPFamily:            firstNonEmpty(session.IPFamily, features.Unknown),
+		ConnStartTime:       formatTime(session.StartTime),
+		ConnEndTime:         formatTime(session.EndTime),
+		DurationMS:          session.DurationMS,
+		TCPState:            firstNonEmpty(session.TCPState, features.Unknown),
+		CloseReason:         firstNonEmpty(session.CloseReason, features.Unknown),
+		IsLongLived:         snapshot.IsLongLived,
+		NetnsIno:            session.NetnsIno,
 
 		BytesOut:                   session.BytesOut,
 		BytesIn:                    session.BytesIn,
@@ -781,6 +851,26 @@ func BuildRecordWithContext(session sessionizer.FlowSession, resolved identity.R
 
 		NetFlowV2IPSizeHistogram:          snapshot.NetFlowV2IPSizeHistogram,
 		NetFlowV2IPSizeHistogramAvailable: snapshot.NetFlowV2IPSizeHistogramAvailable,
+
+		// v1alpha5: taken straight off the session. The sessionizer already
+		// installed window deltas on window_summary records and left lifetime
+		// values on session_summary, so there is nothing to recompute here —
+		// and nothing that could disagree with the mixed histograms about
+		// which window it is describing.
+		PktSizeHistogramOut: session.PktSizeHistogramOut,
+		PktSizeHistogramIn:  session.PktSizeHistogramIn,
+		IATHistogramOut:     session.IATHistogramOut,
+		IATHistogramIn:      session.IATHistogramIn,
+		IPTTLMinOut:         session.IPTTLMinOut,
+		IPTTLMaxOut:         session.IPTTLMaxOut,
+		IPTTLMinIn:          session.IPTTLMinIn,
+		IPTTLMaxIn:          session.IPTTLMaxIn,
+		SYNCountOut:         session.SYNCountOut,
+		SYNCountIn:          session.SYNCountIn,
+		FINCountOut:         session.FINCountOut,
+		FINCountIn:          session.FINCountIn,
+		RSTCountOut:         session.RSTCountOut,
+		RSTCountIn:          session.RSTCountIn,
 
 		LocalRetransSKBCount:  counterIfAvailable(session.LocalRetransSKBCount, session.LocalRetransAvailable),
 		LocalRetransSKBBytes:  counterIfAvailable(session.LocalRetransSKBBytes, session.LocalRetransAvailable),
@@ -856,13 +946,13 @@ func BuildRecordWithContext(session sessionizer.FlowSession, resolved identity.R
 
 		SrcIdentityResolutionMethod: resolved.Src.Method,
 		SrcIdentityFrozen:           session.SourceIdentity.Frozen,
-		SrcIdentityObservedTime:  formatTime(session.SourceIdentity.ObservedAt),
-		SrcIdentityAttempts:      session.SourceIdentity.Attempts,
-		SrcIdentityMissingReason: session.SourceIdentity.MissingReason,
-		SrcRevisionSource:        session.SourceIdentity.RevisionSource,
-		SrcKeyG2Available:        srcKeyG2,
-		SrcKeyG3Available:        srcKeyG3,
-		SrcKeyG4Available:        srcKeyG4,
+		SrcIdentityObservedTime:     formatTime(session.SourceIdentity.ObservedAt),
+		SrcIdentityAttempts:         session.SourceIdentity.Attempts,
+		SrcIdentityMissingReason:    session.SourceIdentity.MissingReason,
+		SrcRevisionSource:           session.SourceIdentity.RevisionSource,
+		SrcKeyG2Available:           srcKeyG2,
+		SrcKeyG3Available:           srcKeyG3,
+		SrcKeyG4Available:           srcKeyG4,
 
 		SrcIdentityResolutionStatus: firstNonEmpty(resolved.Src.ResolutionStatus, identity.ResolutionStatusUnknown),
 		DstIdentityResolutionStatus: firstNonEmpty(resolved.Dst.ResolutionStatus, identity.ResolutionStatusUnknown),

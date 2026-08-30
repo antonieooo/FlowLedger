@@ -122,6 +122,11 @@ type rawCounters struct {
 	retrans                              uint64
 	directionChanges                     uint64
 	localRetransCount, localRetransBytes uint64
+	// v1alpha5 per-direction TCP flag PACKET counts. Independent of
+	// syn/fin/rst above, which stay the per-connection tracepoint values.
+	synOut, synIn uint64
+	finOut, finIn uint64
+	rstOut, rstIn uint64
 }
 
 // windowBaseline is the previous accepted cumulative snapshot of one
@@ -133,6 +138,13 @@ type windowBaseline struct {
 	pktHist  map[string]uint64
 	iatHist  map[string]uint64
 	nfHist   map[string]uint64
+	// v1alpha5: the per-direction histograms are differenced exactly like
+	// their mixed counterparts, against a snapshot taken at the same
+	// emission, so a window's out+in still reconstructs its mixed delta.
+	pktHistOut map[string]uint64
+	pktHistIn  map[string]uint64
+	iatHistOut map[string]uint64
+	iatHistIn  map[string]uint64
 }
 
 type FlowSession struct {
@@ -214,6 +226,29 @@ type FlowSession struct {
 	IPPktLenMin                  *uint32
 	IPPktLenMax                  *uint32
 
+	// v1alpha5: per-direction split of the packet-size histogram, IAT
+	// histogram and TTL envelope, plus per-direction TCP flag packet counts.
+	// The histograms hold the LATEST cumulative kernel snapshot (same rule as
+	// the mixed histograms in features.Accumulator: replaced, never summed);
+	// the TTL pairs are min/max envelopes; the counts live in rawCounters.
+	// On a window_summary record the histograms and counts are replaced by
+	// their window deltas in buildWindow, while the TTL envelopes stay
+	// lifetime values — exactly as ip_ttl_min/max already behave.
+	PktSizeHistogramOut map[string]uint64
+	PktSizeHistogramIn  map[string]uint64
+	IATHistogramOut     map[string]uint64
+	IATHistogramIn      map[string]uint64
+	IPTTLMinOut         *uint32
+	IPTTLMaxOut         *uint32
+	IPTTLMinIn          *uint32
+	IPTTLMaxIn          *uint32
+	SYNCountOut         uint64
+	SYNCountIn          uint64
+	FINCountOut         uint64
+	FINCountIn          uint64
+	RSTCountOut         uint64
+	RSTCountIn          uint64
+
 	// v1alpha3 P2: LOCAL egress retransmissions (tcp/tcp_retransmit_skb),
 	// cumulative; merged as the latest monotonic value. skb granularity, not
 	// wire packets. Peer-direction retransmissions are unobservable and have
@@ -248,8 +283,8 @@ type FlowSession struct {
 	windowSeq   uint64
 	accumulator features.Accumulator
 
-	raw          rawCounters
-	baseline     windowBaseline
+	raw           rawCounters
+	baseline      windowBaseline
 	baselineKnown bool // true iff this generation began with CONNECT/ACCEPT (counters provably from zero)
 	pendingReset  bool // a raw cumulative counter regressed since the last accepted baseline
 	epoch         uint64
@@ -410,6 +445,7 @@ func (s *Sessionizer) Process(ev collector.FlowEvent) []FlowSession {
 	}
 	session.mergeObservedSKBPackets(ev)
 	session.mergeHeaderAggregates(ev)
+	session.mergeDirectionalStats(ev)
 	session.mergeLocalRetrans(ev)
 	session.accumulator.AddEvent(ev)
 	s.updateFeatureSnapshot(session)
@@ -469,6 +505,36 @@ func (s *Sessionizer) buildWindow(session *FlowSession, now time.Time, final boo
 
 	pktDelta, pktRegressed := features.SubtractHistogram(cum.PktSizeHistogram, session.baseline.pktHist)
 	iatDelta, iatRegressed := features.SubtractHistogram(cum.IATHistogram, session.baseline.iatHist)
+	// v1alpha5: the four per-direction histograms are differenced with the
+	// same helper against baselines snapshotted at the same emission. Their
+	// regressions feed the SAME counter_reset gate as the mixed ones, so a
+	// window can never be valid with a reset direction histogram inside it.
+	//
+	// NULL DISCIPLINE. These fields carry no *_available companion, so null
+	// is their only channel for "no reading", and it must mean exactly that:
+	//   nil          -> the direction has never been observed on this flow
+	//                   (kernel sent an all-zero array, which the event layer
+	//                   turns into a nil map), or the window is invalid.
+	//   all-zero map -> the direction IS observed and genuinely moved no
+	//                   packets during this window (a quiet window on a
+	//                   long-lived flow).
+	// Fabricating an all-zero map for an unobserved direction would claim a
+	// measurement that was never taken; this mirrors how the NetFlow-v2
+	// histogram already guards its own nil.
+	subDir := func(cur, base map[string]uint64) (map[string]uint64, bool) {
+		if cur != nil {
+			return features.SubtractHistogram(cur, base)
+		}
+		if histogramHasCounts(base) {
+			return nil, true
+		}
+		return nil, false
+	}
+	pktOutDelta, pktOutRegressed := subDir(session.PktSizeHistogramOut, session.baseline.pktHistOut)
+	pktInDelta, pktInRegressed := subDir(session.PktSizeHistogramIn, session.baseline.pktHistIn)
+	iatOutDelta, iatOutRegressed := subDir(session.IATHistogramOut, session.baseline.iatHistOut)
+	iatInDelta, iatInRegressed := subDir(session.IATHistogramIn, session.baseline.iatHistIn)
+	dirHistRegressed := pktOutRegressed || pktInRegressed || iatOutRegressed || iatInRegressed
 	var nfDelta map[string]uint64
 	nfRegressed := false
 	if cum.NetFlowV2IPSizeHistogram != nil {
@@ -480,7 +546,7 @@ func (s *Sessionizer) buildWindow(session *FlowSession, now time.Time, final boo
 	invalidReason := ""
 	if !session.baselineKnown {
 		invalidReason = WindowInvalidUnknownBaseline
-	} else if session.pendingReset || pktRegressed || iatRegressed || nfRegressed {
+	} else if session.pendingReset || pktRegressed || iatRegressed || nfRegressed || dirHistRegressed {
 		invalidReason = WindowInvalidCounterReset
 	}
 
@@ -502,6 +568,19 @@ func (s *Sessionizer) buildWindow(session *FlowSession, now time.Time, final boo
 		summary.PacketsOut, summary.PacketsIn = 0, 0
 		summary.ObservedSKBPacketsOut, summary.ObservedSKBPacketsIn = 0, 0
 		summary.LocalRetransSKBCount, summary.LocalRetransSKBBytes = 0, 0
+		// v1alpha5 additive fields are zeroed with everything else. The
+		// histograms go to nil rather than all-zero (see the null discipline
+		// above): an invalid window has no trustworthy delta to report, and
+		// an all-zero map would read as "measured, nothing moved". The TTL
+		// envelopes are left alone: they are lifetime extrema, not window
+		// deltas, exactly like ip_ttl_min/max on an invalid window today.
+		summary.PktSizeHistogramOut = nil
+		summary.PktSizeHistogramIn = nil
+		summary.IATHistogramOut = nil
+		summary.IATHistogramIn = nil
+		summary.SYNCountOut, summary.SYNCountIn = 0, 0
+		summary.FINCountOut, summary.FINCountIn = 0, 0
+		summary.RSTCountOut, summary.RSTCountIn = 0, 0
 		summary.FeatureSnapshot = features.WindowSnapshot(cum, features.WindowCounterDeltas{}, windowDuration)
 	} else {
 		base := session.baseline.counters
@@ -529,6 +608,16 @@ func (s *Sessionizer) buildWindow(session *FlowSession, now time.Time, final boo
 		summary.ObservedSKBPacketsIn = session.raw.skbIn - base.skbIn
 		summary.LocalRetransSKBCount = session.raw.localRetransCount - base.localRetransCount
 		summary.LocalRetransSKBBytes = session.raw.localRetransBytes - base.localRetransBytes
+		summary.PktSizeHistogramOut = pktOutDelta
+		summary.PktSizeHistogramIn = pktInDelta
+		summary.IATHistogramOut = iatOutDelta
+		summary.IATHistogramIn = iatInDelta
+		summary.SYNCountOut = session.raw.synOut - base.synOut
+		summary.SYNCountIn = session.raw.synIn - base.synIn
+		summary.FINCountOut = session.raw.finOut - base.finOut
+		summary.FINCountIn = session.raw.finIn - base.finIn
+		summary.RSTCountOut = session.raw.rstOut - base.rstOut
+		summary.RSTCountIn = session.raw.rstIn - base.rstIn
 		summary.FeatureSnapshot = features.WindowSnapshot(cum, d, windowDuration)
 	}
 
@@ -543,6 +632,11 @@ func (s *Sessionizer) buildWindow(session *FlowSession, now time.Time, final boo
 		pktHist:  copyBuckets(cum.PktSizeHistogram),
 		iatHist:  copyBuckets(cum.IATHistogram),
 		nfHist:   copyBuckets(cum.NetFlowV2IPSizeHistogram),
+
+		pktHistOut: copyBuckets(session.PktSizeHistogramOut),
+		pktHistIn:  copyBuckets(session.PktSizeHistogramIn),
+		iatHistOut: copyBuckets(session.IATHistogramOut),
+		iatHistIn:  copyBuckets(session.IATHistogramIn),
 	}
 	session.baselineKnown = true
 	session.pendingReset = false
@@ -596,6 +690,16 @@ func (session *FlowSession) mergeRaw(ev collector.FlowEvent, evType string) {
 	additive(&session.raw.rst, ev.RSTCount)
 	additive(&session.raw.retrans, ev.RetransCount)
 	additive(&session.raw.directionChanges, ev.DirectionChanges)
+	// v1alpha5 per-direction flag PACKET counts. Same merge rule as
+	// syn/fin/rst above, and deliberately NOT touched by the legacy
+	// lifecycle-implied SYN/FIN below: those model a connection event, while
+	// these count observed packets.
+	additive(&session.raw.synOut, ev.SYNCountOut)
+	additive(&session.raw.synIn, ev.SYNCountIn)
+	additive(&session.raw.finOut, ev.FINCountOut)
+	additive(&session.raw.finIn, ev.FINCountIn)
+	additive(&session.raw.rstOut, ev.RSTCountOut)
+	additive(&session.raw.rstIn, ev.RSTCountIn)
 	if !cumulative {
 		switch evType {
 		case "CONNECT", "ACCEPT":
@@ -828,6 +932,68 @@ func (session *FlowSession) mergeLocalRetrans(ev collector.FlowEvent) {
 	if session.LocalRetransSource == "" && ev.LocalRetransSource != "" {
 		session.LocalRetransSource = ev.LocalRetransSource
 	}
+}
+
+// mergeDirectionalStats folds one event's v1alpha5 per-direction signals into
+// the session. Histograms follow the SAME rule the mixed histograms already
+// obey for cumulative (eBPF) events: the latest complete snapshot REPLACES the
+// stored one, never bucket-sums — summing repeated cumulative snapshots is the
+// v1alpha2 inflation bug. An empty/absent histogram is "not provided" and
+// leaves the stored snapshot alone. The TTL envelopes merge as min/max, the
+// same idempotent rule as ip_ttl_min/max.
+func (session *FlowSession) mergeDirectionalStats(ev collector.FlowEvent) {
+	cumulative := ev.CounterSemantics == collector.CounterSemanticsCumulative
+	mergeHist := func(dst *map[string]uint64, src map[string]uint64) {
+		if len(src) == 0 {
+			return
+		}
+		if cumulative {
+			*dst = copyBuckets(src)
+			return
+		}
+		// Delta (mock) semantics: per-event increments sum, mirroring
+		// features.Accumulator's delta path for the mixed histograms.
+		if *dst == nil {
+			*dst = make(map[string]uint64, len(src))
+		}
+		for bucket, count := range src {
+			(*dst)[bucket] += count
+		}
+	}
+	mergeHist(&session.PktSizeHistogramOut, ev.PacketSizeHistogramOut)
+	mergeHist(&session.PktSizeHistogramIn, ev.PacketSizeHistogramIn)
+	mergeHist(&session.IATHistogramOut, ev.IATHistogramOut)
+	mergeHist(&session.IATHistogramIn, ev.IATHistogramIn)
+	session.IPTTLMinOut = minU32Ptr(session.IPTTLMinOut, ev.IPTTLMinOut)
+	session.IPTTLMaxOut = maxU32Ptr(session.IPTTLMaxOut, ev.IPTTLMaxOut)
+	session.IPTTLMinIn = minU32Ptr(session.IPTTLMinIn, ev.IPTTLMinIn)
+	session.IPTTLMaxIn = maxU32Ptr(session.IPTTLMaxIn, ev.IPTTLMaxIn)
+
+	// LIFETIME flag counts. These are what a session_summary record reports
+	// (counter_semantics == lifetime_cumulative); buildWindow overwrites them
+	// with the window delta on its own copy, leaving the lifetime values
+	// intact on the live session.
+	//
+	// Cumulative (eBPF) events carry totals since flow start, so the merge is
+	// a monotonic max — the same rule ObservedSKBPacketsOut/In and the mixed
+	// counters in features.Accumulator already use, which keeps the pre-reset
+	// maximum as a lower bound when a kernel counter regresses. Delta (mock)
+	// events sum, mirroring rawCounters.
+	maxInto := func(cur *uint64, next uint64) {
+		if !cumulative {
+			*cur += next
+			return
+		}
+		if next > *cur {
+			*cur = next
+		}
+	}
+	maxInto(&session.SYNCountOut, ev.SYNCountOut)
+	maxInto(&session.SYNCountIn, ev.SYNCountIn)
+	maxInto(&session.FINCountOut, ev.FINCountOut)
+	maxInto(&session.FINCountIn, ev.FINCountIn)
+	maxInto(&session.RSTCountOut, ev.RSTCountOut)
+	maxInto(&session.RSTCountIn, ev.RSTCountIn)
 }
 
 func minU32Ptr(current, candidate *uint32) *uint32 {

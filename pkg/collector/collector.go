@@ -138,6 +138,42 @@ type FlowEvent struct {
 	LocalRetransAvailable bool   `json:"local_retrans_available,omitempty"`
 	LocalRetransSource    string `json:"local_retrans_source,omitempty"`
 
+	// --- v1alpha5: per-direction split of three existing families ---
+	// "Out" = local egress, "In" = local ingress — the SAME direction
+	// predicate that produces RealPacketsSent/Recv, decided once in the BPF
+	// packet path. NOT client/server.
+	//
+	// The two histogram pairs are EXACT decompositions of PacketSizeHistogram
+	// and IATHistogram: out[b] + in[b] == mixed[b] for every bucket. That
+	// holds for IAT too, because the kernel has always measured each
+	// inter-arrival gap against the previous packet in the SAME direction and
+	// merely merged the results into one array.
+	PacketSizeHistogramOut map[string]uint64 `json:"packet_size_histogram_out,omitempty"`
+	PacketSizeHistogramIn  map[string]uint64 `json:"packet_size_histogram_in,omitempty"`
+	IATHistogramOut        map[string]uint64 `json:"iat_histogram_out,omitempty"`
+	IATHistogramIn         map[string]uint64 `json:"iat_histogram_in,omitempty"`
+	// Per-PACKET counts of packets bearing each TCP flag, per direction, read
+	// from the raw flag byte at cgroup_skb. A DIFFERENT quantity from
+	// SYNCount/FINCount/RSTCount above, which are per-CONNECTION values from
+	// the socket-state tracepoint: a SYN retransmission increments
+	// SYNCountOut and never SYNCount, and a SYN+ACK increments SYNCountIn.
+	// Coverage is bounded by the packet path: a connection that never reached
+	// ESTABLISHED has no BPF flow entry, so refused/unanswered connection
+	// attempts contribute nothing here.
+	SYNCountOut uint64 `json:"syn_count_out,omitempty"`
+	SYNCountIn  uint64 `json:"syn_count_in,omitempty"`
+	FINCountOut uint64 `json:"fin_count_out,omitempty"`
+	FINCountIn  uint64 `json:"fin_count_in,omitempty"`
+	RSTCountOut uint64 `json:"rst_count_out,omitempty"`
+	RSTCountIn  uint64 `json:"rst_count_in,omitempty"`
+	// Per-direction TTL envelope, same rolling semantics as IPTTLMin/Max
+	// (cumulative over the flow, never reset per window). Nil = that
+	// direction observed no packet.
+	IPTTLMinOut *uint32 `json:"ip_ttl_min_out,omitempty"`
+	IPTTLMaxOut *uint32 `json:"ip_ttl_max_out,omitempty"`
+	IPTTLMinIn  *uint32 `json:"ip_ttl_min_in,omitempty"`
+	IPTTLMaxIn  *uint32 `json:"ip_ttl_max_in,omitempty"`
+
 	// CounterSemantics marks whether this event's counters are cumulative
 	// flow snapshots or per-event deltas; see CounterSemantics* constants.
 	// Empty means delta (legacy mock behaviour).

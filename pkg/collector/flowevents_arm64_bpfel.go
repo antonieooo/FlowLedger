@@ -54,9 +54,19 @@ type flowEventsFlowStats struct {
 	NfIpSizeBuckets            [6]uint64
 	RetransSkbCount            uint64
 	RetransSkbBytes            uint64
+	PktSizeBucketsOut          [7]uint64
+	PktSizeBucketsIn           [7]uint64
+	IatBucketsOut              [6]uint64
+	IatBucketsIn               [6]uint64
 	SynCount                   uint32
 	FinCount                   uint32
 	RstCount                   uint32
+	SynCountOut                uint32
+	SynCountIn                 uint32
+	FinCountOut                uint32
+	FinCountIn                 uint32
+	RstCountOut                uint32
+	RstCountIn                 uint32
 	TcpFlagsOrSent             uint32
 	TcpFlagsOrRecv             uint32
 	TcpWinMaxSent              uint16
@@ -65,6 +75,10 @@ type flowEventsFlowStats struct {
 	IpPktLenMax                uint16
 	IpTtlMin                   uint8
 	IpTtlMax                   uint8
+	IpTtlMinOut                uint8
+	IpTtlMaxOut                uint8
+	IpTtlMinIn                 uint8
+	IpTtlMaxIn                 uint8
 	CloseSeen                  uint8
 	ClientHelloInspected       uint8
 	ServerHelloInspected       uint8
@@ -73,7 +87,8 @@ type flowEventsFlowStats struct {
 	TcpMetricsAvailable        uint8
 	TcpHeaderObservedSent      uint8
 	TcpHeaderObservedRecv      uint8
-	Pad1                       [2]uint8
+	Established                uint8
+	Pad1                       [5]uint8
 }
 
 type flowEventsLocalEp struct {
@@ -126,6 +141,7 @@ type flowEventsProgramSpecs struct {
 	HandleCgroupSkbEgress  *ebpf.ProgramSpec `ebpf:"handle_cgroup_skb_egress"`
 	HandleCgroupSkbIngress *ebpf.ProgramSpec `ebpf:"handle_cgroup_skb_ingress"`
 	HandleInetSockSetState *ebpf.ProgramSpec `ebpf:"handle_inet_sock_set_state"`
+	HandleTcpConnect       *ebpf.ProgramSpec `ebpf:"handle_tcp_connect"`
 	HandleTcpRecvmsgEntry  *ebpf.ProgramSpec `ebpf:"handle_tcp_recvmsg_entry"`
 	HandleTcpRecvmsgReturn *ebpf.ProgramSpec `ebpf:"handle_tcp_recvmsg_return"`
 	HandleTcpRetransmitSkb *ebpf.ProgramSpec `ebpf:"handle_tcp_retransmit_skb"`
@@ -139,6 +155,7 @@ type flowEventsMapSpecs struct {
 	ConfigMap             *ebpf.MapSpec `ebpf:"config_map"`
 	DropCounters          *ebpf.MapSpec `ebpf:"drop_counters"`
 	Events                *ebpf.MapSpec `ebpf:"events"`
+	FlowStatsInitScratch  *ebpf.MapSpec `ebpf:"flow_stats_init_scratch"`
 	FlowStatsMap          *ebpf.MapSpec `ebpf:"flow_stats_map"`
 	LocalEpToKey          *ebpf.MapSpec `ebpf:"local_ep_to_key"`
 	RecvArgsMap           *ebpf.MapSpec `ebpf:"recv_args_map"`
@@ -168,6 +185,7 @@ type flowEventsMaps struct {
 	ConfigMap             *ebpf.Map `ebpf:"config_map"`
 	DropCounters          *ebpf.Map `ebpf:"drop_counters"`
 	Events                *ebpf.Map `ebpf:"events"`
+	FlowStatsInitScratch  *ebpf.Map `ebpf:"flow_stats_init_scratch"`
 	FlowStatsMap          *ebpf.Map `ebpf:"flow_stats_map"`
 	LocalEpToKey          *ebpf.Map `ebpf:"local_ep_to_key"`
 	RecvArgsMap           *ebpf.Map `ebpf:"recv_args_map"`
@@ -180,6 +198,7 @@ func (m *flowEventsMaps) Close() error {
 		m.ConfigMap,
 		m.DropCounters,
 		m.Events,
+		m.FlowStatsInitScratch,
 		m.FlowStatsMap,
 		m.LocalEpToKey,
 		m.RecvArgsMap,
@@ -195,6 +214,7 @@ type flowEventsPrograms struct {
 	HandleCgroupSkbEgress  *ebpf.Program `ebpf:"handle_cgroup_skb_egress"`
 	HandleCgroupSkbIngress *ebpf.Program `ebpf:"handle_cgroup_skb_ingress"`
 	HandleInetSockSetState *ebpf.Program `ebpf:"handle_inet_sock_set_state"`
+	HandleTcpConnect       *ebpf.Program `ebpf:"handle_tcp_connect"`
 	HandleTcpRecvmsgEntry  *ebpf.Program `ebpf:"handle_tcp_recvmsg_entry"`
 	HandleTcpRecvmsgReturn *ebpf.Program `ebpf:"handle_tcp_recvmsg_return"`
 	HandleTcpRetransmitSkb *ebpf.Program `ebpf:"handle_tcp_retransmit_skb"`
@@ -206,6 +226,7 @@ func (p *flowEventsPrograms) Close() error {
 		p.HandleCgroupSkbEgress,
 		p.HandleCgroupSkbIngress,
 		p.HandleInetSockSetState,
+		p.HandleTcpConnect,
 		p.HandleTcpRecvmsgEntry,
 		p.HandleTcpRecvmsgReturn,
 		p.HandleTcpRetransmitSkb,

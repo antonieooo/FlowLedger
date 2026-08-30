@@ -50,6 +50,20 @@ func rawEBPFEventBTFOffsets() map[string]uintptr {
 		"rst_count":                    unsafe.Offsetof(raw.RSTCount),
 		"ip_ttl_min":                   unsafe.Offsetof(raw.IpTtlMin),
 		"ip_ttl_max":                   unsafe.Offsetof(raw.IpTtlMax),
+		"pkt_size_buckets_out":         unsafe.Offsetof(raw.PktSizeBucketsOut),
+		"pkt_size_buckets_in":          unsafe.Offsetof(raw.PktSizeBucketsIn),
+		"iat_buckets_out":              unsafe.Offsetof(raw.IATBucketsOut),
+		"iat_buckets_in":               unsafe.Offsetof(raw.IATBucketsIn),
+		"syn_count_out":                unsafe.Offsetof(raw.SYNCountOut),
+		"syn_count_in":                 unsafe.Offsetof(raw.SYNCountIn),
+		"fin_count_out":                unsafe.Offsetof(raw.FINCountOut),
+		"fin_count_in":                 unsafe.Offsetof(raw.FINCountIn),
+		"rst_count_out":                unsafe.Offsetof(raw.RSTCountOut),
+		"rst_count_in":                 unsafe.Offsetof(raw.RSTCountIn),
+		"ip_ttl_min_out":               unsafe.Offsetof(raw.IpTtlMinOut),
+		"ip_ttl_max_out":               unsafe.Offsetof(raw.IpTtlMaxOut),
+		"ip_ttl_min_in":                unsafe.Offsetof(raw.IpTtlMinIn),
+		"ip_ttl_max_in":                unsafe.Offsetof(raw.IpTtlMaxIn),
 		"tcp_flags_or_sent":            unsafe.Offsetof(raw.TcpFlagsOrSent),
 		"tcp_flags_or_recv":            unsafe.Offsetof(raw.TcpFlagsOrRecv),
 		"tcp_win_max_sent":             unsafe.Offsetof(raw.TcpWinMaxSent),
@@ -110,10 +124,23 @@ func TestRawEBPFEventLayoutMatchesBTF(t *testing.T) {
 // map (every byte is ×65536 of kernel memory), flow_event is the per-event
 // ringbuf payload. These budgets are deliberate design limits — a change that
 // exceeds them must be an explicit decision, not an accident of field growth.
+//
+// RAISED FOR v1alpha5 (was 384/376). The per-direction split adds 240 bytes
+// to each struct, 208 of them the four histogram arrays; both are now 600
+// bytes. The cost was accepted knowingly:
+//   - flow_stats_map: 600 × 65536 = 37.5 MiB of kernel memory per node, up
+//     from 22.5 MiB. Charged to the agent's memcg, whose limit is 2 GiB.
+//   - events ringbuf (16 MiB): ~27.9k in-flight events instead of ~46.6k.
+//     STATS emission is once per 5 s per flow, so the headroom is ample.
+//
+// Keeping the histograms u64 (rather than shrinking them to u32 to squeeze
+// under the old budget) is what makes out[b] + in[b] == mixed[b] exact for
+// arbitrarily long flows; a narrower counter could overflow where the mixed
+// one does not and silently break the identity.
 func TestBPFStructResourceBudget(t *testing.T) {
 	const (
-		flowStatsBudget = 384
-		flowEventBudget = 376
+		flowStatsBudget = 608
+		flowEventBudget = 608
 	)
 	spec, err := loadFlowEvents()
 	if err != nil {
