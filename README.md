@@ -1,271 +1,257 @@
-# Flow Ledger v0
+# FlowLedger
 
-Flow Ledger v0 is a Kubernetes-aware flow evidence ledger. It records aggregated TCP flow metadata as JSONL `session_summary` and `window_summary` records with Kubernetes identity, service, topology, and model-ready feature context.
+FlowLedger is a Kubernetes-aware eBPF flow evidence ledger for network observability and cloud-native intrusion-detection research. A node agent collects TCP lifecycle events, traffic statistics, and bounded TLS handshake metadata, enriches them with Kubernetes identity, and writes JSONL records for downstream analysis.
 
-It is a flow/session metadata ledger. It is not an IDS, alerting system, machine-learning system, packet capture tool, or TLS decryption tool. It does not store payloads.
+The current agent emits schema **`v1alpha7`** with feature set **`flowledger-fast-features-v2`**. It supports local mock replay and experimental Linux eBPF collection. The repository also contains baseline-cache, anomaly-scoring, and Isolation Forest inference components under `pkg/nodemodel`; these are not yet connected to the node-agent pipeline. Detection, alerting, and slow-path review remain future integration work.
 
-## What v0 Implements
+## How it works
 
-- Mock flow-event ingestion from JSONL.
-- Session/window aggregation for `CONNECT`, `ACCEPT`, `STATS`, and `CLOSE` events.
-- Kubernetes metadata cache using client-go informers for Pods, Services, EndpointSlices, workload controllers, Jobs, CronJobs, and ServiceAccounts.
-- Endpoint identity enrichment for Linux cgroup IDs, Pod IPs, Service ClusterIPs, EndpointSlice backends, external IPs, and `unknown`.
-- Experiment labels from the `flow-ledger-experiment` ConfigMap with last-known-good behavior on read failures.
-- JSONL ledger writing with basic size/age rotation.
-- Prometheus metrics on `/metrics`.
-- A Kubernetes DaemonSet manifest for lifecycle, metadata, ledger, and metrics validation using mock events.
-- An experimental Linux eBPF collector for IPv4 TCP lifecycle events plus lightweight send/recv traffic accounting.
-- Schema `v1alpha2` records with flow lifecycle fields, traffic statistics, Kubernetes identity, service/topology context, TLS/protocol visibility placeholders, and Fast Path / Slow Path review placeholders.
+```mermaid
+flowchart LR
+    B[Linux eBPF hooks] --> C[Collector]
+    M[Mock JSONL events] --> C
+    C --> S[Session and window aggregation]
+    K[Kubernetes metadata cache] --> I[Identity enrichment]
+    K --> S
+    S --> I
+    E[Experiment ConfigMap] --> L[JSONL ledger]
+    I --> L
+    C --> P[Prometheus metrics]
+    S --> P
+    I --> P
+```
 
-## What v0 Does Not Implement
+- **Collection:** TCP lifecycle tracepoints, send/receive accounting hooks, optional retransmission tracking, and cgroup v2 packet hooks. IPv4 and IPv4-mapped IPv6 sockets are supported; native IPv6 traffic is not collected.
+- **Aggregation:** lifetime session summaries and configurable window deltas, with counter-reset detection, baseline validity, and a final partial window when a connection ends.
+- **Identity:** cgroup/Pod mapping, workload ownership, Service and EndpointSlice context, and per-connection source identity snapshots. Destination identity is resolved when records are emitted.
+- **Features:** bytes and send/receive observation counts; aggregate and directional packet-size/IAT histograms; observed SKB counts; TCP flags, TTL and header envelopes; local retransmission statistics; and best-effort JA4/JA4S metadata.
+- **Storage:** local JSONL files with size/age rotation and retention of rotated files.
+- **Diagnostics:** Prometheus metrics, periodic diagnostic logs, and a static eBPF resource-audit command.
 
-- The primary `packets_out` / `packets_in` fields remain syscall/message-level approximations from `tcp_sendmsg` and `tcp_recvmsg`; packet-level `cgroup_skb` hooks provide histogram-derived packet features without changing those field semantics.
-- No fast-path detection yet.
-- No slow-path review yet.
-- No alerting yet.
-- No machine learning model yet.
-- No TLS decryption.
-- No payload storage.
-- TLS ClientHello and ServerHello inspection are limited to 1024 bytes for the first matching handshake record per flow. FlowLedger extracts JA4, JA4S, offered/chosen TLS version, offered/chosen ALPN, and a hash of SNI only.
-- No TLS decryption.
-- No plaintext SNI storage.
-- No certificate capture.
-- No fragmented ClientHello or ServerHello reassembly.
-- No HTTP path, HTTP header, or HTTP body capture in the current implementation.
-- No ML inference or Slow Path reviewer verdicts yet; model/review fields are placeholders with simple reason codes.
-- No production retention, compression, or upload pipeline for ledger files.
-- No assumption that every flow maps to a Pod; `unknown` mapping is normal.
+## Quick start: local mock replay
 
-## Components
-
-- `collector`: reads raw flow events from mock JSONL or, on Linux, from an experimental eBPF tracepoint collector.
-- `sessionizer`: aggregates flow events into session/window summaries.
-- `k8smeta`: watches Kubernetes metadata and maintains local lookup caches.
-- `identity`: maps session endpoints to Kubernetes or external identities.
-- `ledger`: writes JSONL records and rotates the active ledger file.
-- `experiment`: reads scenario labels from a ConfigMap.
-- `metrics`: exposes Prometheus metrics.
-
-## Run Local Mock Mode
+Requires Go **1.25 or newer**. Mock mode needs neither Kubernetes nor BPF privileges.
 
 ```bash
 go run ./cmd/node-agent \
-  --mode mock \
-  --mock-events-path ./testdata/mock_flow_events.jsonl \
-  --ledger-path ./flows.jsonl \
-  --node-name local-test
+  --mode=mock \
+  --mock-events-path=./testdata/mock_flow_events.jsonl \
+  --ledger-path=./flows.jsonl \
+  --node-name=local-test
 ```
 
-The agent keeps running after the mock file is consumed so `/metrics` stays available. Stop it with `Ctrl-C`.
-
-Check output:
+In another terminal:
 
 ```bash
-cat ./flows.jsonl
+head -n 2 ./flows.jsonl
 curl http://localhost:9090/metrics
 ```
 
-Without an in-cluster Kubernetes config, metadata cache startup is skipped and identity fields resolve to `unknown`.
+The agent flushes remaining sessions after consuming the file and stays running to serve metrics. Stop it with `Ctrl-C`. Outside a Pod, the agent uses an empty Kubernetes metadata cache: it reads in-cluster configuration, not your local kubeconfig. Kubernetes identities may therefore be `unknown` in local runs.
 
-Useful ledger flags:
+Use `go run ./cmd/node-agent --help` for all flags, or `make run-mock` for the same example.
+
+## Reading the ledger
+
+Each line is one JSON object. The two record types serve different purposes:
+
+| Record type | `counter_semantics` | Intended use |
+| --- | --- | --- |
+| `window_summary` | `window_delta` | Incremental traffic within a window; default window size is 30 seconds |
+| `session_summary` | `lifetime_cumulative` | Whole-connection totals for diagnostics |
+
+**Do not sum session totals together with window deltas:** they describe overlapping traffic. For window-based analysis, select `record_type == "window_summary"` and inspect `window_valid` before using counters.
+
+With `jq` installed:
 
 ```bash
---ledger-max-bytes=104857600
---ledger-max-age=0s
+jq -c 'select(.record_type == "window_summary" and .window_valid == true) |
+  {flow_id, window_id, window_start_time, end_time, final_window,
+   src_ip, dst_ip, bytes_out, bytes_in}' ./flows.jsonl
 ```
 
-`--ledger-max-bytes=0` disables size-based rotation. `--ledger-max-age=0s` disables age-based rotation.
+Important field semantics:
 
-## Build eBPF Bindings
+- `window_invalid_reason` identifies an unknown initial baseline or a counter reset. Invalid windows contain zero delta counters/histograms; these zeros must not be interpreted as measured inactivity. `counter_epoch` separates counter lineages.
+- `final_window` marks the last, potentially shorter interval. Use the record's timestamps for its actual span.
+- `packets_out` / `packets_in` count send/receive observations from socket hooks. `observed_skb_packets_out` / `observed_skb_packets_in` count observations at cgroup SKB hooks. Neither is a guarantee of physical wire-packet counts, especially with segmentation offload.
+- Histogram-based statistics are estimates. Raw packet-length and IAT sequences are not retained. Directional IAT histograms measure intervals between packets in the same direction.
+- Extrema and other non-additive fields, such as TTL ranges, TCP flag OR-masks, and connection duration, retain lifetime context on window records.
+- `src` / `dst` and `_out` / `_in` describe the observed local socket and its traffic directions. A server-side observation is a separate perspective from the client's record; avoid treating both as unique connections without an explicit deduplication policy.
+- Source identity is resolved near connection establishment, retried within bounded limits, and frozen for that connection generation. Missing mappings and availability flags are part of the data contract.
 
-The generated eBPF bindings are checked in. Regenerate them after changing `bpf/flow_events.bpf.c`:
+The record structure and field definitions are in [pkg/ledger/writer.go](pkg/ledger/writer.go). Preserve `schema_version` when building datasets so downstream consumers can identify the data contract.
+
+## Run the eBPF collector locally
+
+The experimental collector requires Linux with compatible BPF/BTF, tracepoint and kprobe support, and sufficient BPF privileges. Packet features and TLS inspection additionally require cgroup v2. Generated objects are checked in for Linux amd64 and arm64, so a normal build does not require Clang.
+
+Build as your regular user, then run the binary with privileges:
 
 ```bash
-go generate ./...
+go build -o /tmp/flowledger-node-agent ./cmd/node-agent
+sudo /tmp/flowledger-node-agent \
+  --mode=ebpf \
+  --node-name=local-ebpf-test \
+  --ledger-path=./flows.jsonl \
+  --window-size=30s
 ```
 
-Generation requires:
+Generate IPv4 TCP activity in another terminal, then inspect the ledger and metrics:
 
-- Go with tool support for `go tool bpf2go`
-- `clang`
+```bash
+curl -4 https://example.com
+curl http://localhost:9090/metrics
+```
 
-The checked-in generator uses `bpf2go -no-strip`, so `llvm-strip` is not required for the default development workflow.
+The collector uses `sock/inet_sock_set_state`, an early `tcp_connect` hook, `tcp_sendmsg` / `tcp_recvmsg`, and best-effort `tcp/tcp_retransmit_skb` tracking. Optional `cgroup_skb/ingress` and `cgroup_skb/egress` hooks provide packet and TLS observations. Check startup logs for attachment failures; some optional hooks can fail while the agent continues with reduced coverage.
 
-The project pins `github.com/cilium/ebpf/cmd/bpf2go` in `go.mod` with a `tool` directive.
+The following collection flags default to `true`:
 
-## Deploy To Kubernetes For Lifecycle Validation
+```text
+--ebpf-enable-traffic-accounting
+--ebpf-enable-tcp-basic-metrics
+--ebpf-enable-packet-timing
+--ebpf-enable-packet-histogram
+--ebpf-enable-tls-handshake-inspect
+--ebpf-enable-header-aggregates
+--ebpf-enable-netflow-v2-histogram
+```
 
-The default manifests do not collect real node traffic. They run the node-agent as a DaemonSet in mock mode with mock events mounted from `flow-ledger-mock-events`. This validates image startup, RBAC, informer sync, metadata enrichment behavior, JSONL writing, and metrics exposure.
+Set a flag explicitly to `false` to disable it. The `--ebpf-stats-emit-interval` default is `5s`, but kernel emission is currently governed by `EBPF_EMIT_INTERVAL_NS` in [bpf/flow_events.bpf.c](bpf/flow_events.bpf.c). Changing the CLI flag alone does not change that kernel interval; modify the constant and regenerate the bindings for that change.
 
-Build and publish an image for your cluster:
+## Deploy to Kubernetes
+
+Build an image and make it available to every target node, either through your registry or your local cluster's image-loading mechanism:
 
 ```bash
 docker build -t flow-ledger:v0 .
 ```
 
-For a remote cluster, push the image to your registry and update `deploy/daemonset.yaml`:
+Both supplied manifests use `flow-ledger:v0` with `imagePullPolicy: IfNotPresent`. This is a development image tag, not the ledger schema version. For registry deployment, push a distinct image tag and update `image:` in the selected DaemonSet manifest.
 
-```yaml
-image: your-registry/flow-ledger:v0
-```
-
-Apply:
+Apply the shared namespace, RBAC, and experiment labels first:
 
 ```bash
-kubectl apply -f deploy/
+kubectl apply -f deploy/namespace.yaml
+kubectl apply -f deploy/rbac.yaml
+kubectl apply -f deploy/configmap.yaml
 ```
 
-Expected resources:
+Then choose **one** collection mode.
 
-- Namespace: `flow-ledger-system`
-- ServiceAccount, ClusterRole, ClusterRoleBinding
-- ConfigMap: `flow-ledger-experiment`
-- ConfigMap: `flow-ledger-mock-events`
-- DaemonSet: `flow-ledger-node-agent`
-
-The DaemonSet mounts `/var/lib/flow-ledger` from each node. View records on a node:
+### Mock validation
 
 ```bash
-sudo tail -f /var/lib/flow-ledger/flows.jsonl
+kubectl apply -f deploy/mock-events-configmap.yaml
+kubectl apply -f deploy/daemonset.yaml
+kubectl -n flow-ledger-system rollout status daemonset/flow-ledger-node-agent
 ```
 
-View metrics:
+This replays synthetic events to validate startup, metadata enrichment, file writing, and metrics.
+
+### Real eBPF collection
 
 ```bash
-kubectl -n flow-ledger-system port-forward ds/flow-ledger-node-agent 9090:9090
-curl http://localhost:9090/metrics
-```
-
-## Experimental eBPF Collector
-
-The eBPF collector is Linux-only and experimental. It attaches to the `sock/inet_sock_set_state` tracepoint for lifecycle events, `tcp_sendmsg` / `tcp_recvmsg` kprobe hooks for lightweight traffic accounting, and optional `cgroup_skb/ingress` plus `cgroup_skb/egress` hooks for packet-level histograms, first-ClientHello inspection, and first-ServerHello inspection.
-
-Current capture behavior:
-
-- `newstate == TCP_ESTABLISHED` becomes `CONNECT`.
-- `newstate == TCP_CLOSE` becomes `CLOSE`.
-- IPv6 is not emitted yet.
-- eBPF maps aggregate cumulative `bytes_sent`, `bytes_recv`, `packets_sent`, and `packets_recv` per flow.
-- `cgroup_skb` packet hooks update packet size histograms, IAT histograms, min/max packet size, idle/burst counters, and real packet counters in the same flow map.
-- Events include cgroup ID and best-effort network namespace identity. Sock-based lifecycle hooks read `net.ns.inum`; cgroup_skb STATS events reuse the netns inode stored on the existing flow entry.
-- `STATS` summary events are emitted at a fixed interval instead of per packet/message.
-- Packet counters are approximate syscall/message counters, not exact wire packet counts.
-- Histogram-derived percentiles are estimates; raw packet length and raw IAT sequences are not stored.
-- The first egress TLS ClientHello and first ingress TLS ServerHello can be copied to a separate ring buffer for userspace parsing. The capture limit is 1024 bytes per handshake direction and the flow is marked inspected after one attempt per direction.
-- SNI plaintext is never written to JSONL; only the first 16 hex characters of SHA-256 over the lowercased SNI are recorded.
-- No payload is written to the ledger; bounded ClientHello and ServerHello bytes are transiently copied to userspace only for metadata extraction.
-- TLS is not decrypted.
-
-Traffic accounting flags:
-
-```bash
---ebpf-flow-map-max-entries=65536
---ebpf-stats-emit-interval=5s
---ebpf-enable-traffic-accounting=true
---ebpf-enable-tcp-basic-metrics=true
---ebpf-enable-packet-timing=true
---ebpf-enable-packet-histogram=true
---ebpf-enable-tls-handshake-inspect=true
-```
-
-`--ebpf-flow-map-max-entries` is applied to the eBPF LRU flow map before load. The current STATS interval is mirrored by a BPF compile-time constant; change `EBPF_EMIT_INTERVAL_NS` in `bpf/flow_events.bpf.c` and run `go generate ./...` if you need a different kernel-side interval. Packet timing, packet histogram, and TLS ClientHello/ServerHello inspection attach `cgroup_skb` programs on cgroup v2 systems. Experimental deployments default them on; production operators can opt out with `--ebpf-enable-packet-timing=false --ebpf-enable-packet-histogram=false --ebpf-enable-tls-handshake-inspect=false`.
-
-Local Linux test, usually requiring root or equivalent BPF permissions:
-
-```bash
-sudo go run ./cmd/node-agent \
-  --mode ebpf \
-  --ledger-path ./flows.jsonl \
-  --node-name local-ebpf-test
-```
-
-In another shell, create TCP activity with `curl`, `nc`, or `wget`, then inspect `flows.jsonl` and `/metrics`.
-
-Kubernetes experimental deployment:
-
-```bash
-kubectl apply -f deploy/
 kubectl apply -f deploy/experimental/daemonset-ebpf.yaml
+kubectl -n flow-ledger-system rollout status daemonset/flow-ledger-node-agent-ebpf
 ```
 
-The experimental DaemonSet uses privileged/capability access and host mounts for BPF/tracing. Do not apply it as part of the default mock validation path.
+The experimental DaemonSet runs privileged and mounts host BPF, tracing, and cgroup filesystems. It uses the agent's default 30-second window.
 
-## Metadata Sync
-
-When running in Kubernetes, the agent waits for informer cache sync before starting the collector. The default timeout is 30 seconds:
+**The two DaemonSets share host port `9090` and `/var/lib/flow-ledger/flows.jsonl`. Run only one per node.** When switching from mock to eBPF, delete the mock DaemonSet first:
 
 ```bash
---metadata-sync-timeout=30s
---allow-unsynced-metadata=false
+kubectl -n flow-ledger-system delete daemonset flow-ledger-node-agent
 ```
 
-If sync times out and `--allow-unsynced-metadata=false`, the agent exits instead of writing early records with incomplete metadata. Local runs without in-cluster config skip this gate and use an empty metadata cache.
+Reverse the deletion when switching back. Keep mock and real-traffic output in separate files or archive the old ledger before switching modes.
 
-## JSONL Record Fields
+View eBPF logs and metrics (use `flow-ledger-node-agent` for mock mode):
 
-Each line is a `session_summary` or `window_summary` using schema `v1alpha2`. See [docs/schema-v1alpha2.md](docs/schema-v1alpha2.md) for field semantics, availability, and an example record.
+```bash
+kubectl -n flow-ledger-system logs ds/flow-ledger-node-agent-ebpf --tail=50
+kubectl -n flow-ledger-system port-forward ds/flow-ledger-node-agent-ebpf 9090:9090
+```
 
-- Record metadata: `schema_version`, `cluster_id`, `node_name`, `agent_id`, `collection_mode`, `hook_source`, experiment labels.
-- Flow lifecycle: `flow_id`, `window_id`, 5-tuple, direction, IP family, connection timing, TCP state, close reason, long-lived flag.
-- Traffic statistics: bytes, packets, totals, ratios, rates, packet size histogram, IAT estimates, TCP counters, and availability flags.
-- TLS/protocol metadata: `protocol_guess`, `is_tls_like`, ClientHello-derived `tls_version`, `sni_hash`, `alpn`, `ja4`, `tls_parse_status`, ServerHello-derived `tls_version_negotiated`, `alpn_negotiated`, `ja4s`, `tls_server_parse_status`, and visibility flags; no TLS plaintext or payload is stored.
-- Kubernetes identity: source and destination Pod, node, workload, ReplicaSet, service account, container metadata when available, image digest when available, cgroup ID, and mapping confidence.
-- Service/topology/policy context: destination service fields, namespace/workload relation flags, external destination flag, and reserved policy/baseline fields.
-- Data quality and sampling metadata: `sampling_applied=false`, `sampling_rate=1.0`, `sampling_reason=none`, `histogram_truncated=false`, `iat_overflow=false`, and `tls_parse_status`.
-- Fast/review placeholders: feature set version, model/review placeholders, reason codes, action suggestion, retention tier, and `payload_collected=false`.
+Read `/var/lib/flow-ledger/flows.jsonl` directly on each node. Files are node-local; the manifests do not deploy a central storage service or a Prometheus server.
 
-Mapping confidence values are `high`, `medium`, `low`, and `unknown`. Mapping methods include `cgroup_id`, `pod_ip`, `service_cluster_ip`, `endpoint_slice`, `external`, and `unknown`.
+The agent waits up to 30 seconds for Kubernetes informer synchronization and exits on sync failure unless `--allow-unsynced-metadata=true`. Experiment labels come from the `flow-ledger-experiment` ConfigMap, refresh periodically, and retain their last known values on read errors.
 
-`rollout_window`, `hpa_scaling_window`, `expected_edge`, and `network_policy_allowed` are reserved or conservative in v0. `pod_restart_window` is based on low-confidence pod mapping windows.
+## Configuration and retention
 
-## Metrics
+| Flag | Default | Purpose |
+| --- | --- | --- |
+| `--mode` | `mock` | Select mock replay or eBPF |
+| `--window-size` | `30s` | Window-summary interval |
+| `--session-timeout` | `1m` | Session inactivity timeout |
+| `--long-lived-threshold` | `5m` | Threshold for `is_long_lived` |
+| `--metrics-addr` | `:9090` | Metrics listener |
+| `--metadata-sync-timeout` | `30s` | Informer synchronization deadline |
+| `--drop-nonlocal-src` | `true` | Suppress records attributed to a source Pod on another node; useful for shared-kernel kind clusters |
+| `--ebpf-flow-map-max-entries` | `65536` | LRU flow-stat map capacity |
+| `--ebpf-map-stats-interval` | `15s` | Map occupancy sampling; negative disables sampling |
+| `--ledger-max-bytes` | `104857600` (100 MiB) | Active-file size rotation; `0` disables |
+| `--ledger-max-age` | `0s` | Active-file age rotation; disabled by default |
+| `--ledger-retention-age` | `24h` | Delete rotated files older than this; `0` disables |
+| `--ledger-retention-bytes` | `2147483648` (2 GiB) | Limit total rotated-file bytes; `0` disables |
+| `--ledger-retention-interval` | `5m` | Retention sweep interval |
 
-- `flowledger_events_total`
-- `flowledger_sessions_active`
-- `flowledger_sessions_emitted_total`
-- `flowledger_unknown_src_mapping_total`
-- `flowledger_unknown_dst_mapping_total`
-- `flowledger_ledger_write_errors_total`
-- `flowledger_k8s_cache_pods`
-- `flowledger_k8s_cache_services`
-- `flowledger_k8s_watch_errors_total`
-- `flowledger_experiment_label_read_errors_total`
-- `flowledger_ebpf_events_total`
-- `flowledger_ebpf_read_errors_total`
-- `flowledger_ebpf_attach_errors_total`
-- `flowledger_ebpf_events_by_type_total`
-- `flowledger_ebpf_stats_events_total`
-- `flowledger_ebpf_connect_events_total`
-- `flowledger_ebpf_close_events_total`
-- `flowledger_ebpf_ringbuf_reserve_failures_total`
-- `flowledger_ebpf_map_full_drops_total`
-- `flowledger_ebpf_lost_events_total`
-- `flowledger_ebpf_traffic_accounting_enabled`
-- `flowledger_tls_handshakes_parsed_total`
-- `flowledger_tls_unmatched_total`
-- `flowledger_tls_buffer_reserve_failed_total`
-- `flowledger_tls_server_hellos_parsed_total`
-- `flowledger_tls_server_hello_unmatched_total`
-- `flowledger_tls_server_hello_parse_errors_total`
-- `flowledger_cgroup_resolutions_total`
-- `flowledger_cgroup_map_size`
+**Rotated files are deleted automatically by default.** For research runs that must retain every record, disable both retention limits and arrange sufficient disk space or external archiving:
 
-## Known Limitations
+```text
+--ledger-retention-age=0s --ledger-retention-bytes=0
+```
 
-- The default Kubernetes deployment validates lifecycle and metadata plumbing only, not real traffic collection.
-- The experimental eBPF collector captures TCP IPv4 lifecycle, lightweight send/receive counters, and cgroup_skb histogram-based packet features on cgroup v2 systems.
-- Histogram-based packet/IAT percentiles are estimates with bucket-width-bounded error; FlowLedger does not retain raw packet length or raw IAT sequences.
-- ClientHello and ServerHello inspection are best-effort and bounded to the first 1024 bytes of the first matching TLS handshake record. Fragmented handshakes are marked `fragmented` and are not reassembled.
-- Session byte and packet counters treat event counters as cumulative and keep the maximum seen value.
-- Owner resolution depends on informer cache freshness and may temporarily emit `BarePod`, `ReplicaSet`, or `unknown` during startup or cache churn.
-- Local source attribution prefers cgroup ID to Pod UID mapping when Kubernetes cgroup paths are visible. Missing cgroup v2/kubepods paths degrade gracefully to Pod IP mapping.
-- Host-network Pod identity can still be ambiguous; netns identity is used as a confidence signal where available.
-- Ledger rotation is local-only and does not compress, upload, or enforce global retention.
+Retention applies to rotated files; it is not a hard limit on total filesystem use. Compression and upload are not implemented. Use `--cluster-id` / `FLOWLEDGER_CLUSTER_ID` and `--agent-id` / `FLOWLEDGER_AGENT_ID` to identify collection sources. Node naming uses `--node-name`, then `NODE_NAME`, then the hostname.
 
-## Next Steps Toward Richer eBPF Collection
+## Diagnostics and development
 
-- Add TC/SKB hooks if strict wire packet count semantics are needed in top-level packet counters.
-- Add richer packet timing summaries without exporting raw packet sequences.
-- Add IPv6 event conversion.
-- Add integration tests or a privileged smoke-test path that is separate from regular unit tests.
-- Keep experimental eBPF deployment separate until kernel compatibility is well understood.
+Metrics include event/session counts, unknown identity mappings, ledger write errors, cgroup resolution, TLS parsing, BPF map occupancy, and drop reasons. See [pkg/metrics/metrics.go](pkg/metrics/metrics.go) for the full list.
+
+Useful diagnostics include `flowledger_phantom_src_filtered_total`, `flowledger_ebpf_map_occupancy_ratio`, `flowledger_ebpf_packet_ep_miss_total`, and `flowledger_ebpf_drops_by_reason_total`. The latter includes `packet_direct_miss` (fallback lookup used) and `local_ep_alias_overwrite` (a shared index slot was replaced); these two counters are attribution diagnostics, not necessarily lost events.
+
+Inspect the embedded BPF object's struct sizes, map capacities, and ring-buffer budgets without loading programs or contacting a cluster:
+
+```bash
+go run ./cmd/ebpf-resource-audit
+go run ./cmd/ebpf-resource-audit --json
+```
+
+Build and run the existing tests:
+
+```bash
+make build
+make test
+```
+
+After changing the BPF C source, regenerate the checked-in objects and Go bindings with Clang and the `bpf2go` tool pinned in `go.mod`:
+
+```bash
+make generate-ebpf
+```
+
+Generation uses `-no-strip`, so `llvm-strip` is not required. Tests cover aggregation, schema contracts, identity snapshots, metadata caches, TLS parsing, retention, BPF layouts, and the standalone model components. Unit tests do not establish live kernel compatibility; use a privileged smoke test on your target nodes as well.
+
+## Repository layout
+
+| Path | Contents |
+| --- | --- |
+| `cmd/node-agent/` | Agent entry point, flags, pipeline, and metrics routing |
+| `cmd/ebpf-resource-audit/` | Static resource report for the embedded BPF object |
+| `bpf/` | Kernel-side TCP collection and packet attribution |
+| `pkg/collector/` | Mock/eBPF collectors, generated bindings, TLS parsing |
+| `pkg/sessionizer/`, `pkg/features/` | Connection aggregation, window deltas, derived features |
+| `pkg/k8smeta/`, `pkg/identity/` | Kubernetes caches, cgroup resolution, endpoint identity |
+| `pkg/ledger/`, `pkg/experiment/`, `pkg/metrics/` | Storage, experiment labels, observability |
+| `pkg/nodemodel/` | Standalone baseline cache, deviation scores, Isolation Forest inference |
+| `deploy/` | Shared Kubernetes resources and separate mock/eBPF DaemonSets |
+| `scripts/`, `testdata/` | Retransmission smoke-test script and mock fixtures |
+
+## Collection boundaries
+
+FlowLedger is a research prototype. Coverage depends on kernel support, hook attachment, NAT paths, and metadata freshness. Exact-tuple packet lookup distinguishes concurrent connections sharing a listening port; the fallback local-endpoint index remains best-effort where address translation prevents a direct match. Early TCP flag coverage is also best-effort, particularly for passive connections and failed attempts.
+
+TLS inspection copies at most 1024 bytes per direction from the first matching ClientHello/ServerHello attempt to userspace for parsing. The ledger stores fingerprints, visible version/ALPN metadata, and a truncated SHA-256 SNI hash. It does not store plaintext SNI, certificates, or application payloads. TLS is not decrypted, and fragmented handshakes are not reassembled; handshake fields may be unavailable.
+
+Native IPv6, UDP/QUIC collection, packet capture, HTTP content extraction, deployed ML inference, alerting, and slow-path reviewer verdicts are outside the current agent implementation. Model/review fields in ledger records remain placeholders. Host-network identity can be ambiguous, and unknown mappings should be handled explicitly by downstream consumers.

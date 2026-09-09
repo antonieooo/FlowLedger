@@ -5,3 +5,13 @@ flows.jsonl
 /dist/
 /coverage.out
 .DS_Store
+
+# Local research material, datasets, and assistant configuration.
+/.claude/
+/CLAUDE.md
+/dataset-analysis.tar
+/new_outline/
+/outline/
+/papers/
+/questions/
+/testbed/
