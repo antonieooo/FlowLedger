@@ -15,3 +15,6 @@ flows.jsonl
 /papers/
 /questions/
 /testbed/
+
+# Model-related code (not part of the flow-recording pipeline).
+/pkg/nodemodel/
